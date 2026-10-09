@@ -1,3 +1,13 @@
+# 当前接手提示：v0.3 已实现
+
+当前入口 src/WorkspaceApp.vue，后端 server/server.mjs + workspace.mjs；接口 /api/v2。旧 src/App.vue / Pipeline.vue / pipeline.mjs 保留作历史及回归参考，不是当前产品入口。
+
+账号角色、随手反馈、多轮会话、独立模型网关、异步持久任务、差异分流、领域专家审核、真实上传清洗与发布、关键词资料检索、版本化导出均已实现。默认 data/workspace.sqlite；可用 DATABASE_URL 切 PostgreSQL，并提供迁移与备份命令。旧 workbench.sqlite 只读保留。
+
+正式实例首次需创建管理员；千问和智谱仍为两路回答；独立裁判等待配置，不能使用旧 JUDGE_MODEL 判断是否启用。详见 README.md、API-CONTRACT.md、VERIFICATION.md。后续仍需 DGX 实机、生产负载验收及实际微调接入。
+
+---
+
 > v0.2 更新：已修复下述 A/B 显示、异步回写、提前显示裁判、来源误标、历史串线、裁判校验与数据持久化问题。新的独立问题工作流、复审及导出规则见 README.md。以下保留为初次归档时的历史记录。
 
 # 本地 AI 成长数据管道：交接与归档
