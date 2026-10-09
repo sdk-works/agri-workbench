@@ -19,3 +19,7 @@ models/
 *.gguf
 *.safetensors
 *.jsonl
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db

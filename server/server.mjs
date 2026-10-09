@@ -7,6 +7,8 @@ import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { Store } from './store.mjs';
+import { createPipeline, validateJudge } from './pipeline.mjs';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -72,27 +74,12 @@ function httpRequest(urlObj, options, body, timeoutMs, onResponse) {
   req.end();
   return req;
 }
-function requestJSON(url, { method = 'GET', payload = null, headers = {}, timeoutMs = 120000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const body = payload ? JSON.stringify(payload) : null;
-    const h = body
-      ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...headers }
-      : { ...headers };
-    const req = httpRequest(u, { method, headers: h }, body, timeoutMs, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        const text = Buffer.concat(chunks).toString('utf-8');
-        let data; try { data = JSON.parse(text); } catch { data = text; }
-        resolve({ status: res.statusCode, data });
-      });
-    });
-    req.on('error', (e) => {
-      // httpRequest 已 destroy；这里兜底拒绝，避免未处理错误
-      resolve({ status: 0, data: { error: e.message } });
-    });
-  });
+async function requestJSON(url, { method = 'GET', payload = null, headers = {}, timeoutMs = 120000 } = {}) {
+  try {
+    const res=await fetch(url,{method,headers:{'Content-Type':'application/json',...(headers||{})},body:payload?JSON.stringify(payload):undefined,signal:AbortSignal.timeout(timeoutMs)});
+    const text=await res.text();let data;try{data=JSON.parse(text)}catch{data=text}
+    return {status:res.status,data};
+  } catch(e) {return {status:0,data:{error:/timeout/i.test(e.name)?'上游请求超时':e.message}}}
 }
 function postJSON(url, payload, headers = {}, timeoutMs = 120000) {
   return requestJSON(url, { method: 'POST', payload, headers, timeoutMs });
@@ -107,14 +94,14 @@ async function callOllama(messages) {
     model: LOCAL_MODEL, messages, stream: false,
   });
   if (r.status !== 200) throw new Error(`本地模型调用失败 (HTTP ${r.status}): ${typeof r.data === 'string' ? r.data.slice(0, 300) : JSON.stringify(r.data).slice(0, 300)}`);
-  return { answer: r.data.message?.content ?? '', model: LOCAL_MODEL, provider: 'local', usage: r.data };
+  return { answer: r.data.message?.content ?? '', model: LOCAL_MODEL, provider: 'local', usage: {input_tokens:r.data.prompt_eval_count??null,output_tokens:r.data.eval_count??null} };
 }
 async function callOllama2(messages) {
   const r = await postJSON(`${OLLAMA_BASE}/api/chat`, {
     model: LOCAL2_MODEL, messages, stream: false,
   });
   if (r.status !== 200) throw new Error(`第二本地模型调用失败 (HTTP ${r.status}): ${typeof r.data === 'string' ? r.data.slice(0, 300) : JSON.stringify(r.data).slice(0, 300)}`);
-  return { answer: r.data.message?.content ?? '', model: LOCAL2_MODEL, provider: 'local2', usage: r.data };
+  return { answer: r.data.message?.content ?? '', model: LOCAL2_MODEL, provider: 'local2', usage: {input_tokens:r.data.prompt_eval_count??null,output_tokens:r.data.eval_count??null} };
 }
 async function callZhipu(messages, modelName) {
   if (!ZHIPU_API_KEY) throw new Error('未配置 ZHIPU_API_KEY（在 server/.env 中设置）');
@@ -170,7 +157,7 @@ async function callJudgeOnce({ question, answerA, answerB }) {
   let r;
   if (String(JUDGE_MODEL).startsWith('local2')) {
     // 裁判走本地指令遵循更强的模型(qwen2.5:7b)，云端限流时兜底，保证评审流程可用
-    r = await postJSON(`${OLLAMA_BASE}/api/chat`, { model: LOCAL_MODEL, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], stream: false, temperature: 0.2, format: 'json' }, null, 90000);
+    r = await postJSON(`${OLLAMA_BASE}/api/chat`, { model: LOCAL_MODEL, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], stream: false, options: {temperature: 0.2}, format: 'json' }, null, 90000);
   } else {
     r = await postJSON(ZHIPU_URL, { model: JUDGE_MODEL, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], stream: false, temperature: 0.2 },
       { Authorization: `Bearer ${ZHIPU_API_KEY}` }, 90000);
@@ -188,9 +175,7 @@ async function callJudgeOnce({ question, answerA, answerB }) {
   if (!parsed || !['A', 'B', 'tie'].includes(parsed.winner)) {
     throw new Error(`裁判输出无法解析: ${text.slice(0, 300)}`);
   }
-  const avgA = (((parsed.a_accuracy || 0) + (parsed.a_completeness || 0) + (parsed.a_actionable || 0) + (parsed.a_concise || 0)) / 4).toFixed(2);
-  const avgB = (((parsed.b_accuracy || 0) + (parsed.b_completeness || 0) + (parsed.b_actionable || 0) + (parsed.b_concise || 0)) / 4).toFixed(2);
-  return { winner: parsed.winner, score_a: avgA, score_b: avgB, reason: parsed.reason || '' };
+  return {...validateJudge(parsed),judge_model:String(JUDGE_MODEL).startsWith('local2')?LOCAL_MODEL:JUDGE_MODEL,judge_route:JUDGE_MODEL,provider:String(JUDGE_MODEL).startsWith('local2')?'local':'zhipu'};
 }
 async function callJudge({ question, answerA, answerB }) {
   if (!ZHIPU_API_KEY && !String(JUDGE_MODEL).startsWith('local2')) throw new Error('未配置 ZHIPU_API_KEY，AI 裁判不可用');
@@ -263,7 +248,7 @@ async function handleJudge(req, res) {
   if (!question || !a || !b) return json(res, 400, { error: 'question / answer_a / answer_b 不能为空' });
   try {
     const verdict = await callJudge({ question, answerA: a, answerB: b });
-    return json(res, 200, { ...verdict, judge_model: JUDGE_MODEL });
+    return json(res, 200, verdict);
   } catch (e) {
     return json(res, 502, { error: e.message });
   }
@@ -272,33 +257,44 @@ async function handleJudge(req, res) {
 async function handleModels(req, res) {
   const list = [];
   // 本地 Ollama 状态
-  let localOk = false;
+  let localOk = false; let installed=[];
   try {
     const r = await getJSON(`${OLLAMA_BASE}/api/tags`, {}, 5000);
-    localOk = r.status === 200;
+    localOk = r.status === 200; installed=(r.data.models||[]).map(m=>m.name);
   } catch { localOk = false; }
-  list.push({ id: 'local_agri', name: `本地千问 (${LOCAL_MODEL})`, provider: 'local', capability: ['chat'], connected: localOk, note: localOk ? 'Ollama 运行中' : 'Ollama 未响应' });
-  list.push({ id: 'local2_agri', name: `第二本地模型 (${LOCAL2_MODEL})`, provider: 'local2', capability: ['chat'], connected: localOk, note: localOk ? 'Ollama 运行中' : 'Ollama 未响应' });
+  list.push({ id: 'local_agri', name: `本地千问 (${LOCAL_MODEL})`, provider: 'local', capability: ['chat'], connected: localOk&&installed.includes(LOCAL_MODEL), note: localOk ? (installed.includes(LOCAL_MODEL)?'已安装 · 推理时再验证':'模型未安装') : 'Ollama 未响应' });
+  list.push({ id: 'local2_agri', name: `第二本地模型 (${LOCAL2_MODEL})`, provider: 'local2', capability: ['chat'], connected: localOk&&installed.includes(LOCAL2_MODEL), note: localOk ? (installed.includes(LOCAL2_MODEL)?'已安装 · 推理时再验证':'模型未安装') : 'Ollama 未响应' });
   // 智谱状态
-  list.push({ id: ZHIPU_DEFAULT_MODEL, name: `智谱 (${ZHIPU_DEFAULT_MODEL})`, provider: 'zhipu', capability: ['chat'], connected: Boolean(ZHIPU_API_KEY), note: ZHIPU_API_KEY ? '密钥已配置' : '未配置密钥' });
+  list.push({ id: ZHIPU_DEFAULT_MODEL, name: `智谱 (${ZHIPU_DEFAULT_MODEL})`, provider: 'zhipu', capability: ['chat'], connected: false, configured:Boolean(ZHIPU_API_KEY), note: ZHIPU_API_KEY ? '密钥已配置 · 连通性未验证' : '未配置密钥' });
   return json(res, 200, { models: list });
 }
 
+const store=new Store(ENV.DATA_PATH || path.join(__dirname,'../data/workbench.sqlite'));
+const pipeline=createPipeline({store,first:ENV.PRIMARY_MODEL_ROUTE||'local_agri',second:ENV.SECONDARY_MODEL_ROUTE||'local2_agri',
+  generate:async(route,messages)=>route==='local_agri'?callOllama(messages):route==='local2_agri'?callOllama2(messages):route.startsWith('glm')?callZhipu(messages,route):callOpenAI(messages,route),
+  judge:callJudge,
+  similarity:(a,b)=>{const score=textSimilarity(a,b);return {score,threshold:SIMILARITY_THRESHOLD,verdict:score<SIMILARITY_THRESHOLD?'different':'similar',method:'char-bigram-jaccard-v1'}}
+});
+pipeline.recover();
+
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  const url = new URL(req.url, 'http://127.0.0.1');
   try {
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST,GET,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,Authorization' });
-      return res.end();
-    }
+    if(req.headers.origin){try{const origin=new URL(req.headers.origin);if(!['127.0.0.1','localhost','[::1]'].includes(origin.hostname))return json(res,403,{error:'仅允许本机开发页面访问'})}catch{return json(res,403,{error:'无效来源'})}}
+    if(req.method==='POST' && !String(req.headers['content-type']||'').startsWith('application/json'))return json(res,415,{error:'需要 application/json'});
+    if(req.method==='GET'&&url.pathname==='/api/v1/comparisons')return json(res,200,{items:pipeline.list()});
+    if(req.method==='POST'&&url.pathname==='/api/v1/comparisons')return json(res,202,pipeline.create(await readBody(req)));
+    const match=url.pathname.match(/^\/api\/v1\/comparisons\/([\w-]+)(?:\/(choice|revision|approve|exclude))?$/);
+    if(match){const [,id,action]=match;if(req.method==='GET'&&!action)return json(res,200,pipeline.get(id));if(req.method==='POST'&&action){const body=await readBody(req);const method={choice:'vote',revision:'edit',approve:'approve',exclude:'exclude'}[action];return json(res,200,pipeline[method](id,body))}}
+    if(req.method==='POST'&&url.pathname==='/api/v1/datasets/export'){const body=await readBody(req);return json(res,200,pipeline.exportDataset(body.kind))}
     if (req.method === 'POST' && url.pathname === '/api/v1/chat') return await handleChat(req, res);
     if (req.method === 'POST' && url.pathname === '/api/v1/similarity') return await handleSimilarity(req, res);
     if (req.method === 'POST' && url.pathname === '/api/v1/judge') return await handleJudge(req, res);
     if (req.method === 'GET' && url.pathname === '/api/v1/models') return await handleModels(req, res);
-    if (req.method === 'GET' && url.pathname === '/api/v1/health') return json(res, 200, { ok: true, localModel: LOCAL_MODEL, zhipuConfigured: Boolean(ZHIPU_API_KEY) });
+    if (req.method === 'GET' && url.pathname === '/api/v1/health') return json(res, 200, { ok:true,version:'0.2.0',storage:'sqlite',localModel:LOCAL_MODEL,secondaryRoute:ENV.SECONDARY_MODEL_ROUTE||'local2_agri',zhipuConfigured:Boolean(ZHIPU_API_KEY) });
     return json(res, 404, { error: 'Not Found' });
   } catch (e) {
-    return json(res, 500, { error: e.message });
+    return json(res, e.status || 500, { error: e.message });
   }
 });
 

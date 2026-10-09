@@ -1,35 +1,26 @@
-# 后端接入契约草案
+# 数据管道 API v0.2
 
-统一前缀 `/api/v1`。身份、租户由后端登录上下文决定，不信任前端传入的用户/租户标识。
-所有写操作须加入鉴权、CSRF防护（Cookie会话模式）、审计和适当的幂等处理。
+本机开发前缀 /api/v1，JSON。当前无正式登录；不应对外暴露。真实来源和裁判结果在 choice 提交前被服务端隐藏。
 
-## POST /chat
-
-请求：
-```json
-{"model":"local_agri","messages":[{"role":"user","content":"番茄开花期如何管理水肥？"}]}
-```
-响应：
-```json
-{"request_id":"uuid","answer":"模型回答","model":"实际模型版本","provider":"local","citations":[],"usage":{"input_tokens":0,"output_tokens":0}}
-```
-后端负责历史长度、农业范围、数据权限和输出检查，不能把浏览器传入的模型名直接当作任意端点。
-前端当前读取 `answer`；流式回答在后续增加。
-
-## 待实现接口
-
-|接口|职责|
+|方法与路径|行为|
 |---|---|
-|GET /models|返回逻辑模型、能力、连接状态，不返回密钥|
-|POST /comparisons|同一证据快照下生成候选回答，保存实际模型来源|
-|GET /reviews|按权限和状态分页读取评审任务|
-|POST /reviews/:id|提交选择、修订、建议及版本，进行并发校验|
-|POST /reviews/:id/approve|复审权限校验并形成不可变审核记录|
-|POST /documents|实际 multipart 文件上传、限额、扫描和存储|
-|GET /documents|返回资料元数据与解析/审核状态|
-|POST /datasets|从审核记录建立版本化快照，排除演示数据|
-|POST /training-jobs|在后端权限和资源检查后提交任务|
-|GET /training-jobs/:id|真实进度、失败原因和评测产物|
+|POST /comparisons|question + request_id 创建持久化异步任务。相同 ID/问题幂等，ID 复用不同问题返回 409|
+|GET /comparisons|返回持久化列表，按盲评状态裁剪来源与裁判|
+|GET /comparisons/:id|单条记录、固定 A/B、任务与审核状态|
+|POST /comparisons/:id/choice|choice=A/B/tie/both_bad/insufficient，actor。只允许提交一次；不足两路只能 insufficient|
+|POST /comparisons/:id/revision|answer/evidence/notes/actor/revision。修订版本乐观校验；进入 awaiting_review|
+|POST /comparisons/:id/approve|actor/revision/preferred(null/A/B)/original_acceptable。检查复审人、版本与 DPO 准入|
+|POST /comparisons/:id/exclude|actor/reason，保留记录排除训练|
+|POST /datasets/export|kind=sft/dpo/eval。只取合格记录，持久化不可变导出快照|
+|GET /models|本地安装情况与供应商配置情况，非生成成功保证|
+|GET /health|版本、存储类型及基本配置状态，不返回密钥|
 
-前端所有演示状态须在接入时替换为服务器权威状态，并实现加载、错误、重试与刷新恢复。
-不应将演示内存状态改成 localStorage 就视为正式数据库。
+旧 chat/similarity/judge 接口保留兼容；新的问答 UI 使用 comparisons，客户端不再负责拼装和持久化偏好对。
+
+生成状态 generating/completed/partial/failed；审核状态 unreviewed/pending/awaiting_review/approved/excluded。
+
+生成与裁判仅更新自身字段，不覆盖人工修订。已审核记录不可再次修改。导出包含实际来源、完整生成上下文（当前独立问题）、人工选择、修订证据、复审、相似度算法和裁判实际模型。
+
+DPO 输出为 prompt 消息数组、chosen/rejected 助手消息数组、meta。与具体训练器对接时仍需字段映射验证。
+
+SQLite 当前保存版本化 JSON 记录和审计快照，适合内部小规模试用；列表分页、结构化分析索引、租户认证及 PostgreSQL 迁移为后续扩展。
