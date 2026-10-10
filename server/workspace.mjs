@@ -1,3 +1,4 @@
+import { createAssetService } from "./assets.mjs";
 import {
   randomUUID,
   randomBytes,
@@ -72,6 +73,13 @@ export function createWorkspace({
     timer;
   const running = new Set(),
     loginAttempts = new Map();
+  const assets = createAssetService({
+    repo,
+    gateway,
+    uploadDir,
+    uploadDocument,
+    domains,
+  });
   const rules = async (db = repo) =>
     (await db.get("settings", "rules"))?.value || defaults;
   async function event(db, u, action, target, details = {}) {
@@ -240,6 +248,64 @@ export function createWorkspace({
         claimed_by: null,
       }),
     );
+  }
+  async function uploadDocument(u, b) {
+    const name = path.basename(text(b.name, "文件名", 200));
+    return repo.transaction(async (db) => {
+      if (!/\.(txt|md|csv|jsonl|docx|pdf|xlsx)$/i.test(name))
+        fail("支持 TXT、MD、CSV、JSONL、DOCX、PDF、XLSX");
+      if (!domains.includes(b.domain)) fail("请选择领域");
+      if (
+        typeof b.base64 !== "string" ||
+        !b.base64.length ||
+        b.base64.length > 11200000 ||
+        !/^[A-Za-z0-9+/]*={0,2}$/.test(b.base64)
+      )
+        fail("文件编码或大小无效");
+      const bytes = Buffer.from(b.base64, "base64");
+      if (!bytes.length || bytes.length > 8 * 1024 * 1024)
+        fail("文件须为 1 字节至 8 MB");
+      const hash = digest(bytes);
+      const duplicate = (
+        await db.list("documents", { tenant: u.tenant, owner: u.id })
+      ).find((d) => d.hash === hash && d.domain === b.domain);
+      if (duplicate) return { document: duplicate, duplicate: true };
+      const d = entity({
+        tenant: u.tenant,
+        owner: u.id,
+        domain: b.domain,
+        name,
+        size: bytes.length,
+        hash,
+        status: "parsing",
+        tags: String(b.tags || "").slice(0, 1000),
+        source: text(b.source || name, "资料来源", 1000),
+        revision: 0,
+      });
+      fs.mkdirSync(uploadDir, { recursive: true });
+      fs.writeFileSync(path.join(uploadDir, d.id), bytes, {
+        flag: "wx",
+        mode: 0o600,
+      });
+      await db.put("documents", d);
+      await db.put(
+        "jobs",
+        entity({
+          id: `parse-${d.id}`,
+          tenant: u.tenant,
+          owner: u.id,
+          domain: d.domain,
+          document_id: d.id,
+          type: "parse",
+          status: "queued",
+          attempts: 0,
+          next_at: 0,
+        }),
+      );
+      await event(db, u, "document_uploaded", d.id);
+
+      return { document: d, duplicate: false };
+    });
   }
   async function createTurn(u, b) {
     return repo.transaction(async (db) => {
@@ -537,6 +603,10 @@ export function createWorkspace({
           parts: parsed.parts,
           warnings: parsed.warnings,
           clean_hash: digest(normalize(parsed.text)),
+          cleaning_stats: {
+            redactions: parsed.redactions,
+            duplicates: parsed.duplicates,
+          },
           revision: 1,
         });
         await db.put("documents", current);
@@ -568,6 +638,8 @@ export function createWorkspace({
         j.attempts++;
         j.started_at = now();
         await db.put("jobs", j);
+        if (["assets", "candidates"].includes(type))
+          await assets.started(db, j);
         if (type === "judge") {
           const turn = await db.get("turns", j.turn_id);
           turn.judge = { status: "running" };
@@ -582,9 +654,13 @@ export function createWorkspace({
             ? runGeneration
             : type === "judge"
               ? runJudge
-              : runDocument
+              : type === "parse"
+                ? runDocument
+                : assets.run
         )(job);
       } catch (e) {
+        if (["assets", "candidates"].includes(type))
+          await assets.failed(job, e);
         await repo.transaction(async (db) => {
           if (job.turn_id) {
             const t = await db.get("turns", job.turn_id);
@@ -643,6 +719,29 @@ export function createWorkspace({
           await route(db, t);
           j.status = "failed";
           j.error = { message: "服务重启中断" };
+        } else if (["assets", "candidates"].includes(j.type)) {
+          const kind =
+            j.type === "assets" ? "asset_exports" : "candidate_batches";
+          const resource = await db.get(kind, j.resource_id);
+          if (resource?.status === "completed") {
+            j.status = "completed";
+          } else if (resource && j.type === "assets") {
+            resource.status = "queued";
+            j.status = "queued";
+            j.next_at = 0;
+            await db.put(kind, resource);
+          } else {
+            j.status = "failed";
+            j.error = {
+              message: "服务重启中断，请手动重试，未自动重复模型请求",
+            };
+            if (resource) {
+              resource.status = "failed";
+              resource.error = j.error.message;
+              resource.error_code = "interrupted";
+              await db.put(kind, resource);
+            }
+          }
         } else {
           j.status = "queued";
           j.next_at = 0;
@@ -673,7 +772,7 @@ export function createWorkspace({
   async function start() {
     await recover();
     timer = setInterval(() => {
-      for (const type of ["generate", "judge", "parse"])
+      for (const type of ["generate", "judge", "parse", "assets", "candidates"])
         tick(type).catch(() => {});
       promote().catch(() => {});
     }, 1000);
@@ -762,6 +861,8 @@ export function createWorkspace({
       return send({ user: safeUser(u) });
     }
     const u = await requireUser(req);
+    if (await assets.handle({ u, routePath, method, url, res, body, send }))
+      return true;
     if (routePath === "/auth/logout" && method === "POST") {
       const token = String(req.headers.cookie || "")
         .split(";")
@@ -1040,62 +1141,8 @@ export function createWorkspace({
       });
     }
     if (routePath === "/documents" && method === "POST") {
-      const b = await body(),
-        name = path.basename(text(b.name, "文件名", 200));
-      if (!/\.(txt|md|csv|jsonl|docx|pdf|xlsx)$/i.test(name))
-        fail("支持 TXT、MD、CSV、JSONL、DOCX、PDF、XLSX");
-      if (!domains.includes(b.domain)) fail("请选择领域");
-      if (
-        typeof b.base64 !== "string" ||
-        !b.base64.length ||
-        b.base64.length > 11200000 ||
-        !/^[A-Za-z0-9+/]*={0,2}$/.test(b.base64)
-      )
-        fail("文件编码或大小无效");
-      const bytes = Buffer.from(b.base64, "base64");
-      if (!bytes.length || bytes.length > 8 * 1024 * 1024)
-        fail("文件须为 1 字节至 8 MB");
-      const hash = digest(bytes);
-      const duplicate = (
-        await repo.list("documents", { tenant: u.tenant, owner: u.id })
-      ).find((d) => d.hash === hash && d.domain === b.domain);
-      if (duplicate) return send({ document: duplicate, duplicate: true });
-      const d = entity({
-        tenant: u.tenant,
-        owner: u.id,
-        domain: b.domain,
-        name,
-        size: bytes.length,
-        hash,
-        status: "parsing",
-        tags: String(b.tags || "").slice(0, 1000),
-        source: text(b.source || name, "资料来源", 1000),
-        revision: 0,
-      });
-      fs.mkdirSync(uploadDir, { recursive: true });
-      fs.writeFileSync(path.join(uploadDir, d.id), bytes, {
-        flag: "wx",
-        mode: 0o600,
-      });
-      await repo.transaction(async (db) => {
-        await db.put("documents", d);
-        await db.put(
-          "jobs",
-          entity({
-            id: `parse-${d.id}`,
-            tenant: u.tenant,
-            owner: u.id,
-            domain: d.domain,
-            document_id: d.id,
-            type: "parse",
-            status: "queued",
-            attempts: 0,
-            next_at: 0,
-          }),
-        );
-        await event(db, u, "document_uploaded", d.id);
-      });
-      return send({ document: d }, 202);
+      const out = await uploadDocument(u, await body());
+      return send(out, out.duplicate ? 200 : 202);
     }
     m = routePath.match(
       /^\/documents\/([\w-]+)(?:\/(publish|reject|original|training-question))?$/,

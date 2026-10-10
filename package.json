@@ -1,6 +1,6 @@
 {
   "name": "agri-workbench",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "server": "node server/server.mjs",
     "test": "node --test server/*.test.mjs",
+    "test:smoke": "node server/smoke.mjs",
     "backup": "node server/backup-workspace.mjs",
     "backup:legacy": "node server/backup.mjs",
     "migrate:postgres": "node server/migrate-postgres.mjs"
@@ -16,6 +17,7 @@
   "dependencies": {
     "csv-parse": "^7.0.3",
     "exceljs": "^4.4.0",
+    "jszip": "^3.10.2",
     "lucide-vue-next": "^0.468.0",
     "mammoth": "^1.13.0",
     "pdfjs-dist": "^6.4.299",

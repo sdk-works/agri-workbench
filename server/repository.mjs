@@ -18,6 +18,13 @@ export const kinds = [
   "events",
   "review_versions",
   "document_versions",
+  "annotations",
+  "annotation_versions",
+  "imports",
+  "asset_exports",
+  "candidate_batches",
+  "candidates",
+  "training_jobs",
 ];
 export async function openRepository({ filename, databaseUrl }) {
   const pool = databaseUrl

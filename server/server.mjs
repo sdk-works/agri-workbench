@@ -74,7 +74,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 415, { error: "需要 application/json" });
     const url = new URL(req.url, "http://127.0.0.1");
     if (req.method === "GET" && url.pathname === "/api/v1/health")
-      return json(res, 200, { ok: true, version: "0.3.0", storage: repo.type });
+      return json(res, 200, { ok: true, version: "0.4.0", storage: repo.type });
     if (await workspace.handle(req, res, url)) return;
     if (url.pathname.startsWith("/api/v1/"))
       return json(res, 410, {
@@ -92,7 +92,7 @@ const server = http.createServer(async (req, res) => {
 });
 server.requestTimeout = 60000;
 server.listen(port, "127.0.0.1", () =>
-  console.log(`农业工作台 v0.3: http://127.0.0.1:${port} · ${repo.type}`),
+  console.log(`农业工作台 v0.4: http://127.0.0.1:${port} · ${repo.type}`),
 );
 let closing = false;
 async function shutdown() {
