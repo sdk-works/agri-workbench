@@ -1,7 +1,7 @@
 import { digest, normalize, redact } from "./documents.mjs";
 
 export const annotationSchema = {
-  schema_version: 1,
+  schema_version: 2,
   type: "object",
   additionalProperties: false,
   properties: {
@@ -32,6 +32,11 @@ export const annotationSchema = {
       maxItems: 30,
     },
     evidence_locations: {
+      type: "array",
+      items: { type: "string", maxLength: 500 },
+      maxItems: 30,
+    },
+    verification_notes: {
       type: "array",
       items: { type: "string", maxLength: 500 },
       maxItems: 30,

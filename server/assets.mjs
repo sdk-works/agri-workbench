@@ -68,6 +68,92 @@ export function createAssetService({
       fail("资料不存在", 404);
     return d;
   }
+  const suggestSystem =
+    "你是农业知识结构化标注助手。根据用户提供的资料原文，提取结构化农业字段，供领域专家复核确认。要求：只依据原文内容；原文没有的信息一律返回 null 或空数组（表示未提供），严禁猜测或编造；knowledge_type 只能取 种植知识|操作规程|设备说明|销售知识|案例记录 之一，不确定返回 null；数组字段无内容返回 []；verification_notes 记录原文未说明、专家后续需核实的要点；evidence_locations 用“段落 N”或简短原文片段定位。只输出严格 JSON 对象，不要任何额外文字。";
+  function normalizeSuggestion(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) raw = {};
+    const out = {};
+    for (const [key, spec] of Object.entries(annotationSchema.properties)) {
+      const v = Object.hasOwn(raw, key) ? raw[key] : undefined;
+      if (spec.type === "array") {
+        if (v === undefined || v === null) {
+          out[key] = [];
+          continue;
+        }
+        if (!Array.isArray(v)) {
+          out[key] = [];
+          continue;
+        }
+        out[key] = [
+          ...new Set(
+            v
+              .filter((s) => typeof s === "string" && s.trim())
+              .map((s) => redact(s.trim()).slice(0, spec.items.maxLength))
+              .slice(0, spec.maxItems),
+          ),
+        ];
+        continue;
+      }
+      if (v === undefined || v === null) {
+        out[key] = null;
+        continue;
+      }
+      if (spec.enum) {
+        out[key] = spec.enum.includes(v) ? v : null;
+        continue;
+      }
+      if (typeof v !== "string") {
+        out[key] = null;
+        continue;
+      }
+      const cleaned = redact(v.trim());
+      out[key] = cleaned ? cleaned.slice(0, spec.maxLength) : null;
+    }
+    return out;
+  }
+  async function suggestAnnotation(u, id) {
+    const d = await document(repo, u, id, true);
+    if (!["pending", "published"].includes(d.status))
+      fail("资料尚未解析完成，无法生成建议", 409);
+    const raw = d.cleaned_text || d.approved_text || "";
+    if (!raw.trim()) fail("暂无可用文本，请先解析资料", 409);
+    let out;
+    try {
+      out = await gateway.call(
+        "local",
+        [
+          { role: "system", content: suggestSystem },
+          { role: "user", content: `资料原文：\n${raw.slice(0, 20000)}` },
+        ],
+        true,
+      );
+    } catch (e) {
+      if (e.code === "configuration")
+        fail("本地模型未配置，无法生成标注建议", 503);
+      throw Object.assign(Error(`标注建议生成失败：${e.message}`), {
+        status: 502,
+      });
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(
+        out.answer.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""),
+      );
+    } catch {
+      fail("标注建议 JSON 无法解析，请重试", 502);
+    }
+    return {
+      schema_version: annotationSchema.schema_version,
+      document_id: id,
+      document_revision: d.revision,
+      fields: normalizeSuggestion(parsed),
+      source_used: d.cleaned_text ? "cleaned" : "approved",
+      truncated: raw.length > 20000,
+      model: out.model,
+      provider: out.provider,
+      at: now(),
+    };
+  }
   async function owned(db, u, kind, id) {
     const r = await db.get(kind, id);
     if (!r || r.tenant !== u.tenant || (u.role !== "admin" && r.owner !== u.id))
@@ -173,7 +259,7 @@ export function createAssetService({
     if (routePath === "/schemas/agriculture" && method === "GET")
       return send(annotationSchema);
     let m = routePath.match(
-      /^\/documents\/([\w-]+)\/(annotation(?:\/approve)?|cleaning-report|retry|ocr|knowledge)$/,
+      /^\/documents\/([\w-]+)\/(annotation(?:\/(approve|suggest))?|cleaning-report|retry|ocr|knowledge)$/,
     );
     if (m) {
       const [, id, action] = m;
@@ -297,6 +383,9 @@ export function createAssetService({
             return a;
           }),
         );
+      }
+      if (action === "annotation/suggest" && method === "POST") {
+        return send(await suggestAnnotation(u, id));
       }
       if (action === "retry" && method === "POST") {
         return send(

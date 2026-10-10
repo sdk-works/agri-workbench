@@ -104,7 +104,32 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
     config = next;
     return publicConfig();
   }
-  async function call(role, messages, json = false) {
+  function withImages(messages, images, { local }) {
+    if (!images?.length || !messages.length) return messages;
+    const valid = images.filter(
+      (img) => img && typeof img.data === "string" && img.data,
+    );
+    if (!valid.length) return messages;
+    const msgs = messages.slice();
+    const last = { ...msgs[msgs.length - 1] };
+    if (local) {
+      last.images = valid.map((img) => img.data);
+    } else {
+      const text = typeof last.content === "string" ? last.content : "";
+      last.content = [
+        { type: "text", text },
+        ...valid.map((img) => ({
+          type: "image_url",
+          image_url: {
+            url: `data:${img.mime || "image/png"};base64,${img.data}`,
+          },
+        })),
+      ];
+    }
+    msgs[msgs.length - 1] = last;
+    return msgs;
+  }
+  async function call(role, messages, json = false, images = undefined) {
     const c = { ...config[role] };
     if (!c?.base_url || !c.model || (c.adapter === "compatible" && !c.api_key))
       throw Object.assign(Error(`${role} 模型未配置`), {
@@ -115,14 +140,14 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
     const payload = local
       ? {
           model: c.model,
-          messages,
+          messages: withImages(messages, images, { local: true }),
           stream: false,
           options: { temperature: json ? 0.1 : 0.5 },
           ...(json ? { format: "json" } : {}),
         }
       : {
           model: c.model,
-          messages,
+          messages: withImages(messages, images, { local: false }),
           stream: false,
           temperature: json ? 0.1 : 0.5,
         };

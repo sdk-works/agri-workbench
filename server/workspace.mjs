@@ -131,6 +131,7 @@ export function createWorkspace({
     delete r.question_hash;
     delete r.config_snapshot;
     delete r.system_prompt;
+    if (r.image) r.image = { mime: r.image.mime, has_image: true };
     if (!review && !r.feedback) {
       for (const c of r.candidates) {
         delete c.model;
@@ -307,10 +308,86 @@ export function createWorkspace({
       return { document: d, duplicate: false };
     });
   }
+  function parseImage(image) {
+    if (image === undefined || image === null) return null;
+    if (typeof image !== "object" || Array.isArray(image)) fail("图片信息无效");
+    const mime = String(image.mime || "");
+    if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mime))
+      fail("图片格式仅支持 PNG/JPG/WEBP/GIF");
+    const data = String(image.data || "");
+    if (!data.length || data.length > 11200000) fail("图片不能超过 8 MB");
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data)) fail("图片数据无效");
+    const bytes = Buffer.from(data, "base64");
+    if (!bytes.length || bytes.length > 8 * 1024 * 1024)
+      fail("图片不能超过 8 MB");
+    return { mime, data };
+  }
+  function validateRule(r) {
+    if (!r.name) fail("请填写规则名称");
+    if (r.kind === "regex") {
+      if (r.pattern.length > 500) fail("正则规则不能超过 500 字符");
+      try {
+        new RegExp(r.pattern, "i");
+      } catch {
+        fail("正则表达式无效");
+      }
+    } else if (!r.pattern.trim()) {
+      fail("请填写关键词");
+    }
+  }
+  function compileRules(rules) {
+    return (rules || [])
+      .filter((r) => r.enabled !== false)
+      .map((r) => {
+        if (r.kind === "regex") {
+          try {
+            return {
+              id: r.id,
+              name: r.name,
+              action: r.action,
+              re: new RegExp(r.pattern, "i"),
+            };
+          } catch {
+            return null;
+          }
+        }
+        return {
+          id: r.id,
+          name: r.name,
+          action: r.action,
+          keywords: String(r.pattern || "").split(/[,，\s]+/).filter(Boolean),
+        };
+      })
+      .filter(Boolean);
+  }
+  function checkRules(text, compiled) {
+    if (!compiled?.length || !text) return null;
+    const lower = text.toLowerCase();
+    const hits = [];
+    for (const r of compiled) {
+      let matched = null;
+      if (r.re) {
+        const m = r.re.exec(text);
+        if (m) matched = String(m[0]).slice(0, 200);
+      } else {
+        const k = r.keywords.find((x) => x && lower.includes(x.toLowerCase()));
+        if (k) matched = k.slice(0, 200);
+      }
+      if (matched)
+        hits.push({ id: r.id, name: r.name, action: r.action, matched });
+    }
+    if (!hits.length) return null;
+    return {
+      status: hits.some((h) => h.action === "block") ? "blocked" : "flagged",
+      hits,
+      at: now(),
+    };
+  }
   async function createTurn(u, b) {
     return repo.transaction(async (db) => {
       const question = text(b.question, "问题"),
-        id = text(b.request_id, "请求编号", 80);
+        id = text(b.request_id, "请求编号", 80),
+        image = parseImage(b.image);
       if (!/^[\w-]{8,80}$/.test(id)) fail("请求编号无效");
       const old = await db.get("turns", id);
       if (old) {
@@ -406,6 +483,7 @@ export function createWorkspace({
         curation_requested: Boolean(b.source_document_id),
         case_key: digest(JSON.stringify({ domain, context })),
         context,
+        image,
         split: conv.split,
         references,
         system_prompt:
@@ -475,7 +553,12 @@ export function createWorkspace({
           },
           ...t.context,
         ];
-        const out = await gateway.call(candidate.role, messages);
+        const out = await gateway.call(
+          candidate.role,
+          messages,
+          false,
+          t.image ? [t.image] : undefined,
+        );
         await repo.transaction(async (db) => {
           const current = await db.get("turns", t.id);
           Object.assign(
@@ -597,8 +680,12 @@ export function createWorkspace({
           )
           .map((x) => ({ id: x.id, name: x.name }))
           .slice(0, 10);
+        const blocking = checkRules(
+          parsed.text,
+          compileRules(await db.list("block_rules", { tenant: d.tenant })),
+        );
         Object.assign(current, {
-          status: "pending",
+          status: blocking?.status === "blocked" ? "blocked" : "pending",
           cleaned_text: parsed.text,
           parts: parsed.parts,
           warnings: parsed.warnings,
@@ -607,6 +694,7 @@ export function createWorkspace({
             redactions: parsed.redactions,
             duplicates: parsed.duplicates,
           },
+          blocking,
           revision: 1,
         });
         await db.put("documents", current);
@@ -1198,13 +1286,16 @@ export function createWorkspace({
             const current = await db.get("documents", id);
             if (current.revision !== b.revision)
               fail("资料已更新，请刷新", 409);
-            if (!["pending", "published", "rejected"].includes(current.status))
+            if (current.blocking?.status === "blocked" && b.confirm_block !== true)
+              fail("资料被拦截规则命中，请确认已人工核实后处理");
+            if (!["pending", "published", "rejected", "blocked"].includes(current.status))
               fail("请等待解析完成");
             if (action === "publish") {
               if (b.checked !== true)
                 fail("请确认来源、适用条件和敏感信息已核查");
               current.approved_text = redact(text(b.text, "审核文本", 1500000));
               current.status = "published";
+              current.blocking = null;
               current.review = {
                 actor: u.id,
                 evidence: text(b.evidence, "审核依据", 4000),
@@ -1225,6 +1316,7 @@ export function createWorkspace({
               );
             } else if (action === "reject") {
               current.status = "rejected";
+              current.blocking = null;
               current.review = {
                 actor: u.id,
                 reason: text(b.reason, "退回原因", 2000),
@@ -1240,6 +1332,74 @@ export function createWorkspace({
           }),
         );
       }
+    }
+    if (routePath === "/block-rules") {
+      needAdmin(u);
+      if (method === "GET")
+        return send({
+          items: await repo.list("block_rules", { tenant: u.tenant }),
+        });
+      if (method === "POST") {
+        const b = await body();
+        return send(
+          await repo.transaction(async (db) => {
+            const rule = entity({
+              tenant: u.tenant,
+              owner: u.id,
+              domain: "*",
+              name: text(b.name, "规则名称", 100),
+              kind: b.kind === "regex" ? "regex" : "keyword",
+              pattern: text(b.pattern, "规则内容", 2000),
+              action: b.action === "flag" ? "flag" : "block",
+              note: String(b.note || "").slice(0, 1000),
+              enabled: b.enabled !== false,
+            });
+            validateRule(rule);
+            await db.put("block_rules", rule);
+            await event(db, u, "rule_created", rule.id, { name: rule.name });
+            return rule;
+          }),
+          201,
+        );
+      }
+    }
+    m = routePath.match(/^\/block-rules\/([\w-]+)$/);
+    if (m) {
+      needAdmin(u);
+      if (method === "PUT") {
+        const b = await body();
+        return send(
+          await repo.transaction(async (db) => {
+            const r = await db.get("block_rules", m[1]);
+            if (!r || r.tenant !== u.tenant) fail("规则不存在", 404);
+            Object.assign(r, {
+              name: text(b.name ?? r.name, "规则名称", 100),
+              kind: b.kind === "regex" ? "regex" : "keyword",
+              pattern: text(b.pattern ?? r.pattern, "规则内容", 2000),
+              action: b.action === "flag" ? "flag" : "block",
+              note:
+                b.note === undefined
+                  ? r.note
+                  : String(b.note).slice(0, 1000),
+              enabled:
+                b.enabled === undefined ? r.enabled : Boolean(b.enabled),
+            });
+            validateRule(r);
+            await db.put("block_rules", r);
+            return r;
+          }),
+        );
+      }
+      if (method === "DELETE")
+        return send(
+          await repo.transaction(async (db) => {
+            const r = await db.get("block_rules", m[1]);
+            if (!r || r.tenant !== u.tenant) fail("规则不存在", 404);
+            await db.remove("block_rules", r.id);
+            await event(db, u, "rule_deleted", r.id, { name: r.name });
+            return { ok: true };
+          }),
+        );
     }
     if (routePath === "/datasets/export" && method === "POST") {
       needAdmin(u);

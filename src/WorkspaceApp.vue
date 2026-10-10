@@ -12,6 +12,7 @@ import {
   Upload,
   RefreshCw,
   LayoutDashboard,
+  ImagePlus,
 } from "lucide-vue-next";
 import { call, download } from "./workspace-api";
 const user = ref(null),
@@ -29,6 +30,7 @@ const conversations = ref([]),
   question = ref(""),
   domain = ref(domains[0]),
   draft = ref(null),
+  pendingImage = ref(null),
   comments = ref({});
 const reviews = ref([]),
   detail = ref(null),
@@ -41,6 +43,10 @@ const docs = ref([]),
   file = ref(null),
   docForm = ref({}),
   docQuestion = ref("");
+const annotation = ref(null),
+  annotationForm = ref({}),
+  annotationEvidence = ref(""),
+  suggested = ref(null);
 const users = ref([]),
   account = ref({
     username: "",
@@ -52,11 +58,20 @@ const users = ref([]),
   }),
   models = ref({}),
   rules = ref({}),
+  blockRules = ref([]),
+  ruleForm = ref({ name: "", kind: "keyword", pattern: "", action: "block", note: "" }),
   jobs = ref([]),
   metrics = ref(null),
   legacy = ref([]);
 const expert = computed(() => ["expert", "admin"].includes(user.value?.role)),
   admin = computed(() => user.value?.role === "admin");
+const annotationStatus = computed(() => {
+  const a = annotation.value?.annotation;
+  if (!a) return { class: "neutral", text: "未标注" };
+  if (a.status === "approved")
+    return { class: "success", text: `已确认 v${a.revision}` };
+  return { class: "amber", text: `草稿 v${a.revision}` };
+});
 const roleNames = { employee: "普通员工", expert: "领域专家", admin: "管理员" };
 const statusNames = {
   queued: "待处理",
@@ -76,6 +91,7 @@ const statusNames = {
   pending: "待审核",
   published: "已发布",
   rejected: "已退回",
+  blocked: "被拦截",
 };
 const choices = {
   A: "采用 A",
@@ -203,15 +219,17 @@ async function refresh() {
     if (current()) metrics.value = response;
   }
   if (view === "settings") {
-    const [m, r, j, l] = await Promise.all([
+    const [m, r, br, j, l] = await Promise.all([
       call("/models"),
       call("/rules"),
+      call("/block-rules"),
       call("/jobs"),
       call("/legacy"),
     ]);
     if (current()) {
       models.value = m.models;
       rules.value = r;
+      blockRules.value = br.items;
       jobs.value = j.items;
       legacy.value = l.items;
     }
@@ -242,22 +260,52 @@ async function selectConversation(c) {
   domain.value = c.domain;
   await act(refresh);
 }
+async function pickImage(e) {
+  const f = e.target.files?.[0];
+  e.target.value = "";
+  if (!f) return;
+  if (f.size > 8 * 1024 * 1024) {
+    error.value = "图片不能超过 8 MB";
+    return;
+  }
+  if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(f.type)) {
+    error.value = "仅支持 PNG / JPG / WEBP / GIF 图片";
+    return;
+  }
+  const base64 = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = () => reject(Error("读取图片失败"));
+    reader.readAsDataURL(f);
+  });
+  pendingImage.value = { data: base64, mime: f.type, name: f.name };
+  draft.value = null;
+}
+function clearImage() {
+  pendingImage.value = null;
+  draft.value = null;
+}
 async function ask() {
   await act(async () => {
     if (
       !draft.value ||
       draft.value.question !== question.value ||
-      draft.value.conversation_id !== conversationId.value
+      draft.value.conversation_id !== conversationId.value ||
+      Boolean(draft.value.image) !== Boolean(pendingImage.value)
     )
       draft.value = {
         request_id: crypto.randomUUID(),
         question: question.value,
         domain: domain.value,
         conversation_id: conversationId.value || undefined,
+        image: pendingImage.value
+          ? { data: pendingImage.value.data, mime: pendingImage.value.mime }
+          : undefined,
       };
     const t = await call("/turns", draft.value);
     conversationId.value = t.conversation_id;
     question.value = "";
+    pendingImage.value = null;
     draft.value = null;
     await refresh();
   });
@@ -340,6 +388,129 @@ async function openDoc(d) {
       checked: false,
       reason: "",
     };
+    await loadAnnotation();
+  });
+}
+async function loadAnnotation() {
+  annotation.value = null;
+  annotationEvidence.value = "";
+  suggested.value = null;
+  if (!mayReviewDoc(doc.value)) return;
+  try {
+    const a = await call(`/documents/${doc.value.id}/annotation`);
+    annotation.value = a;
+    annotationForm.value = a.annotation
+      ? formFromFields(a.annotation.fields)
+      : blankAnnotationForm();
+  } catch {
+    annotationForm.value = blankAnnotationForm();
+  }
+}
+function blankAnnotationForm() {
+  return {
+    title: "",
+    summary: "",
+    knowledge_type: "",
+    crop: "",
+    variety: "",
+    growth_stage: "",
+    cultivation_method: "",
+    region: "",
+    greenhouse: "",
+    applicable_conditions: "",
+    exclusions: "",
+    keywords: "",
+    evidence_locations: "",
+    verification_notes: "",
+  };
+}
+function formFromFields(f) {
+  const join = (arr) => (Array.isArray(arr) ? arr.join("\n") : "");
+  return {
+    title: f.title || "",
+    summary: f.summary || "",
+    knowledge_type: f.knowledge_type || "",
+    crop: f.crop || "",
+    variety: f.variety || "",
+    growth_stage: f.growth_stage || "",
+    cultivation_method: f.cultivation_method || "",
+    region: f.region || "",
+    greenhouse: f.greenhouse || "",
+    applicable_conditions: join(f.applicable_conditions),
+    exclusions: join(f.exclusions),
+    keywords: join(f.keywords),
+    evidence_locations: join(f.evidence_locations),
+    verification_notes: join(f.verification_notes),
+  };
+}
+function fieldsFromForm() {
+  const fields = { ...annotationForm.value };
+  for (const key of [
+    "applicable_conditions",
+    "exclusions",
+    "keywords",
+    "evidence_locations",
+    "verification_notes",
+  ]) {
+    fields[key] = String(fields[key] || "")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 30);
+  }
+  for (const key of [
+    "title",
+    "summary",
+    "knowledge_type",
+    "crop",
+    "variety",
+    "growth_stage",
+    "cultivation_method",
+    "region",
+    "greenhouse",
+  ]) {
+    fields[key] = String(fields[key] || "").trim() || null;
+  }
+  return fields;
+}
+async function suggestAnnotation() {
+  await act(async () => {
+    suggested.value = await call(
+      `/documents/${doc.value.id}/annotation/suggest`,
+      {},
+    );
+    annotationForm.value = formFromFields(suggested.value.fields);
+    notice.value = `已填入 AI 建议（${suggested.value.model}），请逐项核对，未提供的字段请保留为空。`;
+  });
+}
+async function saveAnnotation() {
+  await act(async () => {
+    const fields = fieldsFromForm();
+    if (!fields.title) throw Error("标注标题不能为空");
+    const a = annotation.value?.annotation || {
+      revision: 0,
+      document_revision: doc.value.revision,
+    };
+    const saved = await call(`/documents/${doc.value.id}/annotation`, {
+      revision: a.revision,
+      document_revision: doc.value.revision,
+      fields,
+    });
+    annotation.value = { annotation: saved, stale: false };
+    notice.value = "标注草稿已保存。";
+  });
+}
+async function approveAnnotation() {
+  await act(async () => {
+    const a = annotation.value?.annotation;
+    if (!a) throw Error("请先保存标注草稿");
+    await call(`/documents/${doc.value.id}/annotation/approve`, {
+      revision: a.revision,
+      checked: true,
+      evidence: annotationEvidence.value.trim() || "已对照原文核实",
+    });
+    await loadAnnotation();
+    notice.value = "标注已确认，可用于知识资产包导出。";
   });
 }
 function mayReviewDoc(d) {
@@ -353,6 +524,9 @@ async function documentAction(action) {
     doc.value = await call(`/documents/${doc.value.id}/${action}`, {
       ...docForm.value,
       revision: doc.value.revision,
+      ...(doc.value.blocking?.status === "blocked"
+        ? { confirm_block: true }
+        : {}),
     });
     notice.value = "资料处理已保存。";
     await refresh();
@@ -402,6 +576,36 @@ async function saveRules() {
   await act(async () => {
     rules.value = await call("/rules", rules.value);
     notice.value = "分流规则已保存。";
+  });
+}
+async function saveBlockRule() {
+  await act(async () => {
+    if (!ruleForm.value.name.trim() || !ruleForm.value.pattern.trim())
+      throw Error("请填写规则名称和规则内容");
+    await call("/block-rules", ruleForm.value);
+    ruleForm.value = {
+      name: "",
+      kind: "keyword",
+      pattern: "",
+      action: "block",
+      note: "",
+    };
+    blockRules.value = (await call("/block-rules")).items;
+    notice.value = "拦截规则已保存，新上传资料立即生效。";
+  });
+}
+async function updateBlockRule(r) {
+  await act(async () => {
+    await call(`/block-rules/${r.id}`, r);
+    blockRules.value = (await call("/block-rules")).items;
+    notice.value = "规则已更新。";
+  });
+}
+async function deleteBlockRule(r) {
+  await act(async () => {
+    await call(`/block-rules/${r.id}`, {}, "DELETE");
+    blockRules.value = (await call("/block-rules")).items;
+    notice.value = "规则已删除。";
   });
 }
 async function retryJob(j) {
@@ -628,7 +832,30 @@ onUnmounted(() => {
                     placeholder="例如：大棚湿度持续偏高，调整通风前需要检查哪些数据？"
                   />
                 </label>
+                <div v-if="pendingImage" class="composer-image">
+                  <img
+                    :src="`data:${pendingImage.mime};base64,${pendingImage.data}`"
+                    alt="提问图片"
+                  />
+                  <span>{{ pendingImage.name }}</span>
+                  <button
+                    type="button"
+                    class="text-button"
+                    @click="clearImage"
+                  >
+                    移除图片
+                  </button>
+                </div>
                 <div class="form-bottom">
+                  <span class="image-pick">
+                    <label class="inline-check"
+                      ><input
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp,image/gif"
+                        @change="pickImage"
+                      /><ImagePlus :size="16" />附图片（PNG/JPG/WEBP/GIF，≤8MB，随问题发给模型）</label
+                    >
+                  </span>
                   <small
                     >追问使用你采用的回答；未选择时优先沿用本地有效回答。选择修改不改写已生成的历史。</small
                   ><button
@@ -975,6 +1202,17 @@ onUnmounted(() => {
                   doc.near_duplicates.map((d) => d.name).join("、")
                 }}；请人工核实。
               </p>
+              <p v-if="doc.blocking" class="warning">
+                {{
+                  doc.blocking.status === "blocked"
+                    ? "被拦截规则命中，暂不能发布，需人工核实后处理"
+                    : "命中提示规则，发布前请留意"
+                }}：{{
+                  doc.blocking.hits
+                    .map((h) => `「${h.name}」命中「${h.matched}」`)
+                    .join("、")
+                }}
+              </p>
               <details v-if="doc.cleaned_text">
                 <summary>查看自动清洗结果（含原始位置）</summary>
                 <pre class="document-text">{{ doc.cleaned_text }}</pre>
@@ -982,9 +1220,14 @@ onUnmounted(() => {
               <template
                 v-if="
                   mayReviewDoc(doc) &&
-                  ['pending', 'published', 'rejected'].includes(doc.status)
+                  ['pending', 'published', 'rejected', 'blocked'].includes(
+                    doc.status,
+                  )
                 "
-                ><label
+                ><p v-if="doc.status === 'blocked'" class="warning">
+                  发布或退回将视为人工处理被拦截资料，处理后拦截标记清除。
+                </p>
+                <label
                   >审核文本<textarea v-model="docForm.text" rows="14" /></label
                 ><label
                   >来源核实与适用条件<textarea
@@ -1031,6 +1274,135 @@ onUnmounted(() => {
                   </button>
                   <p class="subtle">问答仍需经过专家审核才能进入训练集。</p>
                 </div></template
+              >
+              <template
+                v-if="
+                  mayReviewDoc(doc) &&
+                  ['pending', 'published', 'rejected', 'blocked'].includes(
+                    doc.status,
+                  )
+                "
+                ><section class="panel block">
+                  <div class="toolbar">
+                    <h2>结构化农业标注</h2>
+                    <span
+                      class="badge"
+                      :class="annotationStatus.class"
+                      >{{ annotationStatus.text }}</span
+                    >
+                  </div>
+                  <p class="subtle">
+                    用统一字段描述每条知识：作物、生育期、栽培方式、适用条件、来源位置与核实状态。原文没有的信息保留为空（未提供），不要猜测。
+                  </p>
+                  <button
+                    class="outline"
+                    :disabled="busy || suggesting"
+                    @click="suggestAnnotation"
+                  >
+                    生成 AI 建议标注
+                  </button>
+                  <p v-if="suggested" class="subtle">
+                    已按 AI 建议（{{ suggested.model }}，基于
+                    {{ suggested.source_used === "cleaned" ? "清洗文本" : "审核文本"
+                    }}）填入表单，请逐项核对。
+                  </p>
+                  <div class="field-grid">
+                    <label
+                      >标题（必填）<input
+                        v-model="annotationForm.title"
+                        maxlength="200" /></label
+                    ><label
+                      >知识类型<select v-model="annotationForm.knowledge_type">
+                        <option value="">未提供</option>
+                        <option
+                          v-for="k in [
+                            '种植知识',
+                            '操作规程',
+                            '设备说明',
+                            '销售知识',
+                            '案例记录',
+                          ]"
+                        >
+                          {{ k }}
+                        </option>
+                      </select></label
+                    ><label
+                      >作物<input
+                        v-model="annotationForm.crop"
+                        maxlength="120" /></label
+                    ><label
+                      >品种<input
+                        v-model="annotationForm.variety"
+                        maxlength="120" /></label
+                    ><label
+                      >生育期<input
+                        v-model="annotationForm.growth_stage"
+                        maxlength="120" /></label
+                    ><label
+                      >栽培方式<input
+                        v-model="annotationForm.cultivation_method"
+                        maxlength="200" /></label
+                    ><label
+                      >地区<input
+                        v-model="annotationForm.region"
+                        maxlength="200" /></label
+                    ><label
+                      >大棚 / 设施<input
+                        v-model="annotationForm.greenhouse"
+                        maxlength="120"
+                    /></label>
+                  </div>
+                  <label
+                    >要点概述<textarea
+                      v-model="annotationForm.summary"
+                      rows="2"
+                      maxlength="4000" /></label
+                  ><label
+                    >适用条件（每行一条）<textarea
+                      v-model="annotationForm.applicable_conditions"
+                      rows="2" /></label
+                  ><label
+                    >不适用 / 排除情况（每行一条）<textarea
+                      v-model="annotationForm.exclusions"
+                      rows="2" /></label
+                  ><label
+                    >关键词（每行一条）<textarea
+                      v-model="annotationForm.keywords"
+                      rows="2" /></label
+                  ><label
+                    >来源位置（段落 / 片段，每行一条）<textarea
+                      v-model="annotationForm.evidence_locations"
+                      rows="2" /></label
+                  ><label
+                    >待核实事项（每行一条）<textarea
+                      v-model="annotationForm.verification_notes"
+                      rows="2" /></label
+                  >
+                  <div class="button-row">
+                    <button
+                      class="primary"
+                      :disabled="busy || !annotationForm.title"
+                      @click="saveAnnotation"
+                    >
+                      保存草稿
+                    </button>
+                    <button
+                      class="outline"
+                      :disabled="busy || !annotation?.annotation"
+                      @click="approveAnnotation"
+                    >
+                      确认标注
+                    </button>
+                    <label class="inline-check"
+                      ><input
+                        v-model="annotationEvidence"
+                      />已对照原文核实，未提供的字段未被猜测</label
+                    >
+                  </div>
+                  <p v-if="annotation?.stale" class="warning">
+                    资料已更新版本，需重新核对标注后再确认。
+                  </p>
+                </section></template
               >
               <pre v-else-if="doc.approved_text" class="document-text">{{
                 doc.approved_text
@@ -1222,6 +1594,71 @@ onUnmounted(() => {
             <button class="primary" :disabled="busy" @click="saveRules">
               保存分流规则
             </button>
+          </section>
+          <section class="panel block">
+            <h2>入库拦截规则</h2>
+            <p class="subtle">
+              资料上传清洗完成后自动匹配；命中「拦截」的文档不能发布，需专家人工核实后处理；命中「提示」仅标记提醒。关键词按空格或逗号分隔，任一命中即触发。
+            </p>
+            <div class="field-grid">
+              <label
+                >规则名称<input v-model="ruleForm.name" placeholder="如：联系方式泄露" /></label
+              ><label
+                >类型<select v-model="ruleForm.kind">
+                  <option value="keyword">关键词</option>
+                  <option value="regex">正则表达式</option>
+                </select></label
+              ><label
+                >规则内容<input
+                  v-model="ruleForm.pattern"
+                  placeholder="关键词用空格或逗号分隔；正则直接填写表达式" /></label
+              ><label
+                >命中动作<select v-model="ruleForm.action">
+                  <option value="block">拦截（不能发布）</option>
+                  <option value="flag">提示（仅标记）</option>
+                </select></label
+              ><label
+                >备注（选填）<input v-model="ruleForm.note" /></label
+              >
+            </div>
+            <button
+              class="primary"
+              :disabled="busy || !ruleForm.name.trim() || !ruleForm.pattern.trim()"
+              @click="saveBlockRule"
+            >
+              添加规则
+            </button>
+            <div v-for="r in blockRules" class="list-row">
+              <div>
+                <strong>{{ r.name }}</strong
+                ><small
+                  >{{ r.kind === "regex" ? "正则" : "关键词" }} ·
+                  {{ r.action === "block" ? "拦截" : "提示" }} ·
+                  {{ r.enabled ? "启用" : "停用" }} · {{ r.pattern }}
+                  {{ r.note ? "· " + r.note : "" }}</small
+                >
+              </div>
+              <button
+                class="outline"
+                :disabled="busy"
+                @click="
+                  r.enabled = !r.enabled;
+                  updateBlockRule(r);
+                "
+              >
+                {{ r.enabled ? "停用" : "启用" }}
+              </button>
+              <button
+                class="outline"
+                :disabled="busy"
+                @click="deleteBlockRule(r)"
+              >
+                删除
+              </button>
+            </div>
+            <p v-if="!blockRules.length" class="empty">
+              暂无拦截规则。未配置规则时资料不会触发拦截。
+            </p>
           </section>
           <section class="panel block">
             <h2>运行任务与异常</h2>
@@ -1658,6 +2095,51 @@ select {
 .composer-v3 {
   padding: 20px;
 }
+.composer-image {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: #f6f9f3;
+  border: 1px solid #e4ecd9;
+  border-radius: 8px;
+  margin: 12px 0;
+}
+.composer-image img {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid #dfe7e3;
+  flex-shrink: 0;
+}
+.composer-image span {
+  flex: 1;
+  font-size: 12px;
+  color: #718260;
+  overflow-wrap: anywhere;
+}
+.image-pick {
+  display: inline-flex;
+  align-items: center;
+}
+.image-pick .inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 400;
+  font-size: 12px;
+  color: #4d7661;
+  cursor: pointer;
+  margin: 0;
+  white-space: nowrap;
+}
+.image-pick .inline-check input {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+}
 .form-bottom {
   display: flex;
   gap: 20px;
@@ -1754,6 +2236,13 @@ summary {
 .badge {
   white-space: normal;
   flex-shrink: 0;
+}
+.button-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  flex-wrap: wrap;
 }
 a.text-button {
   display: inline-flex;

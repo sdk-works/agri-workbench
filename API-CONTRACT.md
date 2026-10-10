@@ -16,7 +16,7 @@
 
 - GET `/conversations`：自己的会话。
 - GET `/turns?conversation_id=...`：自己的问答轮；反馈前隐藏真实模型，普通员工永不接收裁判结果。
-- POST `/turns`：`{request_id,question,domain,conversation_id?}`，202 返回已持久化任务。相同 request_id 幂等，问题不同返回 409。
+- POST `/turns`：`{request_id,question,domain,conversation_id?,image?}`，202 返回已持久化任务。相同 request_id 幂等，问题不同返回 409。`image` 可选 `{mime:"image/png|image/jpeg|image/webp|image/gif",data:"裸base64"}`，最大 8 MB；随当前问题传给模型（Ollama 走 images 数组、兼容接口走 image_url），图片数据不出现在列表返回中。
 - POST `/turns/:id/feedback`：`{choice,comment?}`，choice 为 A/B/tie/both_bad/insufficient。只允许本人反馈，可更新；不改写历史上下文。
 
 模型任务持久化，生成、裁判、解析分队列异步执行。生成中断不会自动重复付费请求；裁判/解析中断可恢复。单实例部署，裁判恢复为至少一次执行，不能保证供应商只计费一次。
@@ -38,9 +38,14 @@
 - POST `/documents`：`{name,base64,domain,source,tags?}`，202 保存原文件并排队清洗；重复文件返回 existing document。
 - GET `/documents/:id`：允许范围内的清洗/发布文本；专家可读发布历史。
 - GET `/documents/:id/original`：本人或授权专家可下载原文件，附件响应。
-- POST `/documents/:id/publish`：专家提交 `{revision,text,evidence,checked:true}`，保留审核版本。
-- POST `/documents/:id/reject`：专家提交 `{revision,reason}`。
+- POST `/documents/:id/publish`：专家提交 `{revision,text,evidence,checked:true,confirm_block?}`，保留审核版本。被拦截（blocked）资料需 `confirm_block:true` 视为人工核实放行，发布后拦截标记清除。
+- POST `/documents/:id/reject`：专家提交 `{revision,reason,confirm_block?}`；被拦截资料退回同样需人工确认，处理后拦截标记清除。
 - POST `/documents/:id/training-question`：专家提交 `{request_id,question}`，以发布资料为指定来源建立送审候选。
+
+## 入库拦截规则
+
+- GET/POST `/block-rules`、PUT/DELETE `/block-rules/:id`：仅管理员。规则 `{name,kind:"keyword"|"regex",pattern,action:"block"|"flag",note?,enabled?}`。keyword 按空格或逗号分隔，任一命中触发；regex 直接编译（无效正则 400）。
+- 资料上传清洗完成后自动匹配：命中 block → 文档状态 blocked，不能发布；命中 flag → 文档保持待审核但带 `blocking` 标记。列表/详情返回 `blocking:{status,hits:[{id,name,action,matched}],at}`。
 
 ## 管理与统计
 

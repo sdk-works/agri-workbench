@@ -606,3 +606,90 @@ test("training interfaces pin reviewed versions; missing executor returns 503 wi
   assert.equal(capabilities.training.configured, false);
   assert.equal(capabilities.asset_packages, true);
 });
+
+test("annotation suggest returns normalized fields for expert review", async (t) => {
+  const f = await fixture(t, {
+    call: async (role) => ({
+      answer: JSON.stringify({
+        title: "番茄湿度核查",
+        crop: "番茄",
+        variety: null,
+        growth_stage: "结果期",
+        knowledge_type: "操作规程",
+        applicable_conditions: ["核对传感器单位", "", 42],
+        keywords: ["湿度", "湿度"],
+        verification_notes: ["原文未说明施肥浓度"],
+        evidence_locations: ["段落 1"],
+        bogus_field: "应被忽略",
+      }),
+      model: role + "-model",
+      provider: "local",
+      usage: { input_tokens: 10, output_tokens: 10 },
+    }),
+  });
+  const employee = await f.add("employee"),
+    expert = await f.add("expert", "expert");
+  const d = await source(f, employee, expert);
+  assert.equal(
+    (
+      await f.request(
+        `/documents/${d.id}/annotation/suggest`,
+        {},
+        employee.cookie,
+      )
+    ).status,
+    403,
+  );
+  const out = await f.request(
+    `/documents/${d.id}/annotation/suggest`,
+    {},
+    expert.cookie,
+  );
+  assert.equal(out.status, 200);
+  assert.equal(out.data.schema_version, 2);
+  assert.equal(out.data.document_revision, d.revision);
+  assert.equal(out.data.fields.crop, "番茄");
+  assert.equal(out.data.fields.growth_stage, "结果期");
+  assert.equal(out.data.fields.title, "番茄湿度核查");
+  assert.equal(out.data.fields.variety, null);
+  assert.deepEqual(out.data.fields.verification_notes, ["原文未说明施肥浓度"]);
+  assert.deepEqual(out.data.fields.applicable_conditions, ["核对传感器单位"]);
+  assert.deepEqual(out.data.fields.keywords, ["湿度"]);
+  assert.equal(out.data.fields.bogus_field, undefined);
+  assert.equal(out.data.source_used, "cleaned");
+});
+
+test("annotation suggest fails cleanly when local model is unavailable", async (t) => {
+  const f = await fixture(t, {
+    call: async () => {
+      throw Object.assign(Error("local 模型未配置"), { code: "configuration" });
+    },
+  });
+  const employee = await f.add("employee"),
+    expert = await f.add("expert", "expert");
+  const d = await source(f, employee, expert);
+  const out = await f.request(
+    `/documents/${d.id}/annotation/suggest`,
+    {},
+    expert.cookie,
+  );
+  assert.equal(out.status, 503);
+  assert.match(out.data.error, /模型未配置/);
+  const unparsed = await fixture(t, {
+    call: async () => ({
+      answer: "抱歉，我无法提供结构化输出",
+      model: "local-model",
+      provider: "local",
+      usage: {},
+    }),
+  });
+  const expert2 = await unparsed.add("expert", "expert"),
+    employee2 = await unparsed.add("employee");
+  const d2 = await source(unparsed, employee2, expert2);
+  const bad = await unparsed.request(
+    `/documents/${d2.id}/annotation/suggest`,
+    {},
+    expert2.cookie,
+  );
+  assert.equal(bad.status, 502);
+});

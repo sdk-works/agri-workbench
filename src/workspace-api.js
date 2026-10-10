@@ -1,6 +1,6 @@
-export async function call(path, body) {
+export async function call(path, body, method) {
   const res = await fetch("/api/v2" + path, {
-    method: body === undefined ? "GET" : "POST",
+    method: method || (body === undefined ? "GET" : "POST"),
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", "X-Workbench": "1" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),

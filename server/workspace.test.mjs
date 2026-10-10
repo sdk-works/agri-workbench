@@ -627,3 +627,331 @@ test("valid text PDF is extracted with page provenance, empty scan is not silent
   fs.writeFileSync(file, pdf(""));
   await assert.rejects(() => parseDocument(file, "source.pdf"), /未提取到文字/);
 });
+
+test("image question passes image to the gateway and hides base64 from clients", async (t) => {
+  const captured = [];
+  const f = await fixture(t, {
+    call: async (role, messages, json, images) => {
+      captured.push({ role, messages, images });
+      return {
+        answer: `${role} 看了图片的回答`,
+        model: role + "-model",
+        provider: role === "local" ? "local" : "cloud",
+        usage: { input_tokens: 10, output_tokens: 10 },
+      };
+    },
+  });
+  const a = await f.add("employee");
+  const out = await f.request(
+    "/turns",
+    {
+      request_id: randomUUID(),
+      question: "这张图片里的叶片是什么问题？",
+      domain: "种植管理",
+      image: {
+        mime: "image/png",
+        data: Buffer.from("fake-png-bytes").toString("base64"),
+      },
+    },
+    a.cookie,
+  );
+  assert.equal(out.status, 202);
+  await f.ws.tick("generate");
+  assert.equal(captured.length, 2);
+  for (const c of captured) {
+    assert.equal(c.images.length, 1);
+    assert.equal(c.images[0].mime, "image/png");
+    assert.equal(
+      c.images[0].data,
+      Buffer.from("fake-png-bytes").toString("base64"),
+    );
+    assert.equal(c.messages.at(-1).role, "user");
+  }
+  const list = (await f.request("/turns", undefined, a.cookie)).data.items;
+  const turn = list.find((x) => x.question.startsWith("这张图片"));
+  assert(turn.image);
+  assert.equal(turn.image.has_image, true);
+  assert.equal(turn.image.mime, "image/png");
+  assert(!turn.image.data);
+});
+
+test("image question rejects bad mime, oversized and invalid base64", async (t) => {
+  const f = await fixture(t),
+    a = await f.add("employee");
+  const base = {
+    request_id: randomUUID(),
+    question: "看图提问",
+    domain: "种植管理",
+  };
+  assert.equal(
+    (
+      await f.request(
+        "/turns",
+        { ...base, image: { mime: "image/tiff", data: "AA==" } },
+        a.cookie,
+      )
+    ).status,
+    400,
+  );
+  assert.equal(
+    (
+      await f.request(
+        "/turns",
+        { ...base, image: { mime: "image/png", data: "not-base64!!" } },
+        a.cookie,
+      )
+    ).status,
+    400,
+  );
+  assert.equal(
+    (
+      await f.request(
+        "/turns",
+        {
+          ...base,
+          image: { mime: "image/png", data: "A".repeat(11200001) },
+        },
+        a.cookie,
+      )
+    ).status,
+    400,
+  );
+});
+
+test("gateway embeds images for ollama and compatible adapters", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agri-img-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const calls = [];
+  const gw = createGateway(
+    {
+      OLLAMA_BASE: "http://127.0.0.1:11434",
+      LOCAL_MODEL: "qwen3-27b",
+      ZHIPU_API_KEY: "cloud-key",
+    },
+    path.join(dir, "config.json"),
+    {
+      fetcher: async (url, options) => {
+        calls.push({ url, body: JSON.parse(options.body) });
+        return {
+          ok: true,
+          json: async () =>
+            url.endsWith("/api/chat")
+              ? { message: { content: "本地看图回答" } }
+              : { choices: [{ message: { content: "云端看图回答" } }] },
+        };
+      },
+    },
+  );
+  const messages = [
+    { role: "system", content: "你是农业助手" },
+    { role: "user", content: "看看这张图" },
+  ];
+  const image = { mime: "image/jpeg", data: "aGVsbG8=" };
+  await gw.call("local", messages, false, [image]);
+  await gw.call("cloud", messages, false, [image]);
+  const local = calls[0].body,
+    cloud = calls[1].body;
+  assert.deepEqual(local.messages.at(-1).images, ["aGVsbG8="]);
+  assert.equal(local.messages.at(-1).content, "看看这张图");
+  assert.deepEqual(cloud.messages.at(-1).content, [
+    { type: "text", text: "看看这张图" },
+    {
+      type: "image_url",
+      image_url: { url: "data:image/jpeg;base64,aGVsbG8=" },
+    },
+  ]);
+  await gw.call("cloud", messages);
+  assert.equal(calls[2].body.messages.at(-1).content, "看看这张图");
+});
+
+test("block rules intercept uploads, gate publishing and clear on expert handling", async (t) => {
+  const f = await fixture(t),
+    expert = await f.add("expert1", "expert"),
+    employee = await f.add("emp1");
+  assert.equal(
+    (await f.request("/block-rules", undefined, employee.cookie)).status,
+    403,
+  );
+  assert.equal(
+    (
+      await f.request(
+        "/block-rules",
+        { name: "x", kind: "keyword", pattern: "y", action: "block" },
+        employee.cookie,
+      )
+    ).status,
+    403,
+  );
+  const created = await f.request(
+    "/block-rules",
+    {
+      name: "联系方式",
+      kind: "keyword",
+      pattern: "手机号,13812345678,电话",
+      action: "block",
+      note: "防止泄露",
+    },
+    f.admin,
+  );
+  assert.equal(created.status, 201);
+  assert.equal(
+    (
+      await f.request(
+        "/block-rules",
+        { name: "bad", kind: "regex", pattern: "([", action: "block" },
+        f.admin,
+      )
+    ).status,
+    400,
+  );
+  const up = await f.request(
+    "/documents",
+    {
+      name: "含电话.txt",
+      base64: Buffer.from("番茄施肥方案 13812345678 每亩用量").toString(
+        "base64",
+      ),
+      domain: domains[0],
+      source: "记录",
+    },
+    employee.cookie,
+  );
+  assert.equal(up.status, 202);
+  const id = up.data.document.id;
+  await f.ws.tick("parse");
+  const blocked = (
+    await f.request("/documents/" + id, undefined, expert.cookie)
+  ).data;
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.blocking.status, "blocked");
+  assert(blocked.blocking.hits.some((h) => h.name === "联系方式"));
+  assert.equal(
+    (
+      await f.request(
+        `/documents/${id}/publish`,
+        {
+          revision: 1,
+          text: "番茄施肥方案",
+          checked: true,
+          evidence: "记录",
+        },
+        expert.cookie,
+      )
+    ).status,
+    400,
+  );
+  const pub = await f.request(
+    `/documents/${id}/publish`,
+    {
+      revision: 1,
+      text: "番茄施肥方案（已去除联系方式）",
+      checked: true,
+      evidence: "人工核实后发布",
+      confirm_block: true,
+    },
+    expert.cookie,
+  );
+  assert.equal(pub.status, 200);
+  assert.equal(pub.data.status, "published");
+  assert.equal(pub.data.blocking, null);
+});
+
+test("flag rules mark but do not block; reject clears blocking", async (t) => {
+  const f = await fixture(t),
+    expert = await f.add("expert1", "expert"),
+    employee = await f.add("emp1");
+  await f.request(
+    "/block-rules",
+    { name: "提醒词", kind: "keyword", pattern: "待核实", action: "flag" },
+    f.admin,
+  );
+  const up = await f.request(
+    "/documents",
+    {
+      name: "待核实.txt",
+      base64: Buffer.from("此方案待核实后使用").toString("base64"),
+      domain: domains[0],
+      source: "记录",
+    },
+    employee.cookie,
+  );
+  await f.ws.tick("parse");
+  const d = (
+    await f.request("/documents/" + up.data.document.id, undefined, expert.cookie)
+  ).data;
+  assert.equal(d.status, "pending");
+  assert.equal(d.blocking.status, "flagged");
+  const up2 = await f.request(
+    "/documents",
+    {
+      name: "正常.txt",
+      base64: Buffer.from("正常种植要点").toString("base64"),
+      domain: domains[0],
+      source: "记录",
+    },
+    employee.cookie,
+  );
+  await f.ws.tick("parse");
+  const d2 = (
+    await f.request("/documents/" + up2.data.document.id, undefined, expert.cookie)
+  ).data;
+  assert.equal(d2.status, "pending");
+  assert.equal(d2.blocking, null);
+  await f.request(
+    `/documents/${up.data.document.id}/reject`,
+    { revision: 1, reason: "待核实内容退回" },
+    expert.cookie,
+  );
+  const after = (
+    await f.request("/documents/" + up.data.document.id, undefined, expert.cookie)
+  ).data;
+  assert.equal(after.status, "rejected");
+  assert.equal(after.blocking, null);
+});
+
+test("block rule CRUD updates and deletes", async (t) => {
+  const f = await fixture(t);
+  const created = await f.request(
+    "/block-rules",
+    { name: "关键词", kind: "keyword", pattern: "甲,乙", action: "block" },
+    f.admin,
+  );
+  const id = created.data.id;
+  const upd = await f.request(
+    `/block-rules/${id}`,
+    {
+      name: "关键词改",
+      kind: "keyword",
+      pattern: "甲,丙",
+      action: "flag",
+      enabled: false,
+    },
+    f.admin,
+    "PUT",
+  );
+  assert.equal(upd.status, 200);
+  assert.equal(upd.data.enabled, false);
+  const emp = await f.add("emp2");
+  const up = await f.request(
+    "/documents",
+    {
+      name: "丙.txt",
+      base64: Buffer.from("甲丙内容").toString("base64"),
+      domain: domains[0],
+      source: "记录",
+    },
+    emp.cookie,
+  );
+  await f.ws.tick("parse");
+  const d = (
+    await f.request("/documents/" + up.data.document.id, undefined, f.admin)
+  ).data;
+  assert.equal(d.status, "pending");
+  assert.equal(d.blocking, null);
+  const del = await f.request(`/block-rules/${id}`, {}, f.admin, "DELETE");
+  assert.equal(del.status, 200);
+  assert.equal(
+    (await f.request("/block-rules", undefined, f.admin)).data.items.length,
+    0,
+  );
+});

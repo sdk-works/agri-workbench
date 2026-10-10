@@ -79,9 +79,9 @@ export async function fixture(
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${server.address().port}/api/v2`;
-  async function request(route, body, cookie = "") {
+  async function request(route, body, cookie = "", method) {
     const res = await fetch(base + route, {
-      method: body === undefined ? "GET" : "POST",
+      method: method || (body === undefined ? "GET" : "POST"),
       headers: {
         "Content-Type": "application/json",
         "X-Workbench": "1",

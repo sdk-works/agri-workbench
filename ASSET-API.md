@@ -15,6 +15,7 @@
 | POST | `/documents/:id/ocr` | 当前返回 503 / OCR_NOT_CONFIGURED |
 | GET | `/documents/:id/annotation` | 标注、资料版本与 stale 状态 |
 | POST | `/documents/:id/annotation` | 专家保存草稿，保留修订历史 |
+| POST | `/documents/:id/annotation/suggest` | 本地模型按清洗/审核文本生成结构化标注建议（只建议不落库，专家核对后保存） |
 | POST | `/documents/:id/annotation/approve` | 专家确认与当前已发布资料一致 |
 | GET | `/documents/:id/knowledge?format=json` | 下载当前已审核知识 JSON；format 可改为 md |
 
@@ -34,7 +35,7 @@
 }
 ```
 
-首次标注 revision=0，后续使用最新返回值。未提供的信息保留 null 或空数组，不自动猜测。审批提交 `{"revision":1,"checked":true,"evidence":"已与原文核对"}`。重新发布资料后，旧标注不能直接导出，必须更新并再次审核。下载可带 `document_revision` 和 `annotation_revision`，版本不一致返回 409；响应含 ETag。
+首次标注 revision=0，后续使用最新返回值。未提供的信息保留 null 或空数组，不自动猜测。`verification_notes`（待核实事项）用于记录原文未说明、专家需核实的要点。`POST /documents/:id/annotation/suggest` 返回建议字段（基于清洗或审核文本，最多 20,000 字符），原文没有的信息返回 null 或空数组；本地模型未配置返回 503，输出无法解析返回 502。审批提交 `{"revision":1,"checked":true,"evidence":"已与原文核对"}`。重新发布资料后，旧标注不能直接导出，必须更新并再次审核。下载可带 `document_revision` 和 `annotation_revision`，版本不一致返回 409；响应含 ETag。
 
 ## 批量导入
 

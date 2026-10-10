@@ -25,6 +25,7 @@ export const kinds = [
   "candidate_batches",
   "candidates",
   "training_jobs",
+  "block_rules",
 ];
 export async function openRepository({ filename, databaseUrl }) {
   const pool = databaseUrl
