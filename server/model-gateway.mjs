@@ -188,7 +188,7 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
       if (!reader)
         throw Object.assign(Error("模型服务不支持流式响应"), { code: "invalid_output" });
       const decoder = new TextDecoder();
-      let text = "", buf = "", usage = null;
+      let text = "", buf = "", usage = null, finished = false, sawError = null;
       try {
         for (;;) {
           const { done, value } = await reader.read();
@@ -205,19 +205,27 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
                 let o = null;
                 try { o = JSON.parse(line); } catch {}
                 if (o) {
-                  delta = o.message?.content || "";
-                  if (o.prompt_eval_count != null || o.eval_count != null)
-                    usage = { input_tokens: o.prompt_eval_count || 0, output_tokens: o.eval_count || 0 };
+                  if (o.error) sawError = typeof o.error === "string" ? o.error : JSON.stringify(o.error);
+                  else {
+                    delta = o.message?.content || "";
+                    if (o.done === true) finished = true;
+                    if (o.prompt_eval_count != null || o.eval_count != null)
+                      usage = { input_tokens: o.prompt_eval_count || 0, output_tokens: o.eval_count || 0 };
+                  }
                 }
               }
             } else if (line.startsWith("data:")) {
               const d = line.slice(5).trim();
-              if (d && d !== "[DONE]") {
+              if (d === "[DONE]") finished = true;
+              else if (d) {
                 let o = null;
                 try { o = JSON.parse(d); } catch {}
                 if (o) {
-                  delta = o.choices?.[0]?.delta?.content || "";
-                  if (o.usage) usage = o.usage;
+                  if (o.error) sawError = typeof o.error === "string" ? o.error : JSON.stringify(o.error);
+                  else {
+                    delta = o.choices?.[0]?.delta?.content || "";
+                    if (o.usage) usage = o.usage;
+                  }
                 }
               }
             }
@@ -233,6 +241,10 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
           { code: /timeout/i.test(e.name) ? "timeout" : "network" },
         );
       }
+      if (sawError)
+        throw Object.assign(Error(`模型返回错误：${sawError}`), { code: "upstream_error" });
+      if (!finished)
+        throw Object.assign(Error("模型响应不完整（流中断，缺少结束标记）"), { code: "invalid_output" });
       if (typeof text !== "string" || !text.trim())
         throw Object.assign(Error("模型返回空回答"), { code: "invalid_output" });
       const inputTokens = usage?.prompt_tokens ?? usage?.input_tokens;

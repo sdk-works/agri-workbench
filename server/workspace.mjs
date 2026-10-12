@@ -808,7 +808,7 @@ export function createWorkspace({
         if (j.type === "generate") {
           const t = await db.get("turns", j.turn_id);
           for (const c of t.candidates)
-            if (c.status === "pending")
+            if (c.status === "pending" || c.status === "generating")
               Object.assign(c, {
                 status: "failed",
                 error: "服务重启中断，未自动重复计费请求",
