@@ -310,6 +310,36 @@ async function ask() {
     await refresh();
   });
 }
+function onComposerKeydown(e) {
+  if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
+  e.preventDefault();
+  if (busy.value) return;
+  if (!question.value.trim()) return;
+  if (turns.value.some((t) => t.status === "generating")) return;
+  ask();
+}
+function onComposerPaste(e) {
+  const items = e.clipboardData || window.clipboardData;
+  if (!items) return;
+  let file = null;
+  for (const it of items.items || []) {
+    if (it.type && it.type.indexOf("image/") === 0) {
+      file = it.getAsFile();
+      break;
+    }
+  }
+  if (!file) return;
+  e.preventDefault();
+  const input = e.currentTarget
+    ?.closest(".composer-v3")
+    ?.querySelector(".image-pick input[type=file]");
+  if (input) {
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    input.files = dt.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+}
 async function feedback(t, choice) {
   await act(async () => {
     await call(`/turns/${t.id}/feedback`, {
@@ -826,6 +856,8 @@ onUnmounted(() => {
                   >{{ turns.length ? "继续追问" : "你的问题"
                   }}<textarea
                     v-model="question"
+                    @keydown="onComposerKeydown"
+                    @paste="onComposerPaste"
                     rows="3"
                     maxlength="4000"
                     required
@@ -2126,13 +2158,28 @@ select {
 .image-pick .inline-check {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-weight: 400;
-  font-size: 12px;
-  color: #4d7661;
+  gap: 8px;
+  padding: 8px 16px;
+  margin: 2px 0;
+  background: #e6f2ec;
+  border: 2px solid #2f7d5f;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 14px;
+  color: #1b5e45;
   cursor: pointer;
-  margin: 0;
   white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s, transform 0.15s, box-shadow 0.15s;
+  box-shadow: 0 1px 4px rgba(31, 94, 70, 0.18);
+}
+.image-pick .inline-check:hover {
+  background: #d3eadd;
+  border-color: #1b6b4f;
+  transform: translateY(-1px);
+  box-shadow: 0 3px 8px rgba(31, 94, 70, 0.22);
+}
+.image-pick .inline-check:active {
+  transform: translateY(0);
 }
 .image-pick .inline-check input {
   position: absolute;

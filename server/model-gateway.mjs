@@ -129,7 +129,7 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
     msgs[msgs.length - 1] = last;
     return msgs;
   }
-  async function call(role, messages, json = false, images = undefined) {
+  async function call(role, messages, json = false, images = undefined, onToken = undefined) {
     const c = { ...config[role] };
     if (!c?.base_url || !c.model || (c.adapter === "compatible" && !c.api_key))
       throw Object.assign(Error(`${role} 模型未配置`), {
@@ -137,18 +137,19 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
       });
     const local = c.adapter === "ollama",
       started = Date.now();
+    const stream = Boolean(onToken);
     const payload = local
       ? {
           model: c.model,
           messages: withImages(messages, images, { local: true }),
-          stream: false,
+          stream,
           options: { temperature: json ? 0.1 : 0.5 },
           ...(json ? { format: "json" } : {}),
         }
       : {
           model: c.model,
           messages: withImages(messages, images, { local: false }),
-          stream: false,
+          stream,
           temperature: json ? 0.1 : 0.5,
         };
     let res;
@@ -182,6 +183,78 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
               ? "upstream_error"
               : "configuration",
       });
+    if (stream) {
+      const reader = res.body && typeof res.body.getReader === "function" ? res.body.getReader() : null;
+      if (!reader)
+        throw Object.assign(Error("模型服务不支持流式响应"), { code: "invalid_output" });
+      const decoder = new TextDecoder();
+      let text = "", buf = "", usage = null;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line) continue;
+            let delta = "";
+            if (local) {
+              if (line.startsWith("{")) {
+                let o = null;
+                try { o = JSON.parse(line); } catch {}
+                if (o) {
+                  delta = o.message?.content || "";
+                  if (o.prompt_eval_count != null || o.eval_count != null)
+                    usage = { input_tokens: o.prompt_eval_count || 0, output_tokens: o.eval_count || 0 };
+                }
+              }
+            } else if (line.startsWith("data:")) {
+              const d = line.slice(5).trim();
+              if (d && d !== "[DONE]") {
+                let o = null;
+                try { o = JSON.parse(d); } catch {}
+                if (o) {
+                  delta = o.choices?.[0]?.delta?.content || "";
+                  if (o.usage) usage = o.usage;
+                }
+              }
+            }
+            if (delta) {
+              text += delta;
+              try { onToken(delta); } catch {}
+            }
+          }
+        }
+      } catch (e) {
+        throw Object.assign(
+          Error(/timeout/i.test(e.name) ? "模型请求超时" : "模型连接失败"),
+          { code: /timeout/i.test(e.name) ? "timeout" : "network" },
+        );
+      }
+      if (typeof text !== "string" || !text.trim())
+        throw Object.assign(Error("模型返回空回答"), { code: "invalid_output" });
+      const inputTokens = usage?.prompt_tokens ?? usage?.input_tokens;
+      const outputTokens = usage?.completion_tokens ?? usage?.output_tokens;
+      const estimated_cost =
+        c.input_price != null &&
+        c.output_price != null &&
+        Number.isFinite(inputTokens) &&
+        Number.isFinite(outputTokens)
+          ? (inputTokens * c.input_price + outputTokens * c.output_price) /
+            1000000
+          : null;
+      return {
+        answer: text,
+        model: c.model,
+        provider: local ? "local" : "cloud",
+        role,
+        latency_ms: Date.now() - started,
+        usage,
+        estimated_cost,
+      };
+    }
     const data = await res.json();
     const answer = local
       ? data.message?.content

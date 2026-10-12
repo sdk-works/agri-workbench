@@ -553,11 +553,30 @@ export function createWorkspace({
           },
           ...t.context,
         ];
+        let partial = "";
+        let lastPartialWrite = 0;
         const out = await gateway.call(
           candidate.role,
           messages,
           false,
           t.image ? [t.image] : undefined,
+          (delta) => {
+            partial += delta;
+            const nowT = Date.now();
+            if (nowT - lastPartialWrite >= 900) {
+              lastPartialWrite = nowT;
+              const snap = partial;
+              repo.transaction(async (db) => {
+                const cur = await db.get("turns", t.id);
+                const cc = cur.candidates.find((x) => x.label === candidate.label);
+                if (cc && cc.status !== "completed" && cc.status !== "failed") {
+                  cc.status = "generating";
+                  cc.text = snap;
+                  await db.put("turns", cur);
+                }
+              }).catch(() => {});
+            }
+          },
         );
         await repo.transaction(async (db) => {
           const current = await db.get("turns", t.id);
