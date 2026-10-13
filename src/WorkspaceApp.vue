@@ -350,6 +350,20 @@ async function feedback(t, choice) {
     await refresh();
   });
 }
+async function adopt(t, choice) {
+  await act(async () => {
+    await call(`/turns/${t.id}/adopt`, { choice });
+    notice.value = "已采用，已停止另一条回答。";
+    await refresh();
+  });
+}
+async function cancelTurn(t) {
+  await act(async () => {
+    await call(`/turns/${t.id}/cancel`, {});
+    notice.value = "已停止。";
+    await refresh();
+  });
+}
 async function openReview(r) {
   await act(async () => {
     detail.value = await call("/reviews/" + r.id);
@@ -781,8 +795,24 @@ onUnmounted(() => {
               <article v-for="t in turns" :key="t.id" class="turn">
                 <div class="question-bubble">
                   <small
-                    >第 {{ t.sequence }} 轮 · {{ statusNames[t.status] }}</small
+                    >第 {{ t.sequence }} 轮 · {{
+                      t.candidates.every((c) => c.status === "pending")
+                        ? "排队中"
+                        : statusNames[t.status]
+                    }}</small
                   >
+                  <button
+                    v-if="
+                      t.status === 'generating' &&
+                      !t.feedback &&
+                      !t.candidates.some((c) => c.status === 'stopped')
+                    "
+                    class="text-button stop"
+                    :disabled="busy"
+                    @click="cancelTurn(t)"
+                  >
+                    停止
+                  </button>
                   <p>{{ t.question }}</p>
                 </div>
                 <div class="wb-answers">
@@ -803,13 +833,38 @@ onUnmounted(() => {
                     <p class="answer-content">
                       {{
                         c.status === "pending"
-                          ? "正在生成，请稍候…"
-                          : c.status === "failed"
-                            ? c.error
-                            : c.text
+                          ? "排队中，请稍候…"
+                          : c.status === "generating"
+                            ? "正在回答…"
+                            : c.status === "failed"
+                              ? c.error
+                              : c.status === "stopped"
+                                ? "已停止"
+                                : c.text
                       }}
                     </p>
                   </section>
+                </div>
+                <div
+                  v-if="
+                    t.status === 'generating' &&
+                    t.candidates.some((c) => c.status === 'completed') &&
+                    t.candidates.some(
+                      (c) => !['completed', 'failed'].includes(c.status),
+                    )
+                  "
+                  class="feedback-bar adopt-bar"
+                >
+                  <span>一条已完成，可先采用它并结束另一条：</span>
+                  <button
+                    v-for="c in t.candidates"
+                    :key="'adopt' + c.label"
+                    class="choice"
+                    :disabled="busy || c.status !== 'completed'"
+                    @click="adopt(t, c.label)"
+                  >
+                    采用 {{ c.label }} 并结束另一条
+                  </button>
                 </div>
                 <details v-if="t.references?.length" class="references">
                   <summary>

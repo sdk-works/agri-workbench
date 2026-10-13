@@ -53,6 +53,13 @@ const workspace = createWorkspace({
   readBody,
   legacyStore,
   secureCookies: env.COOKIE_SECURE === "true",
+  limits: {
+    activeGen: Number(env.ACTIVE_GEN_CONCURRENCY || 2),
+    activePerUser: Number(env.ACTIVE_PER_USER || 1),
+    queuedPerUser: Number(env.QUEUED_PER_USER || 1),
+    localConcurrency: Number(env.LOCAL_CONCURRENCY || 2),
+    cloudConcurrency: Number(env.CLOUD_CONCURRENCY || 2),
+  },
 });
 await workspace.start();
 const allowedOrigins = new Set(

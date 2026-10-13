@@ -129,7 +129,7 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
     msgs[msgs.length - 1] = last;
     return msgs;
   }
-  async function call(role, messages, json = false, images = undefined, onToken = undefined) {
+  async function call(role, messages, json = false, images = undefined, onToken = undefined, opts = {}) {
     const c = { ...config[role] };
     if (!c?.base_url || !c.model || (c.adapter === "compatible" && !c.api_key))
       throw Object.assign(Error(`${role} 模型未配置`), {
@@ -138,6 +138,8 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
     const local = c.adapter === "ollama",
       started = Date.now();
     const stream = Boolean(onToken);
+    const timeoutMs = local ? 180000 : 90000;
+    const signal = opts.signal || AbortSignal.timeout(timeoutMs);
     const payload = local
       ? {
           model: c.model,
@@ -164,15 +166,16 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
             ...(c.api_key ? { Authorization: `Bearer ${c.api_key}` } : {}),
           },
           body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(90000),
+          signal,
           redirect: "error",
         },
       );
     } catch (e) {
-      throw Object.assign(
-        Error(/timeout/i.test(e.name) ? "模型请求超时" : "模型连接失败"),
-        { code: /timeout/i.test(e.name) ? "timeout" : "network" },
-      );
+      if (opts.signal?.aborted)
+        throw Object.assign(Error("模型调用已取消"), { code: "canceled" });
+      if (/timeout/i.test(e.name) || e.name === "TimeoutError")
+        throw Object.assign(Error("模型请求超时"), { code: "timeout" });
+      throw Object.assign(Error("模型连接失败"), { code: "network" });
     }
     if (!res.ok)
       throw Object.assign(Error(`模型服务 HTTP ${res.status}`), {
@@ -236,10 +239,11 @@ export function createGateway(env, filename, { fetcher = fetch } = {}) {
           }
         }
       } catch (e) {
-        throw Object.assign(
-          Error(/timeout/i.test(e.name) ? "模型请求超时" : "模型连接失败"),
-          { code: /timeout/i.test(e.name) ? "timeout" : "network" },
-        );
+        if (opts.signal?.aborted)
+          throw Object.assign(Error("模型调用已取消"), { code: "canceled" });
+        if (/timeout/i.test(e.name) || e.name === "TimeoutError")
+          throw Object.assign(Error("模型请求超时"), { code: "timeout" });
+        throw Object.assign(Error("模型连接失败"), { code: "network" });
       }
       if (sawError)
         throw Object.assign(Error(`模型返回错误：${sawError}`), { code: "upstream_error" });
