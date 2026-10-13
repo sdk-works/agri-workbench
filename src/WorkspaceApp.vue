@@ -831,17 +831,24 @@ onUnmounted(() => {
                       }}</small>
                     </h3>
                     <p class="answer-content">
-                      {{
-                        c.status === "pending"
-                          ? "排队中，请稍候…"
-                          : c.status === "generating"
-                            ? "正在回答…"
-                            : c.status === "failed"
-                              ? c.error
-                              : c.status === "stopped"
-                                ? "已停止"
-                                : c.text
-                      }}
+                      <template v-if="c.status === 'pending'">
+                        <span style="display:block;font-size:13px;color:#94a3b8;">排队中，请稍候…</span>
+                      </template>
+                      <template v-else>
+                        <span
+                          v-if="c.status === 'generating'"
+                          style="display:block;font-size:13px;color:#7c3aed;"
+                        >正在回答…</span>
+                        <span
+                          v-else-if="c.status === 'failed'"
+                          style="display:block;font-size:13px;color:#dc2626;"
+                        >{{ c.error }}</span>
+                        <span
+                          v-else-if="c.status === 'stopped'"
+                          style="display:block;font-size:13px;color:#64748b;"
+                        >已停止</span>
+                        <span v-if="c.text" class="cand-text">{{ c.text }}</span>
+                      </template>
                     </p>
                   </section>
                 </div>

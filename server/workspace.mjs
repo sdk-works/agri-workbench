@@ -1,5 +1,4 @@
 import { createAssetService } from "./assets.mjs";
-import { createSemaphore } from "./scheduler.mjs";
 import {
   randomUUID,
   randomBytes,
@@ -83,9 +82,9 @@ export function createWorkspace({
     cloudConcurrency: limits.cloudConcurrency ?? 2,
   };
   let activeGen = 0;
-  const activeOwners = new Set();
-  const semLocal = createSemaphore(conf.localConcurrency);
-  const semCloud = createSemaphore(conf.cloudConcurrency);
+  const activeOwnersCount = new Map(); // owner -> 活跃 generate 任务数（支持 activePerUser）
+  const genRunning = new Set(); // 运行中 generate 任务 id（停机等待用）
+  let schedLock = Promise.resolve(); // 调度领取段互斥，保证额度检查与领取原子
   const jobAborts = new Map();
   const assets = createAssetService({
     repo,
@@ -558,33 +557,10 @@ export function createWorkspace({
       if (!chosen || chosen.status !== "completed")
         fail("只能采用已完成的回答");
       const job = await db.get("jobs", `generate-${id}`);
-      for (const c of t.candidates) {
-        if (c.label !== choice && ["pending", "generating"].includes(c.status))
-          Object.assign(c, {
-            status: "stopped",
-            error: "已采用另一条回答，停止此路",
-            error_code: "stopped",
-            ended_reason: "stopped",
-          });
-      }
       const ctrl = jobAborts.get(job?.id);
-      ctrl?.abort();
-      const f = entity({
-        id: `feedback-${id}`,
-        tenant: u.tenant,
-        owner: u.id,
-        domain: t.domain,
-        turn_id: id,
-        choice,
-        comment: "",
-        updated_at: now(),
-      });
-      await db.put("feedback", f);
-      t.feedback = { choice, comment: "", at: f.updated_at };
-      const good = t.candidates.filter((c) => c.status === "completed").length;
-      t.status = good === 2 ? "completed" : good ? "partial" : "failed";
+      if (ctrl && job && ["queued", "running"].includes(job.status)) ctrl.abort();
+      t.adopted = { choice, at: now() };
       await db.put("turns", t);
-      await route(db, t);
       return safeTurn(t, u);
     });
   }
@@ -653,17 +629,13 @@ export function createWorkspace({
     });
   }
   async function generateCandidate(job, t, candidate, messages, signal) {
-    const sem = candidate.role === "local" ? semLocal : semCloud;
-    let release = null;
+    // 进入运行即标 generating：只要 job 已领取、开始调用模型，就不再显示成排队
+    await markCandidate(job, candidate.label, "generating", null, null);
+    let partial = "",
+      lastPartialWrite = 0;
     try {
-      release = await sem.acquire();
-    } catch {
-      await markCandidate(job, candidate.label, "failed", "排队等待中被取消", "canceled");
-      return;
-    }
-    try {
-      let partial = "",
-        lastPartialWrite = 0;
+      // 并发限流由 model-gateway 按实际上游资源统一执行（含裁判/回退/候选生成），
+      // 这里不再单独 acquire；等待额度期间若被取消由 gateway 抛 canceled。
       const out = await gateway.call(
         candidate.role,
         messages,
@@ -700,7 +672,7 @@ export function createWorkspace({
           usage: out.usage,
           estimated_cost: out.estimated_cost ?? null,
           latency_ms: out.latency_ms,
-          ended_reason: "completed",
+          ended_reason: out.ended_reason || "completed",
         });
         await db.put("turns", current);
       });
@@ -713,8 +685,6 @@ export function createWorkspace({
         signal.aborted ? "已取消" : e.message,
         signal.aborted ? "canceled" : code,
       );
-    } finally {
-      release?.();
     }
   }
   async function runGeneration(job) {
@@ -735,16 +705,36 @@ export function createWorkspace({
     } finally {
       jobAborts.delete(job.id);
     }
+    let adoptedChoice = null;
     await repo.transaction(async (db) => {
       const t = await db.get("turns", job.turn_id);
-      const good = t.candidates.filter((c) => c.status === "completed").length;
+      adoptedChoice = t.adopted?.choice ?? null;
+      // 采用（adopt）后：被停的非采用候选统一标 stopped，区别于 cancel 的 failed
+      if (t.adopted) {
+        for (const c of t.candidates)
+          if (c.label !== t.adopted.choice && c.status !== "completed")
+            Object.assign(c, {
+              status: "stopped",
+              error: "已采用另一条回答，停止此路",
+              error_code: "stopped",
+              ended_reason: "stopped",
+            });
+      }
+      // 长度截止（ended_reason=length）不算完整完成，不进入评测/偏好
+      const good = t.candidates.filter(
+        (c) => c.status === "completed" && c.ended_reason !== "length",
+      ).length;
       t.status = good === 2 ? "completed" : good ? "partial" : "failed";
       t.judge = { status: good === 2 ? "queued" : "unavailable" };
       await db.put("turns", t);
       if (good === 2) await enqueue(db, t, "judge");
       await route(db, t);
     });
-    await finishJob(job, controller.signal.aborted ? "canceled" : "completed");
+    // adopt 停一路视为正常完成；仅用户 cancel 才标 canceled
+    await finishJob(
+      job,
+      adoptedChoice ? "completed" : controller.signal.aborted ? "canceled" : "completed",
+    );
   }
   async function runJudge(job) {
     const t = await repo.get("turns", job.turn_id);
@@ -862,39 +852,66 @@ export function createWorkspace({
     if (type !== "generate") {
       if (running.has(type)) return;
       running.add(type);
-    } else if (activeGen >= conf.activeGen) {
-      return;
     }
     try {
-      const job = await repo.transaction(async (db) => {
-        const available = (await db.list("jobs", { status: "queued" }))
-          .filter((j) => j.type === type && j.next_at <= Date.now())
-          .sort((a, b) => a.created_at.localeCompare(b.created_at));
-        if (!available.length) return null;
-        let j = available[0];
-        if (type === "generate") {
-          const free = available.filter((x) => !activeOwners.has(x.owner));
-          if (!free.length) return null;
-          j = free[0];
+      let job = null;
+      if (type === "generate") {
+        // 领取段互斥：额度检查 + 预留 + 事务领取原子，避免重叠 tick 超领
+        const prev = schedLock;
+        let release;
+        schedLock = new Promise((r) => (release = r));
+        await prev;
+        try {
+          if (stopped) return;
+          if (activeGen >= conf.activeGen) return;
+          job = await repo.transaction(async (db) => {
+            const available = (await db.list("jobs", { status: "queued" }))
+              .filter((j) => j.type === type && j.next_at <= Date.now())
+              .sort((a, b) => a.created_at.localeCompare(b.created_at));
+            if (!available.length) return null;
+            const free = available.filter(
+              (x) =>
+                (activeOwnersCount.get(x.owner) || 0) < conf.activePerUser,
+            );
+            if (!free.length) return null;
+            const j = free[0];
+            j.status = "running";
+            j.attempts++;
+            j.started_at = now();
+            await db.put("jobs", j);
+            activeGen++;
+            activeOwnersCount.set(
+              j.owner,
+              (activeOwnersCount.get(j.owner) || 0) + 1,
+            );
+            return j;
+          });
+        } finally {
+          release();
         }
-        j.status = "running";
-        j.attempts++;
-        j.started_at = now();
-        await db.put("jobs", j);
-        if (["assets", "candidates"].includes(type))
-          await assets.started(db, j);
-        if (type === "judge") {
-          const turn = await db.get("turns", j.turn_id);
-          turn.judge = { status: "running" };
-          await db.put("turns", turn);
-        }
-        if (type === "generate") {
-          activeGen++;
-          activeOwners.add(j.owner);
-        }
-        return j;
-      });
+      } else {
+        job = await repo.transaction(async (db) => {
+          const available = (await db.list("jobs", { status: "queued" }))
+            .filter((j) => j.type === type && j.next_at <= Date.now())
+            .sort((a, b) => a.created_at.localeCompare(b.created_at));
+          if (!available.length) return null;
+          const j = available[0];
+          j.status = "running";
+          j.attempts++;
+          j.started_at = now();
+          await db.put("jobs", j);
+          if (["assets", "candidates"].includes(type))
+            await assets.started(db, j);
+          if (type === "judge") {
+            const turn = await db.get("turns", j.turn_id);
+            turn.judge = { status: "running" };
+            await db.put("turns", turn);
+          }
+          return j;
+        });
+      }
       if (!job) return;
+      if (type === "generate") genRunning.add(job.id);
       try {
         await (
           type === "generate"
@@ -939,8 +956,11 @@ export function createWorkspace({
         });
       } finally {
         if (type === "generate") {
+          genRunning.delete(job.id);
           activeGen--;
-          activeOwners.delete(job.owner);
+          const n = (activeOwnersCount.get(job.owner) || 1) - 1;
+          if (n <= 0) activeOwnersCount.delete(job.owner);
+          else activeOwnersCount.set(job.owner, n);
         } else {
           running.delete(type);
         }
@@ -1035,7 +1055,13 @@ export function createWorkspace({
   async function stop() {
     stopped = true;
     clearInterval(timer);
-    while (running.size) await new Promise((r) => setTimeout(r, 20));
+    // 等待所有运行中的生成任务与后台任务退出（有界排空），
+    // 避免正常停机时关闭数据库打断在途输出与终态保存
+    const deadline = Date.now() + 90000;
+    while (genRunning.size && Date.now() < deadline)
+      await new Promise((r) => setTimeout(r, 20));
+    while (running.size && Date.now() < deadline)
+      await new Promise((r) => setTimeout(r, 20));
   }
 
   async function handle(req, res, url) {

@@ -44,6 +44,12 @@ const repo = await openRepository({
 const gateway = createGateway(
   env,
   env.MODEL_CONFIG_PATH || path.join(root, "data/model-config.json"),
+  {
+    limits: {
+      localConcurrency: Number(env.LOCAL_CONCURRENCY || 2),
+      cloudConcurrency: Number(env.CLOUD_CONCURRENCY || 2),
+    },
+  },
 );
 const workspace = createWorkspace({
   repo,
