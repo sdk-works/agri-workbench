@@ -52,6 +52,7 @@ const gateway = createGateway(
     },
   },
 );
+const imageServer = createImageServer({ repo, env, json, readBody });
 const workspace = createWorkspace({
   repo,
   gateway,
@@ -60,6 +61,7 @@ const workspace = createWorkspace({
   readBody,
   legacyStore,
   secureCookies: env.COOKIE_SECURE === "true",
+  createImageTask: imageServer.createTask,
   limits: {
     activeGen: Number(env.ACTIVE_GEN_CONCURRENCY || 2),
     activePerUser: Number(env.ACTIVE_PER_USER || 1),
@@ -68,7 +70,6 @@ const workspace = createWorkspace({
     cloudConcurrency: Number(env.CLOUD_CONCURRENCY || 2),
   },
 });
-const imageServer = createImageServer({ repo, env, json, readBody });
 await workspace.start();
 const allowedOrigins = new Set(
   (

@@ -108,6 +108,47 @@ export function createImageServer({ repo, env, json, readBody }) {
     }
   }
 
+  // 创建并提交一个图片任务（供 HTTP 路由与问答配图复用）。
+  // u 需含 id/tenant/username；返回最终 task（含 comfy_prompt_id 或 failed 状态）。
+  async function createTask(u, { prompt, size }) {
+    const p = String(prompt || "").trim();
+    if (!p) fail("提示词不能为空");
+    if (p.length > 2000) fail("提示词过长（最多 2000 字符）");
+    if (!SIZES.has(size)) fail("尺寸仅支持 768 或 1024");
+    const seed = Math.floor(Math.random() * 1_000_000) + 1;
+    const task = {
+      id: randomUUID(),
+      owner: u.id,
+      tenant: u.tenant || "park",
+      domain: "image",
+      user_id: u.id,
+      username: u.username || u.name || "",
+      prompt: p,
+      width: size,
+      height: size,
+      seed,
+      status: "queued",
+      created_at: now(),
+      comfy_prompt_id: null,
+      filename: "",
+      error: "",
+      completed_at: "",
+    };
+    await repo.put("image_jobs", task); // 先落库，任务不丢
+    try {
+      const r = await comfy("POST", "/prompt", buildWorkflow(p, size, seed));
+      const pid = r?.prompt_id;
+      if (!pid) fail("出图服务未返回任务号", 502);
+      const rec = { ...task, comfy_prompt_id: pid };
+      await repo.put("image_jobs", rec);
+      return rec;
+    } catch (e) {
+      const rec = { ...task, status: "failed", error: e.message, completed_at: now() };
+      await repo.put("image_jobs", rec);
+      return rec;
+    }
+  }
+
   async function handle(req, res, url) {
     if (!url.pathname.startsWith("/api/v2/")) return false;
     const routePath = url.pathname.slice(7),
@@ -123,43 +164,7 @@ export function createImageServer({ repo, env, json, readBody }) {
     if (routePath === "/images/generate" && method === "POST") {
       const u = await requireUser(req);
       const b = await body();
-      const prompt = String(b.prompt || "").trim();
-      if (!prompt) fail("提示词不能为空");
-      if (prompt.length > 2000) fail("提示词过长（最多 2000 字符）");
-      const size = Number(b.size);
-      if (!SIZES.has(size)) fail("尺寸仅支持 768 或 1024");
-      const seed = Math.floor(Math.random() * 1_000_000) + 1;
-      const task = {
-        id: randomUUID(),
-        owner: u.id,
-        tenant: u.tenant || "park",
-        domain: "image",
-        user_id: u.id,
-        username: u.username || u.name || "",
-        prompt,
-        width: size,
-        height: size,
-        seed,
-        status: "queued",
-        created_at: now(),
-        comfy_prompt_id: null,
-        filename: "",
-        error: "",
-        completed_at: "",
-      };
-      await repo.put("image_jobs", task); // 先落库，任务不丢
-      try {
-        const r = await comfy("POST", "/prompt", buildWorkflow(prompt, size, seed));
-        const pid = r?.prompt_id;
-        if (!pid) fail("出图服务未返回任务号", 502);
-        const rec = { ...task, comfy_prompt_id: pid };
-        await repo.put("image_jobs", rec);
-        return send({ task: rec });
-      } catch (e) {
-        const rec = { ...task, status: "failed", error: e.message, completed_at: now() };
-        await repo.put("image_jobs", rec);
-        return send({ task: rec });
-      }
+      return send({ task: await createTask(u, { prompt: b.prompt, size: Number(b.size) }) });
     }
 
     if (routePath === "/images/tasks" && method === "GET") {
@@ -224,5 +229,5 @@ export function createImageServer({ repo, env, json, readBody }) {
     return false;
   }
 
-  return { handle };
+  return { handle, createTask };
 }

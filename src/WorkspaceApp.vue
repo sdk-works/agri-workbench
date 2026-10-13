@@ -202,6 +202,16 @@ async function refresh() {
     if (current()) {
       conversations.value = list.items;
       turns.value = response.items.sort((a, b) => a.sequence - b.sequence);
+      // 拉取含配图轮次的图片任务状态（在问答里直接显示配图卡片）
+      for (const t of turns.value) {
+        if (!t.gen_image) continue;
+        try {
+          t.imageTask = (await call("/images/tasks/" + t.gen_image)).task;
+        } catch {
+          t.imageTask = { status: "failed", error: "图片状态获取失败" };
+        }
+        if (!current()) break;
+      }
     }
   }
   if (view === "reviews") {
@@ -905,6 +915,47 @@ onUnmounted(() => {
                       </template>
                     </p>
                   </section>
+                </div>
+                <div v-if="t.imageTask" class="panel candidate image-card">
+                  <h3>
+                    配图<small>{{
+                      imageStatus[t.imageTask.status] || t.imageTask.status
+                    }}</small>
+                  </h3>
+                  <template
+                    v-if="
+                      t.imageTask.status === 'completed' &&
+                      t.imageTask.filename
+                    "
+                  >
+                    <img
+                      :src="'/api/v2/images/' + t.imageTask.id + '/file'"
+                      style="
+                        max-width: 100%;
+                        border-radius: 6px;
+                        display: block;
+                        margin: 6px 0;
+                      "
+                      alt="配图"
+                    />
+                    <a
+                      :href="'/api/v2/images/' + t.imageTask.id + '/file'"
+                      class="text-button"
+                      target="_blank"
+                      rel="noopener"
+                    >下载图片</a>
+                  </template>
+                  <span
+                    v-else-if="
+                      ['queued', 'running'].includes(t.imageTask.status)
+                    "
+                    style="color:#94a3b8;font-size:13px;"
+                  >
+                    {{ imageStatus[t.imageTask.status] || t.imageTask.status }}…
+                  </span>
+                  <span v-else style="color:#dc2626;font-size:13px;">
+                    {{ t.imageTask.error || "图片生成失败" }}
+                  </span>
                 </div>
                 <div
                   v-if="
