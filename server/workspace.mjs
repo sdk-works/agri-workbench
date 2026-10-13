@@ -396,6 +396,10 @@ export function createWorkspace({
       at: now(),
     };
   }
+  // 统一完整性判定：长度截止（ended_reason=length）不算完整答案，不进入评测/偏好/导出/恢复
+  function isComplete(c) {
+    return c?.status === "completed" && c.ended_reason !== "length";
+  }
   async function createTurn(u, b) {
     return repo.transaction(async (db) => {
       const question = text(b.question, "问题"),
@@ -448,15 +452,19 @@ export function createWorkspace({
       }
       const context = [];
       for (const previous of turns.slice(-10)) {
+        // 优先用户明确采用（adopted）的完整答案；兼容旧轮次仅有 feedback 的情况；再回退本地/任意完整答案
         const adopted =
+          (previous.adopted &&
+            previous.candidates.find(
+              (c) => c.label === previous.adopted.choice && isComplete(c),
+            )) ||
           previous.candidates.find(
-            (c) =>
-              c.label === previous.feedback?.choice && c.status === "completed",
+            (c) => c.label === previous.feedback?.choice && isComplete(c),
           ) ||
           previous.candidates.find(
-            (c) => c.role === "local" && c.status === "completed",
+            (c) => c.role === "local" && isComplete(c),
           ) ||
-          previous.candidates.find((c) => c.status === "completed");
+          previous.candidates.find(isComplete);
         if (adopted)
           context.push(
             { role: "user", content: previous.question },
@@ -527,7 +535,7 @@ export function createWorkspace({
       if (
         ["A", "B"].includes(b.choice) &&
         !t.candidates.some(
-          (c) => c.label === b.choice && c.status === "completed",
+          (c) => c.label === b.choice && isComplete(c),
         )
       )
         fail("无法采用失败的回答");
@@ -554,8 +562,8 @@ export function createWorkspace({
     return repo.transaction(async (db) => {
       const t = await ownTurn(db, u, id);
       const chosen = t.candidates.find((c) => c.label === choice);
-      if (!chosen || chosen.status !== "completed")
-        fail("只能采用已完成的回答");
+      if (!chosen || !isComplete(chosen))
+        fail("只能采用已完成的完整回答");
       const job = await db.get("jobs", `generate-${id}`);
       const ctrl = jobAborts.get(job?.id);
       if (ctrl && job && ["queued", "running"].includes(job.status)) ctrl.abort();
@@ -980,9 +988,9 @@ export function createWorkspace({
                 status: "failed",
                 error: "服务重启中断，未自动重复计费请求",
               });
-          t.status = t.candidates.every((c) => c.status === "completed")
+          t.status = t.candidates.every(isComplete)
             ? "completed"
-            : t.candidates.some((c) => c.status === "completed")
+            : t.candidates.some(isComplete)
               ? "partial"
               : "failed";
           t.judge = {
@@ -1759,7 +1767,7 @@ export function createWorkspace({
           unknown: turns
             .flatMap((t) =>
               [
-                ...t.candidates.filter((c) => c.status === "completed"),
+                ...t.candidates.filter(isComplete),
                 t.judge.result,
               ].filter(Boolean),
             )

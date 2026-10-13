@@ -114,37 +114,46 @@ test("采用 A 并停止运行中的 B（adopt）", async (t) => {
       throw Object.assign(Error("已取消"), { code: "canceled" });
     },
   });
-  const a = await f.add("employee");
-  await f.request(
-    "/turns",
-    { request_id: "req-adopt-0000001", question: "问", domain: domains[0] },
-    a.cookie,
-  );
-  const gen = f.ws.tick("generate");
-  await sleep(120); // 让 local 路完成（A/B 随机）
-  const before = await f.repo.get("turns", "req-adopt-0000001");
-  const doneC = before.candidates.find((c) => c.status === "completed");
-  assert.ok(doneC, "应有一条已完成");
-  const otherC = before.candidates.find((c) => c.label !== doneC.label);
-  const res = await f.request(
-    "/turns/req-adopt-0000001/adopt",
-    { choice: doneC.label },
-    a.cookie,
-  );
-  assert.equal(res.status, 200, JSON.stringify(res.data));
-  releaseB(); // 让 B 的阻塞释放（应已被 abort 标 stopped）
-  await gen;
-  const turn = await f.repo.get("turns", "req-adopt-0000001");
-  const adopted = turn.candidates.find((c) => c.label === doneC.label),
-    stoppedC = turn.candidates.find((c) => c.label === otherC.label);
-  assert.equal(adopted.status, "completed");
-  assert.equal(stoppedC.status, "stopped");
-  assert.equal(turn.status, "partial");
-  // 采用只记录 adopted（决定下轮上下文），不写成正式 A/B 偏好
-  assert.equal(turn.adopted?.choice, doneC.label);
-  assert.equal(turn.feedback, null);
-  const j = await f.repo.get("jobs", "generate-req-adopt-0000001");
-  assert.equal(j.status, "completed");
+  try {
+    const a = await f.add("employee");
+    await f.request(
+      "/turns",
+      { request_id: "req-adopt-0000001", question: "问", domain: domains[0] },
+      a.cookie,
+    );
+    const gen = f.ws.tick("generate");
+    // 有界等待：任一路完成即继续，避免固定 sleep 在全套负载下时序不稳定
+    let before;
+    for (let i = 0; i < 60; i++) {
+      before = await f.repo.get("turns", "req-adopt-0000001");
+      if (before.candidates.some((c) => c.status === "completed")) break;
+      await sleep(50);
+    }
+    const doneC = before.candidates.find((c) => c.status === "completed");
+    assert.ok(doneC, "应有一条已完成");
+    const otherC = before.candidates.find((c) => c.label !== doneC.label);
+    const res = await f.request(
+      "/turns/req-adopt-0000001/adopt",
+      { choice: doneC.label },
+      a.cookie,
+    );
+    assert.equal(res.status, 200, JSON.stringify(res.data));
+    releaseB(); // 让 B 的阻塞释放（应已被 abort 标 stopped）
+    await gen;
+    const turn = await f.repo.get("turns", "req-adopt-0000001");
+    const adopted = turn.candidates.find((c) => c.label === doneC.label),
+      stoppedC = turn.candidates.find((c) => c.label === otherC.label);
+    assert.equal(adopted.status, "completed");
+    assert.equal(stoppedC.status, "stopped");
+    assert.equal(turn.status, "partial");
+    // 采用只记录 adopted（决定下轮上下文），不写成正式 A/B 偏好
+    assert.equal(turn.adopted?.choice, doneC.label);
+    assert.equal(turn.feedback, null);
+    const j = await f.repo.get("jobs", "generate-req-adopt-0000001");
+    assert.equal(j.status, "completed");
+  } finally {
+    releaseB(); // 保证 gate 释放，失败时也不会让清理等待 90 秒
+  }
 });
 
 test("取消运行中的任务（cancel running）", async (t) => {
@@ -163,26 +172,30 @@ test("取消运行中的任务（cancel running）", async (t) => {
     { request_id: "req-cancel-0000001", question: "问", domain: domains[0] },
     a.cookie,
   );
-  const gen = f.ws.tick("generate");
-  await sleep(100);
-  const res = await f.request(
-    "/turns/req-cancel-0000001/cancel",
-    undefined,
-    a.cookie,
-    "POST",
-  );
-  assert.equal(res.status, 200);
-  release();
-  await gen;
-  const turn = await f.repo.get("turns", "req-cancel-0000001");
-  const cloudC = turn.candidates.find((c) => c.role === "cloud");
-  assert.ok(
-    ["failed", "stopped"].includes(cloudC.status),
-    "云端候选应被取消，实际=" + cloudC.status,
-  );
-  assert.equal(cloudC.error_code, "canceled");
-  const j = await f.repo.get("jobs", "generate-req-cancel-0000001");
-  assert.equal(j.status, "canceled");
+  try {
+    const gen = f.ws.tick("generate");
+    await sleep(100);
+    const res = await f.request(
+      "/turns/req-cancel-0000001/cancel",
+      undefined,
+      a.cookie,
+      "POST",
+    );
+    assert.equal(res.status, 200);
+    release(); // 成功路径先释放 gate，让 cloud 调用退出
+    await gen;
+    const turn = await f.repo.get("turns", "req-cancel-0000001");
+    const cloudC = turn.candidates.find((c) => c.role === "cloud");
+    assert.ok(
+      ["failed", "stopped"].includes(cloudC.status),
+      "云端候选应被取消，实际=" + cloudC.status,
+    );
+    assert.equal(cloudC.error_code, "canceled");
+    const j = await f.repo.get("jobs", "generate-req-cancel-0000001");
+    assert.equal(j.status, "canceled");
+  } finally {
+    release(); // 失败兜底，避免清理等待 90 秒
+  }
 });
 
 test("单用户活跃上限：同一员工第二问排队，不同员工才并行", async (t) => {

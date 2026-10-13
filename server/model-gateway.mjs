@@ -158,19 +158,20 @@ export function createGateway(
     // 按实际上游资源归组限流（同一 Ollama/API 实例共享额度，含裁判/回退/候选生成）
     const resKey = local ? "local" : c.base_url;
     const resLimit = local ? limits.localConcurrency : limits.cloudConcurrency;
-    // 组合外部取消信号与超时信号，保证两者都生效并可区分
-    const combined = opts.signal
-      ? AbortSignal.any([opts.signal, AbortSignal.timeout(timeoutMs)])
-      : AbortSignal.timeout(timeoutMs);
-    let release;
+    let release, execSignal;
     try {
+      // 排队等待只监听外部取消（用户可取消排队）；执行时限在取得额度后再启动，
+      // 避免排队时间扣掉推理预算、或拿到额度时已发过期请求
       release = await limiter.acquire(resKey, resLimit, opts.signal);
+      execSignal = opts.signal
+        ? AbortSignal.any([opts.signal, AbortSignal.timeout(timeoutMs)])
+        : AbortSignal.timeout(timeoutMs);
       return await run();
     } catch (e) {
       if (opts.signal?.aborted)
         throw Object.assign(Error("模型调用已取消"), { code: "canceled" });
       if (e.code === "canceled") throw e;
-      if (combined.aborted)
+      if (execSignal?.aborted)
         throw Object.assign(Error("模型请求超时"), { code: "timeout" });
       if (e.code && e.code !== "network") throw e;
       if (/timeout/i.test(e.name) || e.name === "TimeoutError")
@@ -206,7 +207,7 @@ export function createGateway(
             ...(c.api_key ? { Authorization: `Bearer ${c.api_key}` } : {}),
           },
           body: JSON.stringify(payload),
-          signal: combined,
+          signal: execSignal,
           redirect: "error",
         },
       );

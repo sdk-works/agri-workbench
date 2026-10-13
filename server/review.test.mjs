@@ -249,3 +249,116 @@ test("P2-5 原子领取：三个重叠 tick 只领 activeGen=2，第三个留在
     ka();
   }
 });
+
+test("adopted 接入追问上下文：采用云端后，下一轮 context 用云端答案", async (t) => {
+  const f = await fixture(t, {
+    call: async (role) => {
+      await sleep(30);
+      return answer(role);
+    },
+  });
+  const a = await f.add("employee");
+  await f.request(
+    "/turns",
+    { request_id: "req-ctx-000000001", question: "问1", domain: domains[0] },
+    a.cookie,
+  );
+  await f.ws.tick("generate");
+  const t1 = await f.repo.get("turns", "req-ctx-000000001");
+  const cloudC = t1.candidates.find((c) => c.role === "cloud");
+  assert.ok(cloudC.status === "completed", "云端候选应完成");
+  const adoptRes = await f.request(
+    "/turns/req-ctx-000000001/adopt",
+    { choice: cloudC.label },
+    a.cookie,
+  );
+  assert.equal(adoptRes.status, 200);
+  // 同一会话第二问：context 应采用云端答案（adopted 优先于 local 回退）
+  const turn2 = await f.request(
+    "/turns",
+    {
+      request_id: "req-ctx-000000002",
+      question: "问2",
+      domain: domains[0],
+      conversation_id: t1.conversation_id,
+    },
+    a.cookie,
+  );
+  assert.equal(turn2.status, 202, JSON.stringify(turn2.data));
+  await f.ws.tick("generate");
+  const t2 = await f.repo.get("turns", "req-ctx-000000002");
+  const assistants = t2.context.filter((m) => m.role === "assistant");
+  assert.ok(
+    assistants.some((m) => m.content === "cloud 答案"),
+    "下轮 context 应包含云端答案，实际=" + JSON.stringify(assistants),
+  );
+});
+
+test("length 完整性贯穿恢复：恢复后 length 候选不计完整，不进 judge", async (t) => {
+  const f = await fixture(t, {
+    call: async (role) => {
+      await sleep(10);
+      return answer(role);
+    },
+  });
+  const a = await f.add("employee");
+  await f.request(
+    "/turns",
+    { request_id: "req-len-00000001", question: "问", domain: domains[0] },
+    a.cookie,
+  );
+  // 模拟重启现场：job 仍 running，候选已写回且一条 ended_reason=length
+  const base = await f.repo.get("turns", "req-len-00000001");
+  await f.repo.put("turns", {
+    ...base,
+    status: "generating",
+    candidates: [
+      {
+        label: "A",
+        role: "local",
+        status: "completed",
+        text: "正常",
+        ended_reason: "completed",
+      },
+      {
+        label: "B",
+        role: "cloud",
+        status: "completed",
+        text: "截断",
+        ended_reason: "length",
+      },
+    ],
+  });
+  const j = await f.repo.get("jobs", "generate-req-len-00000001");
+  await f.repo.put("jobs", { ...j, status: "running" });
+  await f.ws.recover();
+  const turn = await f.repo.get("turns", "req-len-00000001");
+  assert.equal(turn.status, "partial", "length 候选不应算完整完成，实际=" + turn.status);
+  assert.equal(turn.judge?.status, "unavailable", "不应自动入队裁判");
+});
+
+test("执行超时从取得额度后计时：排队不扣预算", async (t) => {
+  const ka = keepAlive();
+  try {
+    let n = 0;
+    const g = gw(
+      () => {
+        const i = ++n;
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            resolve(streamRes([enc('{"message":{"content":"x"},"done":true}\n')]));
+          }, i === 1 ? 100 : 20);
+        });
+      },
+      { localConcurrency: 1, localTimeoutMs: 60 },
+    );
+    const p1 = g.call("local", [{ role: "user", content: "a" }], false, undefined, () => {});
+    await sleep(30); // 第一调用占用额度，执行中
+    const p2 = g.call("local", [{ role: "user", content: "b" }], false, undefined, () => {});
+    const out = await p2; // 第二排队到第一完成后再执行，不应因排队触发超时
+    assert.equal(out.ended_reason, "completed", "排队等待不应触发执行超时");
+    await p1;
+  } finally {
+    ka();
+  }
+});
