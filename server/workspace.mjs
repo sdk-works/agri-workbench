@@ -18,7 +18,7 @@ import {
 } from "./documents.mjs";
 
 const scrypt = promisify(scryptCallback);
-export const domains = ["种植管理", "农业物联网", "农业销售"];
+export const domains = ["种植管理", "农业物联网", "农业销售", "设计"];
 const now = () => new Date().toISOString();
 const fail = (message, status = 400) => {
   throw Object.assign(Error(message), { status });
