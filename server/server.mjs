@@ -6,6 +6,7 @@ import { Store } from "./store.mjs";
 import { openRepository } from "./repository.mjs";
 import { createGateway } from "./model-gateway.mjs";
 import { createWorkspace } from "./workspace.mjs";
+import { createImageServer } from "./image-server.mjs";
 import { loadEnv } from "./env.mjs";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url))),
@@ -67,6 +68,7 @@ const workspace = createWorkspace({
     cloudConcurrency: Number(env.CLOUD_CONCURRENCY || 2),
   },
 });
+const imageServer = createImageServer({ repo, env, json, readBody });
 await workspace.start();
 const allowedOrigins = new Set(
   (
@@ -88,6 +90,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     if (req.method === "GET" && url.pathname === "/api/v1/health")
       return json(res, 200, { ok: true, version: "0.4.0", storage: repo.type });
+    if (await imageServer.handle(req, res, url)) return;
     if (await workspace.handle(req, res, url)) return;
     if (url.pathname.startsWith("/api/v1/"))
       return json(res, 410, {

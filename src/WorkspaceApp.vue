@@ -63,6 +63,16 @@ const users = ref([]),
   jobs = ref([]),
   metrics = ref(null),
   legacy = ref([]);
+const imageTasks = ref([]),
+  imageForm = ref({ prompt: "", size: 1024 }),
+  imageSubmitting = ref(false);
+const imageStatus = {
+  queued: "排队中",
+  running: "生成中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
 const expert = computed(() => ["expert", "admin"].includes(user.value?.role)),
   admin = computed(() => user.value?.role === "admin");
 const annotationStatus = computed(() => {
@@ -102,6 +112,7 @@ const choices = {
 };
 const nav = computed(() => [
   { id: "chat", label: "农业问答", icon: MessageSquare },
+  { id: "images", label: "生成图片", icon: ImagePlus },
   { id: "documents", label: "知识资料", icon: Library },
   ...(expert.value
     ? [
@@ -197,6 +208,10 @@ async function refresh() {
     const response = await call("/reviews");
     if (current()) reviews.value = response.items;
   }
+  if (view === "images") {
+    const response = await call("/images/tasks");
+    if (current()) imageTasks.value = response.items;
+  }
   if (view === "documents") {
     const response = await call("/documents");
     if (current()) docs.value = response.items;
@@ -239,7 +254,8 @@ async function poll() {
   if (polling || busy.value || !user.value) return;
   polling = true;
   try {
-    if (["chat", "reviews", "documents"].includes(page.value)) await refresh();
+    if (["chat", "images", "reviews", "documents"].includes(page.value))
+      await refresh();
   } catch (e) {
     if (!disposed) {
       error.value = e.message;
@@ -259,6 +275,44 @@ async function selectConversation(c) {
   conversationId.value = c.id;
   domain.value = c.domain;
   await act(refresh);
+}
+async function submitImage() {
+  if (imageSubmitting.value) return;
+  const prompt = imageForm.value.prompt.trim();
+  if (!prompt) {
+    error.value = "请输入提示词";
+    return;
+  }
+  error.value = "";
+  notice.value = "";
+  imageSubmitting.value = true;
+  try {
+    await call("/images/generate", {
+      prompt,
+      size: Number(imageForm.value.size),
+    });
+    imageForm.value.prompt = "";
+    await refresh();
+    notice.value = "已提交出图任务，可在下方查看进度";
+  } catch (e) {
+    error.value = e.message;
+  } finally {
+    imageSubmitting.value = false;
+  }
+}
+async function cancelImage(id) {
+  await act(async () => {
+    await call("/images/tasks/" + id + "/cancel", {});
+    await refresh();
+  });
+}
+function imageUrl(id) {
+  return "/api/v2/images/" + id + "/file";
+}
+function imageTitle(t) {
+  const size = t.width + "×" + t.height;
+  const at = t.completed_at ? " · " + new Date(t.completed_at).toLocaleString() : "";
+  return `${t.prompt}（${size}${at}）`;
 }
 async function pickImage(e) {
   const f = e.target.files?.[0];
@@ -1227,6 +1281,94 @@ onUnmounted(() => {
             <p v-if="!filteredReviews.length" class="empty">
               暂无需要你处理的案例。
             </p>
+          </section>
+        </template>
+        <template v-if="page === 'images'">
+          <section class="panel block">
+            <h2>生成图片</h2>
+            <p class="subtle intro">
+              输入提示词生成图片（本地 FLUX 模型，1024×1024 约 10–20 秒）。
+              建议使用英文提示词，贴合度更佳；含精确中文文字的海报请后期排版叠加。
+            </p>
+            <div class="field-grid">
+              <label
+                >尺寸<select v-model.number="imageForm.size">
+                  <option :value="768">768×768</option>
+                  <option :value="1024">1024×1024</option>
+                </select></label
+              >
+            </div>
+            <textarea
+              v-model="imageForm.prompt"
+              rows="3"
+              maxlength="2000"
+              style="
+                width: 100%;
+                box-sizing: border-box;
+                padding: 10px 12px;
+                font: inherit;
+                border: 1px solid #d5ddd4;
+                border-radius: 6px;
+              "
+              placeholder="例如：smart greenhouse interior, tomato plants on hydroponic gutters, ripe red fruits, bright daylight"
+            ></textarea>
+            <button
+              class="primary"
+              :disabled="imageSubmitting"
+              @click="submitImage"
+            >
+              <ImagePlus :size="16" />{{ imageSubmitting ? "提交中…" : "生成图片" }}
+            </button>
+          </section>
+          <section class="panel block">
+            <h2>我的任务</h2>
+            <p v-if="!imageTasks.length" class="empty">还没有图片任务。</p>
+            <div v-for="t in imageTasks" :key="t.id" class="list-row">
+              <div style="flex: 0 0 128px">
+                <img
+                  v-if="t.status === 'completed'"
+                  :src="imageUrl(t.id)"
+                  :alt="t.prompt"
+                  loading="lazy"
+                  style="
+                    width: 128px;
+                    height: 128px;
+                    object-fit: cover;
+                    border-radius: 6px;
+                    display: block;
+                  "
+                />
+                <span v-else class="badge neutral">
+                  {{ imageStatus[t.status] || t.status }}
+                </span>
+              </div>
+              <div style="flex: 1">
+                <strong>{{ t.prompt }}</strong>
+                <small>
+                  {{ t.width }}×{{ t.height }}
+                  <span v-if="t.status === 'completed'">
+                    · {{ new Date(t.completed_at).toLocaleString() }}
+                  </span>
+                  <span v-if="t.error" class="badge danger">{{ t.error }}</span>
+                </small>
+              </div>
+              <div style="flex: 0 0 auto">
+                <a
+                  v-if="t.status === 'completed'"
+                  class="text-button"
+                  :href="imageUrl(t.id)"
+                  :download="'qhe_' + t.id + '.png'"
+                  >下载</a
+                >
+                <button
+                  v-if="['queued', 'running'].includes(t.status)"
+                  class="text-button"
+                  @click="cancelImage(t.id)"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
           </section>
         </template>
         <template v-if="page === 'documents'">
