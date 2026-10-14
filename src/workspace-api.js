@@ -6,9 +6,18 @@ export async function call(path, body, method) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(60000),
   });
-  const data = await res.json();
+  // 先读文本再判空/解析：空 body（204 或偶发空响应）不抛 DOMException，也不绕过状态检查
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error("服务返回了无法解析的响应");
+    }
+  }
   if (!res.ok) {
-    const error = Error(data.error || `请求失败 ${res.status}`);
+    const error = Error((data && data.error) || `请求失败 ${res.status}`);
     error.status = res.status;
     throw error;
   }
