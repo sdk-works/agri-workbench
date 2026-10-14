@@ -604,6 +604,19 @@ export function createWorkspace({
       return safeTurn(turn, u);
     });
   }
+  async function deleteConversation(u, id) {
+    return repo.transaction(async (db) => {
+      const conv = await db.get("conversations", id);
+      if (!conv || conv.owner !== u.id || conv.tenant !== u.tenant)
+        fail("会话不存在", 404);
+      const turns = (
+        await db.list("turns", { tenant: u.tenant, owner: u.id })
+      ).filter((t) => t.conversation_id === id);
+      for (const t of turns) await db.remove("turns", t.id);
+      await db.remove("conversations", id);
+      return { ok: true, removed: turns.length + 1 };
+    });
+  }
   async function feedback(u, id, b) {
     return repo.transaction(async (db) => {
       const t = await ownTurn(db, u, id);
@@ -1353,6 +1366,9 @@ export function createWorkspace({
           owner: u.id,
         }),
       });
+    const dm = routePath.match(/^\/conversations\/([\w-]+)$/);
+    if (dm && method === "DELETE")
+      return send(await deleteConversation(u, dm[1]));
     if (routePath === "/turns" && method === "GET") {
       const items = (
         await repo.list("turns", { tenant: u.tenant, owner: u.id })

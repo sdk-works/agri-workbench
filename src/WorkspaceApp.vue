@@ -31,7 +31,8 @@ const conversations = ref([]),
   domain = ref(domains[0]),
   draft = ref(null),
   pendingImage = ref(null),
-  comments = ref({});
+  comments = ref({}),
+  confirmingDelete = ref("");
 const reviews = ref([]),
   detail = ref(null),
   reviewForm = ref({}),
@@ -288,6 +289,33 @@ async function selectConversation(c) {
   conversationId.value = c.id;
   domain.value = c.domain;
   await act(refresh);
+}
+async function deleteConversation(c) {
+  // 二次确认：第一次点击进入确认态（按钮变"确认删除？"），4 秒内再点执行
+  if (confirmingDelete.value !== c.id) {
+    confirmingDelete.value = c.id;
+    setTimeout(() => {
+      if (confirmingDelete.value === c.id) confirmingDelete.value = "";
+    }, 4000);
+    return;
+  }
+  confirmingDelete.value = "";
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    await call(`/conversations/${c.id}`, undefined, "DELETE");
+    if (conversationId.value === c.id) {
+      conversationId.value = "";
+      turns.value = [];
+      domain.value = "";
+    }
+    notice.value = "会话已删除";
+    await act(refresh);
+  } catch (e) {
+    error.value = e.message;
+  } finally {
+    busy.value = false;
+  }
 }
 async function submitImage() {
   if (imageSubmitting.value) return;
@@ -838,15 +866,24 @@ onUnmounted(() => {
             <section class="panel conversation-list">
               <button class="primary" @click="newConversation">
                 <Plus :size="16" />新会话</button
-              ><button
+              >
+              <div
                 v-for="c in conversations"
                 :key="c.id"
                 :class="['conversation', { selected: c.id === conversationId }]"
-                @click="selectConversation(c)"
               >
-                <strong>{{ c.title }}</strong
-                ><small>{{ c.domain }}</small>
-              </button>
+                <button class="conv-open" @click="selectConversation(c)">
+                  <strong>{{ c.title }}</strong
+                  ><small>{{ c.domain }}</small>
+                </button>
+                <button
+                  class="conv-delete"
+                  :class="{ confirming: confirmingDelete === c.id }"
+                  :title="confirmingDelete === c.id ? '再次点击确认删除' : '删除会话'"
+                  @click.stop="deleteConversation(c)"
+                  >{{ confirmingDelete === c.id ? "确认删除？" : "删除" }}</button
+                >
+              </div>
               <p v-if="!conversations.length" class="subtle">
                 你的会话将保存在这里。
               </p>
@@ -2269,14 +2306,53 @@ select {
   margin-bottom: 15px;
 }
 .conversation {
+  position: relative;
+  width: 100%;
+  border-radius: 7px;
+}
+.conversation .conv-open {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   width: 100%;
   text-align: left;
   padding: 12px;
-  border-radius: 7px;
   gap: 7px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.conv-delete {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  background: transparent;
+  border: 0;
+  color: #b0483c;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 7px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.conversation:hover .conv-delete,
+.conv-delete:focus-visible,
+.conv-delete.confirming {
+  opacity: 1;
+}
+.conv-delete:hover {
+  background: #f6e3e0;
+}
+.conv-delete.confirming {
+  background: #d94f3d;
+  color: #fff;
+}
+.conv-delete.confirming:hover {
+  background: #c73e2d;
 }
 .conversation strong {
   font-weight: 500;
