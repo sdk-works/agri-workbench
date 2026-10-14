@@ -104,6 +104,15 @@ const statusNames = {
   rejected: "已退回",
   blocked: "被拦截",
 };
+function docStatusClass(s) {
+  return {
+    published: "success",
+    pending: "amber",
+    rejected: "danger",
+    blocked: "danger",
+    parsing: "neutral",
+  }[s] || "neutral";
+}
 const choices = {
   A: "采用 A",
   B: "采用 B",
@@ -667,7 +676,10 @@ async function documentAction(action) {
         ? { confirm_block: true }
         : {}),
     });
-    notice.value = "资料处理已保存。";
+    notice.value =
+      action === "publish"
+        ? `已发布新版本 v${doc.value.revision}，该资料已参与问答检索。`
+        : "资料已退回。";
     await refresh();
   });
 }
@@ -1505,8 +1517,12 @@ onUnmounted(() => {
             <section class="panel block">
               <h2>{{ doc.name }}</h2>
               <p>
-                {{ statusNames[doc.status] }} · {{ doc.domain }} ·
-                {{ doc.source }} · v{{ doc.revision }}
+                <span
+                  class="badge"
+                  :class="docStatusClass(doc.status)"
+                  >{{ statusNames[doc.status] }}</span
+                >
+                · {{ doc.domain }} · {{ doc.source }} · v{{ doc.revision }}
               </p>
               <p class="subtle">标签：{{ doc.tags || "未填写" }}</p>
               <details v-if="doc.versions?.length">
@@ -1746,7 +1762,11 @@ onUnmounted(() => {
                   {{ Math.ceil(d.size / 1024) }} KB</small
                 >
               </div>
-              <span class="badge neutral">{{ statusNames[d.status] }}</span>
+              <span
+                class="badge"
+                :class="docStatusClass(d.status)"
+                >{{ statusNames[d.status] }}</span
+              >
             </button>
             <p v-if="!docs.length" class="empty">还没有可见资料。</p>
           </section>
