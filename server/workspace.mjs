@@ -80,6 +80,9 @@ export function createWorkspace({
   // 命中明确图片意图词，或"生成/画/绘制/出…图"句式；普通问题零额外模型调用。
   const IMAGE_INTENT_RE =
     /(图片|示意图|海报|效果图|设计图|平面图|布局图|结构图|渲染图|插图|配图|架构图|流程图|户型图|机械图|电路图|安装图|生成图|绘图|图画|CAD|图纸)|(生成|制作|画|绘制|出|渲染|给我|看看).{0,18}(图|画面)|(图|画面|图片).{0,18}(生成|制作|画|绘制|出|渲染)/i;
+  // 明确取消配图的表述（与"不要近距离的"这类画面调整区分开）：仅在说"不要图片/不配图/只要文字"时取消
+  const IMAGE_CANCEL_RE =
+    /(不要|不用|无需|别|取消|去掉|撤掉|只要文字|不配图|不要图|不生成图).{0,6}(图片|图|配图|画面|示意)/i;
   // 后台为命中意图的问答自动创建图片任务（fire-and-forget，不阻塞问答返回）
   // 先请 judge 模型判断是否需要配图并整理英文提示词（FLUX 中文贴合度差），
   // 若模型判定不需要或 judge 不可用则回退用问题原文生图/保持可用。
@@ -98,7 +101,9 @@ export function createWorkspace({
             content:
               "你是配图助手。判断用户问题是否明确需要生成一张配图。如需，把用户意图整理成一段简洁的英文图片提示词（含主体、场景、风格，不用引号）。只输出严格 JSON：{\"need\":true,\"prompt\":\"英文提示词\"} 或 {\"need\":false}。",
           },
-          { role: "user", content: turn.question },
+          { role: "user", content: turn.image_base
+              ? `前一轮图片主体：${turn.image_base}\n本轮调整：${turn.question}\n请结合前一轮主体与本轮调整要求整理一段简洁的英文图片提示词（体现本轮改动，如视角、场景或内容变化）。`
+              : turn.question },
         ],
         true,
       );
@@ -547,6 +552,15 @@ export function createWorkspace({
           });
         references.splice(3);
       }
+      // 配图意图继承上下文：前一问答要图时，本轮的修改/追问默认继续配图
+      //（除非本轮明确"不要图/不配图/只要文字"）；image_base 记录前一轮主体用于整理英文提示词
+      const prevTurn = turns[turns.length - 1];
+      const inheritImage =
+        !!prevTurn &&
+        (prevTurn.image_hint || prevTurn.gen_image) &&
+        !IMAGE_CANCEL_RE.test(question);
+      const imageBase = inheritImage ? prevTurn.question : "";
+      const image_hint = IMAGE_INTENT_RE.test(question) || Boolean(inheritImage);
       const order =
         randomBytes(1)[0] % 2 ? ["local", "cloud"] : ["cloud", "local"];
       const turn = entity({
@@ -569,7 +583,8 @@ export function createWorkspace({
           "提示：当用户需要图片或示意时，系统会在本次回答下方自动生成一张配图并显示。你可以在文字回答中简短说明“已在下方为你生成配图”，并描述你设想的画面；不要声称“我无法生成图片”。\n" +
           JSON.stringify(references),
         status: "generating",
-        image_hint: IMAGE_INTENT_RE.test(question),
+        image_hint,
+        image_base: imageBase,
         gen_image: "",
         image_status: "",
         image_error: "",
