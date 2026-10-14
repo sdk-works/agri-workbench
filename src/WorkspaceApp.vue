@@ -205,6 +205,9 @@ async function refresh() {
       // 拉取含配图轮次的图片任务状态（在问答里直接显示配图卡片）
       for (const t of turns.value) {
         if (!t.gen_image) continue;
+        // 已完成/失败/取消的配图不再重复拉取，避免每次轮询重建 <img> 导致闪屏
+        if (t.imageTask && ["completed", "failed", "cancelled"].includes(t.imageTask.status))
+          continue;
         try {
           t.imageTask = (await call("/images/tasks/" + t.gen_image)).task;
         } catch {

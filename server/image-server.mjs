@@ -219,7 +219,8 @@ export function createImageServer({ repo, env, json, readBody }) {
         "Content-Type": "image/png",
         "Content-Length": data.length,
         "Content-Disposition": `inline; filename="${path.basename(t.filename)}"`,
-        "Cache-Control": "no-store",
+        // 同一任务 id 的 filename 与图片内容固定不变，允许浏览器缓存避免重复下载导致闪屏
+        "Cache-Control": "public, max-age=86400",
         "X-Content-Type-Options": "nosniff",
       });
       res.end(data);
