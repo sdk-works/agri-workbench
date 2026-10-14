@@ -777,7 +777,7 @@ onUnmounted(() => {
   <div v-if="!user" class="login-screen">
     <section class="login-card">
       <div class="brand-line">
-        <Sprout :size="32" /><strong>青禾 · 农业 AI 工作台</strong>
+        <Sprout :size="32" /><strong>京阳智农 · 农业 AI 工作台</strong>
       </div>
       <p class="subtle">日常使用积累经验，让专家把关农业知识。</p>
       <h1>
@@ -818,7 +818,7 @@ onUnmounted(() => {
     <aside class="wb-sidebar">
       <div class="brand-line">
         <Sprout :size="27" /><strong
-          >青禾 <small>AGRI INTELLIGENCE</small></strong
+          >京阳智农 <small>AGRI INTELLIGENCE</small></strong
         >
       </div>
       <div class="workspace-label">

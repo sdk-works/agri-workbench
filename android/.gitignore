@@ -1,0 +1,15 @@
+# 构建产物
+**/build/
+.gradle/
+
+# 本机配置（含本机 SDK 路径）
+local.properties
+
+# 签名密钥（切勿提交）
+keystore/
+*.jks
+
+# IDE / 系统
+.idea/
+*.iml
+.DS_Store
