@@ -15,6 +15,7 @@ import {
   ImagePlus,
   Building2,
   FolderKanban,
+  Menu,
 } from "lucide-vue-next";
 import { call, download } from "./workspace-api";
 const user = ref(null),
@@ -79,6 +80,8 @@ const departments = ref([]),
 const domainOptions = computed(() =>
   departments.value.filter((d) => d.active !== false).map((d) => d.name)
 );
+// 移动端侧边栏抽屉开关。
+const menuOpen = ref(false);
 const imageStatus = {
   queued: "排队中",
   running: "生成中",
@@ -216,6 +219,7 @@ async function logout() {
 }
 async function go(id) {
   page.value = id;
+  menuOpen.value = false;
   error.value = "";
   notice.value = "";
   detail.value = null;
@@ -954,7 +958,7 @@ onUnmounted(() => {
     </section>
   </div>
   <div v-else class="wb-layout">
-    <aside class="wb-sidebar">
+    <aside class="wb-sidebar" :class="{ open: menuOpen }">
       <div class="brand-line">
         <Sprout :size="27" /><strong
           >京阳智农 <small>AGRI INTELLIGENCE</small></strong
@@ -979,8 +983,16 @@ onUnmounted(() => {
         ><button @click="logout"><LogOut :size="16" />退出登录</button>
       </div>
     </aside>
+    <div class="sidebar-mask" v-if="menuOpen" @click="menuOpen = false"></div>
     <main class="wb-main">
       <header class="wb-top">
+        <button
+          class="menu-btn"
+          aria-label="菜单"
+          @click="menuOpen = !menuOpen"
+        >
+          <Menu :size="18" />
+        </button>
         <span
           >农业 AI 平台 / <strong>{{ title }}</strong></span
         ><span class="badge success">{{ roleNames[user.role] }}</span>
@@ -2879,6 +2891,12 @@ a.text-button {
   display: inline-flex;
   margin: 12px 0;
 }
+.wb-top .menu-btn {
+  display: none;
+}
+.sidebar-mask {
+  display: none;
+}
 @media (max-width: 1100px) {
   .chat-layout {
     grid-template-columns: 170px minmax(0, 1fr);
@@ -2897,11 +2915,40 @@ a.text-button {
   .wb-layout {
     display: block;
   }
+  .wb-top .menu-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  .sidebar-mask {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    z-index: 50;
+  }
   .wb-sidebar {
-    position: static;
-    width: 100%;
-    height: auto;
-    padding: 16px;
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 240px;
+    height: 100%;
+    z-index: 60;
+    padding: 20px;
+    overflow-y: auto;
+    box-shadow: 0 0 24px rgba(0, 0, 0, 0.18);
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+  }
+  .wb-sidebar.open {
+    transform: translateX(0);
   }
   .wb-sidebar > .brand-line {
     font-size: 18px;
@@ -2910,15 +2957,17 @@ a.text-button {
     display: none;
   }
   .wb-sidebar nav {
-    flex-direction: row;
-    overflow-x: auto;
+    flex-direction: column;
+    align-items: stretch;
+    overflow: visible;
     margin-top: 18px;
     padding-bottom: 4px;
   }
   .wb-sidebar nav button {
     white-space: nowrap;
-    padding: 10px;
-    font-size: 12px;
+    padding: 12px 10px;
+    font-size: 14px;
+    width: 100%;
   }
   .wb-profile {
     display: flex;
