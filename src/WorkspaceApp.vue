@@ -75,6 +75,10 @@ const departments = ref([]),
   deptForm = ref({ name: "" }),
   editingDept = ref(null),
   entryForm = ref({});
+// 问题领域选项 = active 部门名（与后端 availableDomains 同步，新增部门自动出现）。
+const domainOptions = computed(() =>
+  departments.value.filter((d) => d.active !== false).map((d) => d.name)
+);
 const imageStatus = {
   queued: "排队中",
   running: "生成中",
@@ -189,6 +193,14 @@ async function authenticate() {
 }
 async function loadDepartments() {
   departments.value = (await call("/departments")).items;
+  // 若当前领域已被停用/不在新列表，回退到第一个 active 部门。
+  if (domainOptions.value.length && !domainOptions.value.includes(domain.value))
+    domain.value = domainOptions.value[0];
+  if (
+    domainOptions.value.length &&
+    !domainOptions.value.includes(upload.value.domain)
+  )
+    upload.value.domain = domainOptions.value[0];
 }
 async function logout() {
   await act(async () => {
@@ -1184,7 +1196,7 @@ onUnmounted(() => {
               <form class="panel composer-v3" @submit.prevent="ask">
                 <label v-if="!conversationId"
                   >问题领域<select v-model="domain">
-                    <option v-for="d in domains">{{ d }}</option>
+                    <option v-for="d in domainOptions">{{ d }}</option>
                   </select></label
                 ><label
                   >{{ turns.length ? "继续追问" : "你的问题"
@@ -1598,7 +1610,7 @@ onUnmounted(() => {
             <div class="field-grid">
               <label
                 >领域<select v-model="upload.domain">
-                  <option v-for="d in domains">{{ d }}</option>
+                  <option v-for="d in domainOptions">{{ d }}</option>
                 </select></label
               ><label
                 >来源 / 版本<input

@@ -73,6 +73,9 @@ const getDept = async (db, id) => {
   const all = await db.list("departments", { tenant: "park" });
   return all.find((d) => d.id === id) || null;
 };
+// 问题领域 = active 部门名（动态）。新增/启用部门即新增问题领域；停用即移出。
+const availableDomains = async (db) =>
+  (await listDepartments(db, false)).map((d) => d.name);
 // 首期部门种子：不存在则创建（幂等）。已有业务引用依赖稳定 ID，改名不改 id。
 const ensureDepartments = async (db) => {
   const existing = await db.list("departments", { tenant: "park" });
@@ -379,7 +382,7 @@ export function createWorkspace({
     return repo.transaction(async (db) => {
       if (!/\.(txt|md|csv|jsonl|docx|pdf|xlsx)$/i.test(name))
         fail("支持 TXT、MD、CSV、JSONL、DOCX、PDF、XLSX");
-      if (!domains.includes(b.domain)) fail("请选择领域");
+      if (!(await availableDomains(db)).includes(b.domain)) fail("请选择领域");
       if (
         typeof b.base64 !== "string" ||
         !b.base64.length ||
@@ -533,7 +536,7 @@ export function createWorkspace({
       )
         fail("会话不存在", 404);
       const domain = conv?.domain || b.domain;
-      if (!domains.includes(domain)) fail("请选择领域");
+      if (!(await availableDomains(db)).includes(domain)) fail("请选择领域");
       const turns = conv
         ? (await db.list("turns", { tenant: u.tenant, owner: u.id }))
             .filter((t) => t.conversation_id === conv.id)
@@ -1251,7 +1254,7 @@ export function createWorkspace({
           name: text(b.name || b.username, "显示名", 60),
           password,
           role: "admin",
-          domains,
+          domains: (await ensureDepartments(db)).map((d) => d.name),
           dept_ids: (await ensureDepartments(db)).map((d) => d.id),
           active: true,
         });
@@ -1366,10 +1369,10 @@ export function createWorkspace({
             } else {
               dept_ids = [];
             }
-            // 知识领域（资料/评审）从部门推导，保留原 4 领域语义；车间等部门不进入知识领域。
+            // 知识领域（资料/评审）与部门同名同步：员工所属部门即其知识领域（含车间等新部门）。
             const domainsNext = dept_ids
               .map((id) => activeDepts.find((d) => d.id === id)?.name)
-              .filter((name) => name && domains.includes(name));
+              .filter(Boolean);
             if (!existing && !password) fail("新账号需要密码");
             if (
               existing?.id === u.id &&
