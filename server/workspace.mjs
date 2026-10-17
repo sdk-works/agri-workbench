@@ -19,6 +19,19 @@ import {
 
 const scrypt = promisify(scryptCallback);
 export const domains = ["种植管理", "农业物联网", "农业销售", "设计"];
+// 部门（组织归属）独立于领域（知识分类）。部门使用稳定 ID，改名不影响历史数据。
+export const defaultDepartments = [
+  { id: "dep-planting", name: "种植管理" },
+  { id: "dep-iot", name: "农业物联网" },
+  { id: "dep-sales", name: "农业销售" },
+  { id: "dep-design", name: "设计" },
+  { id: "dep-shop", name: "车间管理" },
+  { id: "dep-manufacturing", name: "车间制造" },
+];
+const domainToDeptId = (name) => {
+  const m = defaultDepartments.find((d) => d.name === name);
+  return m ? m.id : null;
+};
 const now = () => new Date().toISOString();
 const fail = (message, status = 400) => {
   throw Object.assign(Error(message), { status });
@@ -34,6 +47,7 @@ const safeUser = (u) => ({
   name: u.name,
   role: u.role,
   domains: u.domains,
+  dept_ids: u.dept_ids || [],
   active: u.active,
   tenant: u.tenant,
 });
@@ -47,6 +61,41 @@ const elevated = (u) => ["expert", "admin"].includes(u.role);
 const inDomain = (u, r) =>
   r.tenant === u.tenant &&
   (u.role === "admin" || (u.role === "expert" && u.domains.includes(r.domain)));
+// 部门访问：管理员拥有全部部门；普通/专家员工仅能访问其所属部门。
+const inDept = (u, deptId) =>
+  u.role === "admin" ||
+  (Array.isArray(u.dept_ids) && u.dept_ids.includes(deptId));
+const listDepartments = async (db, includeInactive = true) => {
+  const all = await db.list("departments", { tenant: "park" });
+  return includeInactive ? all : all.filter((d) => d.active !== false);
+};
+const getDept = async (db, id) => {
+  const all = await db.list("departments", { tenant: "park" });
+  return all.find((d) => d.id === id) || null;
+};
+// 首期部门种子：不存在则创建（幂等）。已有业务引用依赖稳定 ID，改名不改 id。
+const ensureDepartments = async (db) => {
+  const existing = await db.list("departments", { tenant: "park" });
+  const have = new Set(existing.map((d) => d.id));
+  for (const d of defaultDepartments) {
+    if (have.has(d.id)) continue;
+    await db.put(
+      "departments",
+      entity({ id: d.id, name: d.name, active: true, status: "active" }),
+    );
+  }
+  return db.list("departments", { tenant: "park" });
+};
+// 老用户迁移：无 dept_ids 时，把原知识领域映射成同名部门，保留既有访问能力。
+const migrateUserDepts = async (db, u) => {
+  if (Array.isArray(u.dept_ids)) return u;
+  const ids = (Array.isArray(u.domains) ? u.domains : [])
+    .map(domainToDeptId)
+    .filter(Boolean);
+  const next = { ...u, dept_ids: ids };
+  await db.put("users", next);
+  return next;
+};
 const needAdmin = (u) => {
   if (u.role !== "admin") fail("仅管理员可操作", 403);
 };
@@ -1174,11 +1223,19 @@ export function createWorkspace({
       json(res, status, v);
       return true;
     };
-    if (routePath === "/auth/status" && method === "GET")
+    if (routePath === "/auth/status" && method === "GET") {
+      const mu = await userFor(req);
+      if (mu && !mu.dept_ids) {
+        const migrated = await repo.transaction((db) =>
+          migrateUserDepts(db, mu),
+        );
+        mu.dept_ids = migrated.dept_ids;
+      }
       return send({
         setup_required: !(await repo.list("users")).length,
-        user: (await userFor(req)) ? safeUser(await userFor(req)) : null,
+        user: mu ? safeUser(mu) : null,
       });
+    }
     if (routePath === "/auth/setup" && method === "POST") {
       const b = await body(),
         password = await makePassword(b.password);
@@ -1193,6 +1250,7 @@ export function createWorkspace({
           password,
           role: "admin",
           domains,
+          dept_ids: (await ensureDepartments(db)).map((d) => d.id),
           active: true,
         });
         await db.put("users", u);
@@ -1221,6 +1279,12 @@ export function createWorkspace({
       if (!u?.active || !(await verify(b.password, u.password)))
         fail("账号或密码不正确", 401);
       loginAttempts.delete(key);
+      if (!u.dept_ids) {
+        const migrated = await repo.transaction((db) =>
+          migrateUserDepts(db, u),
+        );
+        u.dept_ids = migrated.dept_ids;
+      }
       const token = randomBytes(32).toString("hex");
       await repo.transaction((db) =>
         db.put(
@@ -1240,6 +1304,10 @@ export function createWorkspace({
       return send({ user: safeUser(u) });
     }
     const u = await requireUser(req);
+    if (!u.dept_ids) {
+      const migrated = await repo.transaction((db) => migrateUserDepts(db, u));
+      u.dept_ids = migrated.dept_ids;
+    }
     if (await assets.handle({ u, routePath, method, url, res, body, send }))
       return true;
     if (routePath === "/auth/logout" && method === "POST") {
@@ -1281,11 +1349,25 @@ export function createWorkspace({
               fail("账号已存在", 409);
             if (!["employee", "expert", "admin"].includes(b.role))
               fail("身份无效");
-            if (
-              !Array.isArray(b.domains) ||
-              b.domains.some((d) => !domains.includes(d))
-            )
-              fail("领域无效");
+            const deptList = await ensureDepartments(db);
+            const activeDepts = deptList.filter((d) => d.active !== false);
+            const deptIdSet = new Set(activeDepts.map((d) => d.id));
+            let dept_ids;
+            if (Array.isArray(b.dept_ids)) {
+              if (b.dept_ids.some((id) => !deptIdSet.has(id)))
+                fail("部门无效");
+              dept_ids = [...new Set(b.dept_ids)];
+            } else if (Array.isArray(b.domains)) {
+              // 兼容老请求：未传部门时按原领域推导（迁移语义）。
+              dept_ids = [...new Set(b.domains.map(domainToDeptId).filter(Boolean))];
+              if (dept_ids.some((id) => !deptIdSet.has(id))) fail("部门无效");
+            } else {
+              dept_ids = [];
+            }
+            // 知识领域（资料/评审）从部门推导，保留原 4 领域语义；车间等部门不进入知识领域。
+            const domainsNext = dept_ids
+              .map((id) => activeDepts.find((d) => d.id === id)?.name)
+              .filter((name) => name && domains.includes(name));
             if (!existing && !password) fail("新账号需要密码");
             if (
               existing?.id === u.id &&
@@ -1298,7 +1380,8 @@ export function createWorkspace({
               name: text(b.name || username, "显示名", 60),
               password: password || existing.password,
               role: b.role,
-              domains: b.domains,
+              domains: domainsNext,
+              dept_ids,
               active: b.active !== false,
             };
             await db.put("users", record);
@@ -1310,6 +1393,201 @@ export function createWorkspace({
           }),
           201,
         );
+      }
+    }
+    // 部门（组织归属）：可新增/编辑/停用；被员工或条目引用的部门禁止删除（只能停用）。
+    if (routePath === "/departments") {
+      if (method === "GET") {
+        return send(
+          await repo.transaction(async (db) => {
+            const depts = await ensureDepartments(db);
+            const users = await db.list("users", { tenant: u.tenant });
+            const entries = await db.list("entries", { tenant: "park" });
+            return {
+              items: depts.map((d) => ({
+                id: d.id,
+                name: d.name,
+                active: d.active !== false,
+                status: d.status || "active",
+                user_count: users.filter(
+                  (x) =>
+                    Array.isArray(x.dept_ids) && x.dept_ids.includes(d.id),
+                ).length,
+                entry_count: entries.filter((e) => e.dept_id === d.id).length,
+              })),
+            };
+          }),
+        );
+      }
+      if (method === "POST") {
+        needAdmin(u);
+        const b = await body();
+        const name = text(b.name, "部门名称", 60);
+        return send(
+          await repo.transaction(async (db) => {
+            const depts = await ensureDepartments(db);
+            if (depts.some((d) => d.name === name)) fail("部门名称已存在", 409);
+            const id =
+              "dep-" +
+              (Math.random().toString(36).slice(2, 8) +
+                Math.random().toString(36).slice(2, 4));
+            await db.put(
+              "departments",
+              entity({ id, name, active: true, status: "active" }),
+            );
+            await event(db, u, "department_created", id);
+            return { id, name, active: true };
+          }),
+          201,
+        );
+      }
+      if (method === "PUT") {
+        needAdmin(u);
+        const b = await body();
+        return send(
+          await repo.transaction(async (db) => {
+            const dept = b.id ? await getDept(db, b.id) : null;
+            if (!dept || dept.tenant !== u.tenant) fail("部门不存在", 404);
+            const name =
+              b.name !== undefined ? text(b.name, "部门名称", 60) : dept.name;
+            const dup = (await listDepartments(db)).find(
+              (d) => d.name === name && d.id !== dept.id,
+            );
+            if (dup) fail("部门名称已存在", 409);
+            const active =
+              b.active !== undefined
+                ? b.active !== false
+                : dept.active !== false;
+            await db.put("departments", {
+              ...dept,
+              name,
+              active,
+              status: active ? "active" : "inactive",
+            });
+            await event(db, u, "department_updated", dept.id);
+            return { id: dept.id, name, active };
+          }),
+        );
+      }
+      if (method === "DELETE") {
+        needAdmin(u);
+        const b = await body();
+        return send(
+          await repo.transaction(async (db) => {
+            const dept = b.id ? await getDept(db, b.id) : null;
+            if (!dept) fail("部门不存在", 404);
+            const users = await db.list("users", { tenant: u.tenant });
+            const entries = await db.list("entries", { tenant: "park" });
+            const refs =
+              users.filter(
+                (x) =>
+                  Array.isArray(x.dept_ids) && x.dept_ids.includes(dept.id),
+              ).length +
+              entries.filter((e) => e.dept_id === dept.id).length;
+            if (refs > 0)
+              fail(`部门仍被 ${refs} 项员工或条目引用，不能删除；请改用停用`, 409);
+            await db.remove("departments", dept.id);
+            await event(db, u, "department_deleted", dept.id);
+            return { ok: true };
+          }),
+        );
+      }
+    }
+    // 部门条目（通用条目页）：管理员维护，所属部门员工查看。
+    if (routePath === "/entries") {
+      const opt = (v, max) =>
+        v === undefined || v === null ? "" : String(v).trim().slice(0, max);
+      if (method === "GET") {
+        const deptId = url.searchParams.get("dept") || "";
+        const dept = await getDept(repo, deptId);
+        if (!dept) fail("部门不存在", 404);
+        if (dept.active === false) fail("部门已停用", 403);
+        if (!inDept(u, deptId)) fail("无权查看该部门", 403);
+        return send({
+          dept: { id: dept.id, name: dept.name },
+          items: (await repo.list("entries", { tenant: "park", domain: deptId })).map(
+            (e) => ({
+              id: e.id,
+              dept_id: e.dept_id,
+              name: e.name,
+              code: e.code,
+              status: e.status,
+              owner: e.owner,
+              note: e.note,
+              updated_at: e.updated_at,
+              created_at: e.created_at,
+              created_by: e.created_by,
+            }),
+          ),
+        });
+      }
+      if (method === "POST" || method === "PUT") {
+        needAdmin(u);
+        const b = await body();
+        return send(
+          await repo.transaction(async (db) => {
+            const dept = b.dept_id ? await getDept(db, b.dept_id) : null;
+            if (!dept) fail("部门不存在", 404);
+            if (dept.active === false) fail("部门已停用", 403);
+            if (!inDept(u, b.dept_id)) fail("无权在该部门维护条目", 403);
+            const name = text(b.name, "名称", 120);
+            const code = opt(b.code, 60);
+            const status = opt(b.status, 40);
+            const owner = opt(b.owner, 40);
+            const note = opt(b.note, 1000);
+            if (method === "PUT") {
+              const existing = b.id ? await db.get("entries", b.id) : null;
+              if (!existing) fail("条目不存在", 404);
+              if (existing.dept_id !== b.dept_id) fail("条目部门不匹配", 400);
+              const next = {
+                ...existing,
+                name,
+                code,
+                status,
+                owner,
+                note,
+                updated_at: now(),
+              };
+              next.domain = b.dept_id;
+              next.owner = owner;
+              next.status = status;
+              await db.put("entries", next);
+              await event(db, u, "entry_updated", next.id);
+              return { id: next.id, ok: true };
+            }
+            const entry = entity({
+              dept_id: b.dept_id,
+              name,
+              code,
+              status,
+              owner,
+              note,
+              updated_at: now(),
+              created_by: u.id,
+            });
+            entry.domain = b.dept_id;
+            entry.owner = owner;
+            entry.status = status;
+            await db.put("entries", entry);
+            await event(db, u, "entry_created", entry.id);
+            return { id: entry.id, ok: true };
+          }),
+          method === "POST" ? 201 : 200,
+        );
+      }
+      if (method === "DELETE") {
+        needAdmin(u);
+        const b = await body();
+        await repo.transaction(async (db) => {
+          const existing = b.id ? await db.get("entries", b.id) : null;
+          if (!existing) fail("条目不存在", 404);
+          const d = await getDept(db, existing.dept_id);
+          if (d?.active === false) fail("部门已停用", 403);
+          if (!inDept(u, existing.dept_id)) fail("无权删除该部门条目", 403);
+          await db.remove("entries", existing.id);
+          await event(db, u, "entry_deleted", existing.id);
+        });
+        return send({ ok: true });
       }
     }
     if (routePath === "/models") {

@@ -13,6 +13,8 @@ import {
   RefreshCw,
   LayoutDashboard,
   ImagePlus,
+  Building2,
+  FolderKanban,
 } from "lucide-vue-next";
 import { call, download } from "./workspace-api";
 const user = ref(null),
@@ -54,7 +56,7 @@ const users = ref([]),
     name: "",
     password: "",
     role: "employee",
-    domains: [...domains],
+    dept_ids: [],
     active: true,
   }),
   models = ref({}),
@@ -67,6 +69,12 @@ const users = ref([]),
 const imageTasks = ref([]),
   imageForm = ref({ prompt: "", size: 1024 }),
   imageSubmitting = ref(false);
+const departments = ref([]),
+  currentDept = ref(null),
+  deptEntries = ref([]),
+  deptForm = ref({ name: "" }),
+  editingDept = ref(null),
+  entryForm = ref({});
 const imageStatus = {
   queued: "排队中",
   running: "生成中",
@@ -120,23 +128,38 @@ const choices = {
   both_bad: "都不好",
   insufficient: "信息不足",
 };
-const nav = computed(() => [
-  { id: "chat", label: "农业问答", icon: MessageSquare },
-  { id: "images", label: "生成图片", icon: ImagePlus },
-  { id: "documents", label: "知识资料", icon: Library },
-  ...(expert.value
-    ? [
-        { id: "reviews", label: "专家评审", icon: ShieldCheck },
-        { id: "metrics", label: "质量看板", icon: LayoutDashboard },
-      ]
-    : []),
-  ...(admin.value
-    ? [
-        { id: "users", label: "员工管理", icon: Users },
-        { id: "settings", label: "模型与规则", icon: Settings },
-      ]
-    : []),
-]);
+const nav = computed(() => {
+  const myDepts = departments.value.filter(
+    (d) =>
+      d.active !== false &&
+      (user.value?.role === "admin" ||
+        (Array.isArray(user.value?.dept_ids) &&
+          user.value.dept_ids.includes(d.id))),
+  );
+  return [
+    { id: "chat", label: "农业问答", icon: MessageSquare },
+    { id: "images", label: "生成图片", icon: ImagePlus },
+    { id: "documents", label: "知识资料", icon: Library },
+    ...(expert.value
+      ? [
+          { id: "reviews", label: "专家评审", icon: ShieldCheck },
+          { id: "metrics", label: "质量看板", icon: LayoutDashboard },
+        ]
+      : []),
+    ...myDepts.map((d) => ({
+      id: `dept:${d.id}`,
+      label: d.name,
+      icon: Building2,
+    })),
+    ...(admin.value
+      ? [
+          { id: "departments", label: "部门管理", icon: FolderKanban },
+          { id: "users", label: "员工管理", icon: Users },
+          { id: "settings", label: "模型与规则", icon: Settings },
+        ]
+      : []),
+  ];
+});
 const title = computed(
   () => nav.value.find((n) => n.id === page.value)?.label || "农业问答",
 );
@@ -172,8 +195,12 @@ async function authenticate() {
     }
     user.value = (await call("/auth/login", login.value)).user;
     login.value.password = "";
+    await loadDepartments();
     await refresh();
   });
+}
+async function loadDepartments() {
+  departments.value = (await call("/departments")).items;
 }
 async function logout() {
   await act(async () => {
@@ -251,6 +278,18 @@ async function refresh() {
   if (view === "users") {
     const response = await call("/users");
     if (current()) users.value = response.items;
+  }
+  if (view === "departments") {
+    const response = await call("/departments");
+    if (current()) departments.value = response.items;
+  }
+  if (view.startsWith("dept:")) {
+    const deptId = view.slice(5);
+    const response = await call("/entries?dept=" + deptId);
+    if (current()) {
+      currentDept.value = response.dept;
+      deptEntries.value = response.items;
+    }
   }
   if (view === "metrics") {
     const response = await call("/metrics");
@@ -695,7 +734,12 @@ async function makeTrainingQuestion() {
   });
 }
 function editUser(u) {
-  account.value = { ...u, domains: [...u.domains], password: "" };
+  account.value = {
+    ...u,
+    domains: [...(u.domains || [])],
+    dept_ids: [...(u.dept_ids || [])],
+    password: "",
+  };
 }
 function resetUser() {
   account.value = {
@@ -703,7 +747,7 @@ function resetUser() {
     name: "",
     password: "",
     role: "employee",
-    domains: [...domains],
+    dept_ids: [],
     active: true,
   };
 }
@@ -713,6 +757,86 @@ async function saveUser() {
     resetUser();
     await refresh();
     notice.value = "员工账号已保存。";
+  });
+}
+function deptNames(u) {
+  const ids = Array.isArray(u?.dept_ids) ? u.dept_ids : [];
+  return (
+    ids
+      .map((id) => departments.value.find((d) => d.id === id)?.name)
+      .filter(Boolean)
+      .join("、") || "未分配部门"
+  );
+}
+function deptName(id) {
+  return departments.value.find((d) => d.id === id)?.name || id;
+}
+function resetDeptForm() {
+  editingDept.value = null;
+  deptForm.value = { name: "" };
+}
+function editDept(d) {
+  editingDept.value = d;
+  deptForm.value = { name: d.name };
+}
+async function saveDept() {
+  await act(async () => {
+    if (!deptForm.value.name.trim()) throw Error("请填写部门名称");
+    if (editingDept.value)
+      await call("/departments", { id: editingDept.value.id, name: deptForm.value.name }, "PUT");
+    else await call("/departments", { name: deptForm.value.name });
+    notice.value = editingDept.value ? "部门已更新。" : "部门已新增。";
+    resetDeptForm();
+    await refresh();
+  });
+}
+async function toggleDept(d) {
+  await act(async () => {
+    await call("/departments", { id: d.id, active: !(d.active !== false) }, "PUT");
+    notice.value = d.active !== false ? "部门已停用。" : "部门已启用。";
+    await refresh();
+  });
+}
+async function deleteDept(d) {
+  await act(async () => {
+    await call("/departments", { id: d.id }, "DELETE");
+    notice.value = "部门已删除。";
+    await refresh();
+  });
+}
+function openDept(d) {
+  entryForm.value = {
+    dept_id: d.id,
+    name: "",
+    code: "",
+    status: "",
+    owner: "",
+    note: "",
+  };
+}
+function resetEntry() {
+  entryForm.value = {};
+}
+function editEntry(e) {
+  entryForm.value = { ...e };
+}
+async function saveEntry() {
+  await act(async () => {
+    const body = { ...entryForm.value };
+    if (!body.dept_id) throw Error("请选择部门");
+    if (body.id) await call("/entries", body, "PUT");
+    else await call("/entries", body);
+    resetEntry();
+    await refresh();
+    notice.value = "条目已保存。";
+  });
+}
+async function deleteEntry(e) {
+  await act(async () => {
+    await call("/entries", { id: e.id }, "DELETE");
+    resetEntry();
+    await refresh();
+    notice.value = "条目已删除。";
   });
 }
 async function saveModel(role) {
@@ -771,7 +895,10 @@ onMounted(async () => {
     const status = await call("/auth/status");
     setup.value = status.setup_required;
     user.value = status.user;
-    if (user.value) await refresh();
+    if (user.value) {
+      await loadDepartments();
+      await refresh();
+    }
   } catch (e) {
     error.value = e.message;
   } finally {
@@ -1800,12 +1927,12 @@ onUnmounted(() => {
                 >
               </div>
               <div class="toolbar">
-                <label v-for="d in domains" class="inline-check"
+                <label v-for="d in departments" class="inline-check"
                   ><input
                     type="checkbox"
-                    v-model="account.domains"
-                    :value="d"
-                  />{{ d }}</label
+                    v-model="account.dept_ids"
+                    :value="d.id"
+                  />{{ d.name }}</label
                 >
               </div>
               <label class="inline-check"
@@ -1827,7 +1954,7 @@ onUnmounted(() => {
             <button v-for="u in users" class="list-row" @click="editUser(u)">
               <div>
                 <strong>{{ u.name }} · {{ u.username }}</strong
-                ><small>{{ u.domains.join("、") }}</small>
+                ><small>{{ deptNames(u) }}</small>
               </div>
               <span
                 >{{ roleNames[u.role] }} ·
@@ -1836,6 +1963,109 @@ onUnmounted(() => {
             </button>
           </section></template
         >
+        <template v-if="page.startsWith('dept:')">
+          <p class="subtle intro">
+            {{ currentDept?.name || "部门" }}条目：管理员维护，所属部门员工查看。
+          </p>
+          <section v-if="admin" class="panel block">
+            <h2>{{ entryForm.id ? "编辑条目" : "新增条目" }}</h2>
+            <form @submit.prevent="saveEntry">
+              <div class="field-grid">
+                <label
+                  >名称<input v-model="entryForm.name" required /></label
+                ><label>编号<input v-model="entryForm.code" /></label
+                ><label>状态<input v-model="entryForm.status" /></label
+                ><label>负责人<input v-model="entryForm.owner" /></label>
+              </div>
+              <label
+                >说明<textarea
+                  v-model="entryForm.note"
+                  rows="2"
+                ></textarea></label
+              >
+              <div class="toolbar">
+                <button class="primary" :disabled="busy">保存条目</button
+                ><button type="button" class="outline" @click="resetEntry">
+                  清空
+                </button>
+              </div>
+            </form>
+          </section>
+          <section class="panel block">
+            <h2>条目列表</h2>
+            <table v-if="deptEntries.length" class="grid-table">
+              <thead>
+                <tr>
+                  <th>名称</th><th>编号</th><th>状态</th><th>负责人</th
+                  ><th>说明</th><th>更新时间</th><th v-if="admin"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="e in deptEntries" :key="e.id">
+                  <td>{{ e.name }}</td>
+                  <td>{{ e.code || "—" }}</td>
+                  <td>{{ e.status || "—" }}</td>
+                  <td>{{ e.owner || "—" }}</td>
+                  <td>{{ e.note || "—" }}</td>
+                  <td>{{ new Date(e.updated_at).toLocaleString() }}</td>
+                  <td v-if="admin">
+                    <button class="link" @click="editEntry(e)">编辑</button
+                    ><button class="link danger" @click="deleteEntry(e)">
+                      删除
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-else class="subtle">暂无条目，管理员可在此新增。</p>
+          </section>
+        </template>
+        <template v-if="page === 'departments' && admin">
+          <p class="subtle intro">
+            部门用于员工归属与条目权限；被员工或条目引用的部门只能停用，不能删除。新部门自动生成通用条目页，但不会自动具备工单流转、库存扣减、设备控制等专业业务。
+          </p>
+          <section class="panel block">
+            <h2>{{ editingDept ? "编辑部门" : "新增部门" }}</h2>
+            <form @submit.prevent="saveDept">
+              <div class="field-grid">
+                <label
+                  >部门名称<input v-model="deptForm.name" required /></label
+                >
+              </div>
+              <div class="toolbar">
+                <button class="primary" :disabled="busy">
+                  {{ editingDept ? "保存" : "新增" }}
+                </button
+                ><button type="button" class="outline" @click="resetDeptForm">
+                  清空
+                </button>
+              </div>
+            </form>
+          </section>
+          <section class="panel block">
+            <h2>部门列表</h2>
+            <div v-for="d in departments" :key="d.id" class="list-row">
+              <div style="flex: 1">
+                <strong>{{ d.name }}</strong
+                ><small
+                  >员工 {{ d.user_count }} · 条目 {{ d.entry_count }} ·
+                  {{ d.active !== false ? "启用" : "已停用" }}</small
+                >
+              </div>
+              <span style="display: flex; gap: 6px; align-items: center">
+                <button class="link" @click="go('dept:' + d.id)">查看</button
+                ><button class="link" @click="editDept(d)">编辑</button
+                ><button class="link" @click="toggleDept(d)">
+                  {{ d.active !== false ? "停用" : "启用" }}
+                </button
+                ><button class="link danger" @click="deleteDept(d)">
+                  删除
+                </button>
+              </span>
+            </div>
+            <p v-if="!departments.length" class="subtle">暂无部门。</p>
+          </section>
+        </template>
         <template v-if="page === 'settings' && admin"
           ><p class="subtle intro">
             回答和裁判分别配置。密钥仅保存在服务器，不回传浏览器。兼容接口填写包含
