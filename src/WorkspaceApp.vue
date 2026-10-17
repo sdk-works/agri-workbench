@@ -129,13 +129,6 @@ const choices = {
   insufficient: "信息不足",
 };
 const nav = computed(() => {
-  const myDepts = departments.value.filter(
-    (d) =>
-      d.active !== false &&
-      (user.value?.role === "admin" ||
-        (Array.isArray(user.value?.dept_ids) &&
-          user.value.dept_ids.includes(d.id))),
-  );
   return [
     { id: "chat", label: "农业问答", icon: MessageSquare },
     { id: "images", label: "生成图片", icon: ImagePlus },
@@ -146,11 +139,6 @@ const nav = computed(() => {
           { id: "metrics", label: "质量看板", icon: LayoutDashboard },
         ]
       : []),
-    ...myDepts.map((d) => ({
-      id: `dept:${d.id}`,
-      label: d.name,
-      icon: Building2,
-    })),
     ...(admin.value
       ? [
           { id: "departments", label: "部门管理", icon: FolderKanban },
