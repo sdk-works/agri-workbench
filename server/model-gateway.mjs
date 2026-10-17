@@ -190,10 +190,11 @@ export function createGateway(
           ...(json ? { format: "json" } : {}),
         }
       : {
+          // compatible(OpenAI/兼容) 接口：不传 temperature/top_p。
+          // GPT-5 等推理模型不接受这些采样参数，传非默认值会报 unsupported_value。
           model: c.model,
           messages: withImages(messages, images, { local: false }),
           stream,
-          temperature: json ? 0.1 : 0.5,
         };
     let res;
     try {

@@ -1122,6 +1122,8 @@ export function createWorkspace({
       for (const j of await db.list("jobs", { status: "running" })) {
         if (j.type === "generate") {
           const t = await db.get("turns", j.turn_id);
+          if (!t) continue; // 历史 turn 缺失则跳过，不阻塞启动
+          t.candidates = Array.isArray(t.candidates) ? t.candidates : [];
           for (const c of t.candidates)
             if (c.status === "pending" || c.status === "generating")
               Object.assign(c, {
