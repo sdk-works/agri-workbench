@@ -48,6 +48,7 @@ const safeUser = (u) => ({
   role: u.role,
   domains: u.domains,
   dept_ids: u.dept_ids || [],
+  scope_all: u.scope_all === true,
   active: u.active,
   tenant: u.tenant,
 });
@@ -57,14 +58,38 @@ const entity = (data) => ({
   created_at: now(),
   ...data,
 });
-const elevated = (u) => ["expert", "admin"].includes(u.role);
+const elevated = (u) => ["expert", "manager", "admin"].includes(u.role);
 const inDomain = (u, r) =>
   r.tenant === u.tenant &&
-  (u.role === "admin" || (u.role === "expert" && u.domains.includes(r.domain)));
+  (u.role === "admin" ||
+    ((u.role === "expert" || u.role === "manager") &&
+      u.domains.includes(r.domain)));
 // 部门访问：管理员拥有全部部门；普通/专家员工仅能访问其所属部门。
 const inDept = (u, deptId) =>
   u.role === "admin" ||
   (Array.isArray(u.dept_ids) && u.dept_ids.includes(deptId));
+// 部门数据范围：管理员为 null（全部），其余为所属部门的名称集合
+const domainScope = async (db, u) => {
+  // 总管理员 / 总管理：覆盖全部部门，新增部门自动包含
+  if (u.role === "admin" || u.scope_all === true) return null;
+  const depts = await listDepartments(db, false);
+  return new Set(
+    depts
+      .filter((d) => (u.dept_ids || []).includes(d.id))
+      .map((d) => d.name),
+  );
+};
+const canUseDomain = (scope, domain) => scope === null || scope.has(domain);
+// 资料可见性：本人 / 本部门已发布 / 本部门专家或部门管理员
+const canSeeDoc = (u, d, scope) => {
+  if (d.tenant !== u.tenant) return false;
+  // 非管理员先满足当前部门范围，再判断本人/已发布/专家权限；
+  // 调岗或撤权后，历史资料不再默认可见。
+  if (!canUseDomain(scope, d.domain)) return false;
+  if (d.owner === u.id) return true;
+  if (d.status === "published") return true;
+  return elevated(u);
+};
 const listDepartments = async (db, includeInactive = true) => {
   const all = await db.list("departments", { tenant: "park" });
   return includeInactive ? all : all.filter((d) => d.active !== false);
@@ -101,6 +126,19 @@ const migrateUserDepts = async (db, u) => {
 };
 const needAdmin = (u) => {
   if (u.role !== "admin") fail("仅管理员可操作", 403);
+};
+const needAdminOrManager = (u) => {
+  if (
+    !["admin", "manager"].includes(u.role) &&
+    u.scope_all !== true
+  )
+    fail("仅管理员、总管理或部门管理员可操作", 403);
+};
+// 部门管理员只能操作自己部门的数据
+const managesDept = (u, deptIds) => {
+  if (u.role === "admin" || u.scope_all === true) return true;
+  const mine = new Set(u.dept_ids || []);
+  return (deptIds || []).length > 0 && deptIds.every((id) => mine.has(id));
 };
 const defaults = {
   sample_rate: 0.05,
@@ -383,6 +421,9 @@ export function createWorkspace({
       if (!/\.(txt|md|csv|jsonl|docx|pdf|xlsx)$/i.test(name))
         fail("支持 TXT、MD、CSV、JSONL、DOCX、PDF、XLSX");
       if (!(await availableDomains(db)).includes(b.domain)) fail("请选择领域");
+      const scope = await domainScope(db, u);
+      if (!canUseDomain(scope, b.domain))
+        fail("只能上传到所属部门的领域", 403);
       if (
         typeof b.base64 !== "string" ||
         !b.base64.length ||
@@ -430,7 +471,7 @@ export function createWorkspace({
           next_at: 0,
         }),
       );
-      await event(db, u, "document_uploaded", d.id);
+      await event(db, u, "document_uploaded", d.id, { domain: d.domain });
 
       return { document: d, duplicate: false };
     });
@@ -537,6 +578,9 @@ export function createWorkspace({
         fail("会话不存在", 404);
       const domain = conv?.domain || b.domain;
       if (!(await availableDomains(db)).includes(domain)) fail("请选择领域");
+      const scope = await domainScope(db, u);
+      if (!canUseDomain(scope, domain))
+        fail("无权在该部门提问", 403);
       const turns = conv
         ? (await db.list("turns", { tenant: u.tenant, owner: u.id }))
             .filter((t) => t.conversation_id === conv.id)
@@ -613,8 +657,20 @@ export function createWorkspace({
         !IMAGE_CANCEL_RE.test(question);
       const imageBase = inheritImage ? prevTurn.question : "";
       const image_hint = IMAGE_INTENT_RE.test(question) || Boolean(inheritImage);
+      // 路由：普通文字走 30B（fast），深度思考或带图走 27B（strong）
+      const wantsStrong = Boolean(image) || b.deep === true;
+      const fastOn = gateway.roleEnabled("fast");
+      const tier = wantsStrong || !fastOn ? "strong" : "fast";
+      const fastModel = tier === "fast" ? gateway.modelFor("fast") : "";
+      // 只为已启用的模型创建候选，避免禁用后仍产生任务
+      const roles = ["local", "cloud"].filter((r) => gateway.roleEnabled(r));
+      if (!roles.length) fail("没有可用的问答模型，请联系管理员", 503);
       const order =
-        randomBytes(1)[0] % 2 ? ["local", "cloud"] : ["cloud", "local"];
+        roles.length > 1
+          ? randomBytes(1)[0] % 2
+            ? ["local", "cloud"]
+            : ["cloud", "local"]
+          : roles;
       const turn = entity({
         id,
         tenant: u.tenant,
@@ -640,9 +696,12 @@ export function createWorkspace({
         gen_image: "",
         image_status: "",
         image_error: "",
+        deep: wantsStrong,
+        model_tier: tier,
         candidates: order.map((role, i) => ({
           label: i ? "B" : "A",
           role,
+          model_requested: role === "local" ? fastModel : "",
           status: "pending",
           text: "",
         })),
@@ -809,7 +868,12 @@ export function createWorkspace({
             }).catch(() => {});
           }
         },
-        { signal },
+        {
+          signal,
+          model: candidate.model_requested || undefined,
+          think: t.deep === true,
+          reasoning_effort: t.deep === true ? "medium" : "minimal",
+        },
       );
       await repo.transaction(async (db) => {
         const current = await db.get("turns", t.id);
@@ -875,10 +939,20 @@ export function createWorkspace({
       const good = t.candidates.filter(
         (c) => c.status === "completed" && c.ended_reason !== "length",
       ).length;
-      t.status = good === 2 ? "completed" : good ? "partial" : "failed";
-      t.judge = { status: good === 2 ? "queued" : "unavailable" };
+      const expected = t.candidates.length;
+      const judgeOn = gateway.roleEnabled("judge");
+      t.status = good === expected ? "completed" : good ? "partial" : "failed";
+      t.judge = {
+        status:
+          good === expected && expected >= 2
+            ? judgeOn
+              ? "queued"
+              : "disabled"
+            : "unavailable",
+      };
       await db.put("turns", t);
-      if (good === 2) await enqueue(db, t, "judge");
+      if (good === expected && expected >= 2 && judgeOn)
+        await enqueue(db, t, "judge");
       await route(db, t);
     });
     // adopt 停一路视为正常完成；仅用户 cancel 才标 canceled
@@ -1062,6 +1136,48 @@ export function createWorkspace({
         });
       }
       if (!job) return;
+      // 执行前复查开关：禁用后排队任务不再发起出站调用
+      if (job.type === "judge" && !gateway.roleEnabled("judge")) {
+        await repo.transaction(async (db) => {
+          const t = await db.get("turns", job.turn_id);
+          if (t) {
+            t.judge = { status: "disabled" };
+            await db.put("turns", t);
+          }
+        });
+        await finishJob(job, "canceled", {
+          error: { message: "裁判模型已停用" },
+        });
+        return;
+      }
+      if (job.type === "generate") {
+        const t = await repo.get("turns", job.turn_id);
+        const alive =
+          t &&
+          (t.candidates || []).some(
+            (c) =>
+              ["pending", "generating"].includes(c.status) &&
+              gateway.roleEnabled(c.role),
+          );
+        if (t && !alive) {
+          await repo.transaction(async (db) => {
+            for (const c of t.candidates || [])
+              if (c.status === "pending")
+                Object.assign(c, {
+                  status: "failed",
+                  error: "模型已停用，未发起请求",
+                  error_code: "disabled",
+                });
+            t.status = "failed";
+            t.judge = { status: "unavailable" };
+            await db.put("turns", t);
+          });
+          await finishJob(job, "canceled", {
+            error: { message: "候选模型均已停用" },
+          });
+          return;
+        }
+      }
       if (type === "generate") genRunning.add(job.id);
       try {
         await (
@@ -1138,11 +1254,18 @@ export function createWorkspace({
             : t.candidates.some(isComplete)
               ? "partial"
               : "failed";
+          const judgeOn = gateway.roleEnabled("judge");
           t.judge = {
-            status: t.status === "completed" ? "queued" : "unavailable",
+            status:
+              t.status === "completed"
+                ? judgeOn
+                  ? "queued"
+                  : "disabled"
+                : "unavailable",
           };
           await db.put("turns", t);
-          if (t.status === "completed") await enqueue(db, t, "judge");
+          if (t.status === "completed" && judgeOn)
+            await enqueue(db, t, "judge");
           await route(db, t);
           j.status = "failed";
           j.error = { message: "服务重启中断" };
@@ -1198,6 +1321,7 @@ export function createWorkspace({
   }
   async function start() {
     await recover();
+    await recoverVoiceTurns();
     timer = setInterval(() => {
       for (const type of ["generate", "judge", "parse", "assets", "candidates"])
         tick(type).catch(() => {});
@@ -1330,11 +1454,26 @@ export function createWorkspace({
       return send({ ok: true });
     }
     if (routePath === "/users") {
-      needAdmin(u);
-      if (method === "GET")
-        return send({
-          items: (await repo.list("users", { tenant: u.tenant })).map(safeUser),
-        });
+      needAdminOrManager(u);
+      if (method === "GET") {
+        const all = await repo.list("users", { tenant: u.tenant });
+        const items =
+          u.role === "admin"
+            ? all
+            : u.scope_all === true
+              ? all.filter(
+                  (x) =>
+                    x.id !== u.id && !["admin", "manager"].includes(x.role),
+                )
+              : all.filter(
+                  (x) =>
+                    !["admin", "manager"].includes(x.role) &&
+                    (x.dept_ids || []).some((id) =>
+                      (u.dept_ids || []).includes(id),
+                    ),
+                );
+        return send({ items: items.map(safeUser) });
+      }
       if (method === "POST") {
         const b = await body(),
           password = b.password ? await makePassword(b.password) : null;
@@ -1352,8 +1491,17 @@ export function createWorkspace({
               )
             )
               fail("账号已存在", 409);
-            if (!["employee", "expert", "admin"].includes(b.role))
+            if (!["employee", "expert", "admin", "manager"].includes(b.role))
               fail("身份无效");
+            const managerLike = u.role === "manager" || u.scope_all === true;
+            if (managerLike && !["employee", "expert"].includes(b.role))
+              fail("部门管理员/总管理只能设置普通员工或领域专家");
+            const wantScopeAll =
+              b.scope_all === undefined
+                ? existing?.scope_all === true
+                : b.scope_all === true;
+            if (b.scope_all === true && u.role !== "admin")
+              fail("只有总管理员可以授予总管理", 403);
             const deptList = await ensureDepartments(db);
             const activeDepts = deptList.filter((d) => d.active !== false);
             const deptIdSet = new Set(activeDepts.map((d) => d.id));
@@ -1368,6 +1516,31 @@ export function createWorkspace({
               if (dept_ids.some((id) => !deptIdSet.has(id))) fail("部门无效");
             } else {
               dept_ids = [];
+            }
+            if (managerLike) {
+              if (existing && existing.id === u.id && b.role !== "manager")
+                fail("不能修改自己的角色");
+              if (existing && ["admin", "manager"].includes(existing.role))
+                fail("无权修改管理员账号", 403);
+              if (u.scope_all === true) {
+                // 总管理：可管理全部非管理员员工，部门可任意分配
+              } else {
+                if (!managesDept(u, dept_ids) || dept_ids.length === 0)
+                  fail("只能管理自己部门内的员工");
+                if (existing) {
+                  const mine = new Set(u.dept_ids || []);
+                  const outside = (existing.dept_ids || []).filter(
+                    (id) => !mine.has(id),
+                  );
+                  // 不能借编辑把员工从其他部门踢出去
+                  if (outside.length)
+                    fail("该员工还属于其他部门，需由总管理员调整", 403);
+                  if (
+                    !(existing.dept_ids || []).some((id) => mine.has(id))
+                  )
+                    fail("无权修改该员工", 403);
+                }
+              }
             }
             // 知识领域（资料/评审）与部门同名同步：员工所属部门即其知识领域（含车间等新部门）。
             const domainsNext = dept_ids
@@ -1387,6 +1560,7 @@ export function createWorkspace({
               role: b.role,
               domains: domainsNext,
               dept_ids,
+              scope_all: u.role === "admin" ? wantScopeAll : existing?.scope_all === true,
               active: b.active !== false,
             };
             await db.put("users", record);
@@ -1463,6 +1637,55 @@ export function createWorkspace({
               b.active !== undefined
                 ? b.active !== false
                 : dept.active !== false;
+            // 资料/问答/评审按部门名称存档；改名会导致历史数据失联，先禁止。
+            if (name !== dept.name) {
+              const tenant = u.tenant;
+              const docs = (
+                await db.list("documents", { tenant })
+              ).filter((d) => d.domain === dept.name);
+              const turns = (
+                await db.list("turns", { tenant })
+              ).filter((t) => t.domain === dept.name);
+              const reviews = (
+                await db.list("reviews", { tenant })
+              ).filter((r) => r.domain === dept.name);
+              if (docs.length + turns.length + reviews.length > 0)
+                fail(
+                  `该部门已有 ${docs.length} 份资料、${turns.length} 次问答、${reviews.length} 条评审，暂不支持改名；请先迁移数据`,
+                  409,
+                );
+              for (const x of await db.list("users", { tenant })) {
+                if (Array.isArray(x.domains) && x.domains.includes(dept.name))
+                  await db.put("users", {
+                    ...x,
+                    domains: x.domains.map((n) =>
+                      n === dept.name ? name : n,
+                    ),
+                  });
+              }
+            }
+            if (!active && dept.active !== false) {
+              const tenant = u.tenant;
+              const members = (
+                await db.list("users", { tenant })
+              ).filter(
+                (x) =>
+                  Array.isArray(x.dept_ids) && x.dept_ids.includes(dept.id),
+              );
+              const docs = (await db.list("documents", { tenant })).filter(
+                (d) => d.domain === dept.name,
+              );
+              const turns = (await db.list("turns", { tenant })).filter(
+                (t) => t.domain === dept.name,
+              );
+              const refs =
+                members.length + docs.length + turns.length;
+              if (refs > 0)
+                fail(
+                  `该部门仍有 ${members.length} 名员工、${docs.length} 份资料、${turns.length} 次问答，请先处理再停用`,
+                  409,
+                );
+            }
             await db.put("departments", {
               ...dept,
               name,
@@ -1483,12 +1706,24 @@ export function createWorkspace({
             if (!dept) fail("部门不存在", 404);
             const users = await db.list("users", { tenant: u.tenant });
             const entries = await db.list("entries", { tenant: "park" });
+            const docs = (
+              await db.list("documents", { tenant: u.tenant })
+            ).filter((d) => d.domain === dept.name);
+            const turns = (
+              await db.list("turns", { tenant: u.tenant })
+            ).filter((t) => t.domain === dept.name);
+            const reviews = (
+              await db.list("reviews", { tenant: u.tenant })
+            ).filter((r) => r.domain === dept.name);
             const refs =
               users.filter(
                 (x) =>
                   Array.isArray(x.dept_ids) && x.dept_ids.includes(dept.id),
               ).length +
-              entries.filter((e) => e.dept_id === dept.id).length;
+              entries.filter((e) => e.dept_id === dept.id).length +
+              docs.length +
+              turns.length +
+              reviews.length;
             if (refs > 0)
               fail(`部门仍被 ${refs} 项员工或条目引用，不能删除；请改用停用`, 409);
             await db.remove("departments", dept.id);
@@ -1642,24 +1877,135 @@ export function createWorkspace({
         return send(await rules());
       }
     }
-    if (routePath === "/conversations" && method === "GET")
+    if (routePath === "/conversations" && method === "GET") {
+      if (url.searchParams.get("scope") === "team") {
+        if (
+          !["admin", "manager"].includes(u.role) &&
+          u.scope_all !== true
+        )
+          fail("仅管理员、总管理可查看团队提问", 403);
+        const scope = await domainScope(repo, u);
+        const users = await repo.list("users", { tenant: u.tenant });
+        const byId = new Map(users.map((x) => [x.id, x]));
+        const turns = await repo.list("turns", { tenant: u.tenant });
+        const byConv = new Map();
+        for (const t of turns) {
+          const arr = byConv.get(t.conversation_id) || [];
+          arr.push(t);
+          byConv.set(t.conversation_id, arr);
+        }
+        const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+        const dept = url.searchParams.get("dept") || "";
+        const owner = url.searchParams.get("owner") || "";
+        const from = url.searchParams.get("from") || "";
+        const to = url.searchParams.get("to") || "";
+        const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+        const pageSize = Math.min(
+          50,
+          Math.max(5, Number(url.searchParams.get("pageSize") || 20)),
+        );
+        const inRange = (ts) => {
+          const v = String(ts || "");
+          if (from && v < from) return false;
+          if (to && v > to + "T23:59:59.999Z") return false;
+          return true;
+        };
+        const rows = (await repo.list("conversations", { tenant: u.tenant }))
+          .filter((c) => {
+            const o = byId.get(c.owner);
+            if (!o) return false;
+            if (!canUseDomain(scope, c.domain)) return false;
+            if (
+              u.role !== "admin" &&
+              ["admin", "manager"].includes(o.role)
+            )
+              return false;
+            if (dept && c.domain !== dept) return false;
+            if (owner && c.owner !== owner) return false;
+            if (q && !String(c.title || "").toLowerCase().includes(q))
+              return false;
+            return inRange(c.created_at);
+          })
+          .map((c) => {
+            const list = (byConv.get(c.id) || [])
+              .slice()
+              .sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+            const last = list[list.length - 1];
+            return {
+              id: c.id,
+              title: c.title,
+              domain: c.domain,
+              owner: c.owner,
+              owner_name: byId.get(c.owner)?.name || "未知",
+              created_at: c.created_at,
+              last_at: last?.created_at || c.created_at,
+              turn_count: list.length,
+              last_question: last?.question || "",
+              has_voice: list.some((t) => t.source === "voice"),
+              completed: list.filter((t) => t.status === "completed").length,
+            };
+          })
+          .sort((a, b) =>
+            String(b.last_at).localeCompare(String(a.last_at)),
+          );
+        const day = new Date().toISOString().slice(0, 10);
+        const stats = {
+          conversations: rows.length,
+          turns: rows.reduce((n, c) => n + c.turn_count, 0),
+          people: new Set(rows.map((c) => c.owner)).size,
+          today: rows.filter(
+            (c) => String(c.created_at).slice(0, 10) === day,
+          ).length,
+          voice: rows.filter((c) => c.has_voice).length,
+        };
+        const start = (page - 1) * pageSize;
+        return send({
+          items: rows.slice(start, start + pageSize),
+          total: rows.length,
+          page,
+          pageSize,
+          stats,
+        });
+      }
       return send({
         items: await repo.list("conversations", {
           tenant: u.tenant,
           owner: u.id,
         }),
       });
+    }
     const dm = routePath.match(/^\/conversations\/([\w-]+)$/);
     if (dm && method === "DELETE")
       return send(await deleteConversation(u, dm[1]));
     if (routePath === "/turns" && method === "GET") {
+      const convId = url.searchParams.get("conversation_id");
+      if (url.searchParams.get("scope") === "team") {
+        if (
+          !["admin", "manager"].includes(u.role) &&
+          u.scope_all !== true
+        )
+          fail("仅管理员、总管理可查看团队提问", 403);
+        const scope = await domainScope(repo, u);
+        const users = await repo.list("users", { tenant: u.tenant });
+        const byId = new Map(users.map((x) => [x.id, x]));
+        const items = (await repo.list("turns", { tenant: u.tenant }))
+          .filter(
+            (t) =>
+              (!convId || t.conversation_id === convId) &&
+              canUseDomain(scope, t.domain) &&
+              (u.role === "admin" ||
+                !["admin", "manager"].includes(byId.get(t.owner)?.role)),
+          )
+          .sort((a, b) => (a.sequence || 0) - (b.sequence || 0))
+          .map((t) => ({
+            ...safeTurn(t, u),
+            owner_name: byId.get(t.owner)?.name || "未知",
+          }));
+        return send({ items });
+      }
       const items = (
         await repo.list("turns", { tenant: u.tenant, owner: u.id })
-      ).filter(
-        (t) =>
-          !url.searchParams.get("conversation_id") ||
-          t.conversation_id === url.searchParams.get("conversation_id"),
-      );
+      ).filter((t) => !convId || t.conversation_id === convId);
       return send({ items: items.map((t) => safeTurn(t, u)) });
     }
     if (routePath === "/turns" && method === "POST")
@@ -1799,12 +2145,10 @@ export function createWorkspace({
     }
     if (routePath === "/documents" && method === "GET") {
       const docs = await repo.list("documents", { tenant: u.tenant });
+      const scope = await domainScope(repo, u);
       return send({
         items: docs
-          .filter(
-            (d) =>
-              d.owner === u.id || d.status === "published" || inDomain(u, d),
-          )
+          .filter((d) => canSeeDoc(u, d, scope))
           .map(
             ({ parts, cleaned_text, approved_text, near_duplicates, ...d }) =>
               d,
@@ -1821,12 +2165,8 @@ export function createWorkspace({
     if (m) {
       const [, id, action] = m;
       const d = await repo.get("documents", id);
-      if (
-        !d ||
-        d.tenant !== u.tenant ||
-        !(d.owner === u.id || d.status === "published" || inDomain(u, d))
-      )
-        fail("资料不存在", 404);
+      const scope = await domainScope(repo, u);
+      if (!d || !canSeeDoc(u, d, scope)) fail("资料不存在", 404);
       if (method === "GET" && !action) {
         const out = { ...d };
         if (!inDomain(u, d)) delete out.near_duplicates;
@@ -1841,7 +2181,7 @@ export function createWorkspace({
         return send(out);
       }
       if (method === "GET" && action === "original") {
-        if (d.owner !== u.id && !inDomain(u, d)) fail("无权读取原文件", 403);
+        if (!canSeeDoc(u, d, scope)) fail("无权读取原文件", 403);
         res.writeHead(200, {
           "Content-Type": "application/octet-stream",
           "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(d.name)}`,
@@ -1987,6 +2327,7 @@ export function createWorkspace({
     if (routePath === "/datasets/export" && method === "POST") {
       needAdmin(u);
       const b = await body();
+      await event(repo, u, "dataset_exported", b.kind, { scope: "all" });
       if (!["sft", "dpo", "eval"].includes(b.kind)) fail("数据集类型无效");
       return send(
         await repo.transaction(async (db) => {
@@ -2191,6 +2532,193 @@ export function createWorkspace({
     }
     fail("接口不存在", 404);
   }
+
+  // ───────────────────── 语音会话（统一存储）─────────────────────
+  const VOICE_SYSTEM_PROMPT =
+    "你是农业园区助手，正在语音通话。回答口语化、简短（尽量120字以内），" +
+    "不要使用 Markdown、列表、标题或表情符号，因为回答会被直接朗读。" +
+    "缺少必要条件时先反问一句。";
+
+  // 服务重启后，遗留的语音“生成中”记录标记为中断，保留已生成文本
+  async function recoverVoiceTurns() {
+    return repo.transaction(async (db) => {
+      const rows = (await db.list("turns", { tenant: "park" })).filter(
+        (t) => t.source === "voice" && t.status === "generating",
+      );
+      for (const t of rows) {
+        const c = (t.candidates || [])[0];
+        if (c) {
+          c.status = c.text ? "failed" : "failed";
+          c.error = c.error || "服务重启中断";
+        }
+        t.status = "failed";
+        t.ended_reason = "interrupted";
+        await db.put("turns", t);
+      }
+      if (rows.length) console.log("[voice] recovered", rows.length, "turns");
+      return rows.length;
+    });
+  }
+
+  async function createVoiceTurn(u, b) {
+    return repo.transaction(async (db) => {
+      const question = text(b.question, "问题", 2000);
+      const id = text(b.request_id, "请求编号", 80);
+      if (!/^[\w-]{8,80}$/.test(id)) fail("请求编号无效");
+
+      const old = await db.get("turns", id);
+      if (old) {
+        if (old.owner !== u.id || old.tenant !== u.tenant)
+          fail("请求编号冲突", 409);
+        if (old.question !== question) fail("请求编号不可用于不同问题", 409);
+        return {
+          turn: safeTurn(old, u),
+          conversation_id: old.conversation_id,
+          duplicate: true,
+        };
+      }
+
+      let conv = b.conversation_id
+        ? await db.get("conversations", b.conversation_id)
+        : null;
+      if (
+        b.conversation_id &&
+        (!conv || conv.owner !== u.id || conv.tenant !== u.tenant)
+      )
+        fail("会话不存在", 404);
+
+      const domain = conv?.domain || b.domain;
+      if (!(await availableDomains(db)).includes(domain)) fail("请选择领域");
+      const scope = await domainScope(db, u);
+      if (!canUseDomain(scope, domain)) fail("无权在该部门提问", 403);
+
+      const turns = (
+        await db.list("turns", { tenant: u.tenant, owner: u.id })
+      )
+        .filter((t) => t.conversation_id === (conv ? conv.id : undefined))
+        .sort((a, b2) => a.sequence - b2.sequence);
+
+      // 超过 3 分钟仍未结束的语音轮次视为中断，避免永久占用“生成中”
+      for (const t of turns) {
+        if (t.source === "voice" && t.status === "generating") {
+          const age = Date.now() - Date.parse(t.created_at || 0);
+          if (age > 180000) {
+            const c = (t.candidates || [])[0];
+            if (c) {
+              c.status = "failed";
+              c.error = c.error || "生成超时中断";
+            }
+            t.status = "failed";
+            t.ended_reason = "timeout";
+            await db.put("turns", t);
+          }
+        }
+      }
+      if (turns.some((t) => t.status === "generating"))
+        fail("上一轮仍在生成，请稍后追问", 409);
+
+      const question_hash = digest(normalize(question));
+      if (!conv) {
+        conv = entity({
+          tenant: u.tenant,
+          owner: u.id,
+          domain,
+          title: question.slice(0, 60),
+          split:
+            parseInt(question_hash.slice(0, 8), 16) % 5 === 0
+              ? "eval"
+              : "train",
+        });
+        await db.put("conversations", conv);
+      }
+
+      const context = [];
+      for (const previous of turns.slice(-6)) {
+        const done = (previous.candidates || []).find(
+          (c) => isComplete(c) && c.text,
+        );
+        if (done)
+          context.push(
+            { role: "user", content: previous.question },
+            { role: "assistant", content: done.text },
+          );
+      }
+      context.push({ role: "user", content: question });
+      while (JSON.stringify(context).length > 12000 && context.length > 2)
+        context.splice(0, 2);
+
+      const turn = entity({
+        id,
+        tenant: u.tenant,
+        owner: u.id,
+        domain,
+        conversation_id: conv.id,
+        sequence: turns.length + 1,
+        question,
+        question_hash,
+        curation_requested: false,
+        case_key: digest(JSON.stringify({ domain, context })),
+        context,
+        image: null,
+        split: conv.split,
+        references: [],
+        system_prompt: VOICE_SYSTEM_PROMPT,
+        status: "generating",
+        image_hint: false,
+        image_base: "",
+        gen_image: "",
+        image_status: "",
+        image_error: "",
+        source: "voice",
+        candidates: [
+          { label: "A", role: "local", status: "generating", text: "" },
+        ],
+        feedback: null,
+        judge: { status: "skipped" },
+        config_snapshot: gateway.publicConfig(),
+      });
+      await db.put("turns", turn);
+      return {
+        turn: safeTurn(turn, u),
+        conversation_id: conv.id,
+        duplicate: false,
+        messages: [
+          { role: "system", content: VOICE_SYSTEM_PROMPT },
+          ...context,
+        ],
+      };
+    });
+  }
+
+  // 结束语音轮次：completed / failed / canceled，始终保留已生成文本
+  async function finishVoiceTurn(u, id, payload = {}) {
+    const status = ["completed", "failed", "canceled"].includes(payload.status)
+      ? payload.status
+      : "failed";
+    return repo.transaction(async (db) => {
+      const t = await db.get("turns", id);
+      if (
+        !t ||
+        t.owner !== u.id ||
+        t.tenant !== u.tenant ||
+        t.source !== "voice"
+      )
+        return null;
+      if (t.status !== "generating") return safeTurn(t, u); // 幂等
+      const c = (t.candidates || [])[0];
+      if (c) {
+        c.status = status;
+        c.text = String(payload.text || c.text || "").slice(0, 200000);
+        if (payload.error) c.error = String(payload.error).slice(0, 500);
+      }
+      t.status = status;
+      if (status !== "completed")
+        t.ended_reason = payload.reason || status;
+      await db.put("turns", t);
+      return safeTurn(t, u);
+    });
+  }
+
   return {
     handle,
     userFor,
@@ -2201,5 +2729,8 @@ export function createWorkspace({
     recover,
     createTurn,
     feedback,
+    createVoiceTurn,
+    finishVoiceTurn,
+    recoverVoiceTurns,
   };
 }

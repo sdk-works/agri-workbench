@@ -27,7 +27,7 @@ export const result = () => ({
 });
 export async function fixture(
   t,
-  { judge = async () => result(), call: generate } = {},
+  { judge = async () => result(), call: generate, disabled = [] } = {},
 ) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agri-v3-")),
     repo = await openRepository({
@@ -41,10 +41,15 @@ export async function fixture(
     }),
     fallbackEnabled: () => false,
     judge,
+    roleEnabled: (role) => !disabled.includes(role),
+    modelFor: (role) =>
+      role === "fast" ? "qwen3:30b-a3b-bench" : role + "-model",
     call:
       generate ||
-      (async (role, messages) => {
-        calls.push({ role, messages });
+      (async (role, messages, json, images, onToken, opts) => {
+        if (disabled.includes(role))
+          throw Object.assign(Error(`${role} 模型已停用`), { code: "disabled" });
+        calls.push({ role, messages, opts });
         return {
           answer: `${role} 有效答案`,
           model: role + "-model",
@@ -149,5 +154,5 @@ export async function fixture(
     await repo.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
-  return { repo, ws, request, admin, add, turn, calls, dir, base };
+  return { repo, ws, request, admin, add, turn, calls, dir, base, disabled };
 }

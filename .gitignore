@@ -24,3 +24,12 @@ models/
 *.sqlite-shm
 *.sqlite-wal
 *.db
+
+# android 构建产物与签名密钥（密钥须本地备份，禁止入库）
+*.apk
+*.aab
+*.jks
+*.keystore
+android/**/build/
+android/**/.gradle/
+android/local.properties

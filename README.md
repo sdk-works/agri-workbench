@@ -31,11 +31,22 @@ npm run dev -- --port 5174 --strictPort
 
 ## 安卓端
 
-`android/` 提供极简 WebView 壳，把工作台装成手机 App 使用，默认内网加载 `http://192.168.0.141/`（不依赖 mDNS）。手机需与服务器同一局域网。
+`android/` 提供极简 WebView 壳，把工作台装成手机 App 使用。页面统一从云端加载 `http://42.193.104.148:8080/`（外网/移动网络均可访问），**网页改版无需重新安装 APK**。
 
-- 支持：网页内文件/图片上传（已实现 `onShowFileChooser`）、JS 弹窗、返回键后退、登录态 cookie 持久化。
-- 打包：需 JDK 17、Android SDK（platform-34 + build-tools）、Gradle 8.10。`cd android && gradle assembleRelease`，产物在 `app/build/outputs/apk/release/`。
-- 签名密钥 `keystore/qinghe.jks` 仅在本地保留，未纳入版本库（`.gitignore` 排除）；升级版本必须用同一密钥签名才能覆盖安装。
+- 支持：网页内文件/图片上传（已实现 `onShowFileChooser`）、JS 弹窗、返回键后退、登录态 cookie 持久化、移动端正确缩放（`useWideViewPort` + `loadWithOverviewMode`）。
+- **语音通话（v1.5 起走服务端）**：
+  - 识别：安卓壳内 `MediaRecorder` 直接录音（16k/AAC，静音 0.9s 自动停），编码后交给网页上传 `POST /api/v2/voice/asr` → 本地 `faster-whisper small`（中文，1～1.5s/句）。
+    **不用 `getUserMedia`**：WebView 在 `http://` 页面属于不安全上下文，浏览器会直接禁用麦克风且不弹授权框，这是 v1.5 语音失败的原因。
+  - 回答：`POST /api/v2/voice/answer`（SSE）→ 语音专用小模型 `qwen2.5:3b` 逐 token 下发（首字 ~30ms），不可用时回退家族模型网关。
+  - 朗读：`POST /api/v2/voice/tts` → `edge-tts`（`zh-CN-XiaoxiaoNeural`），按标点切句、边生成边播（首句到出声约 1.5～2.5s）。
+  - 连续对话：说完停顿自动提交 → 回答边生成边播 → 播完自动续听；支持「停止播报／挂断」。
+  - 权限引导：点击通话先调 `QingHeVoice.diagnose()` 检查麦克风权限/识别服务/朗读引擎；缺权限时给出步骤 + 「授权麦克风」「打开应用设置」按钮。
+- 语音服务为独立进程：`agri-voice.service`（`voice_service.py`，`127.0.0.1:8790`），模型缓存 `~/.cache/huggingface`，依赖 `faster-whisper / edge-tts`（PyAV 需 **12.x**，19.x 移除了 `metadata_errors`）。
+- 在线更新：启动后拉取 `http://42.193.104.148/apk/agri-android.json` 比对 `versionCode`，有新版本弹窗提示；`DownloadManager` 下载后用 `ApkFileProvider` 拉起系统安装器（`content://`，兼容 Android 7+）。
+- 发布新版本：递增 `versionCode`/`versionName` → `cd android && gradle assembleRelease` → 将 `app/build/outputs/apk/release/app-release.apk` 上传为云端 `/var/www/greenhouse/apk/jingyang-v<版本>.apk` → 更新 `agri-android.json` 的 `versionCode/versionName/apkUrl/size/md5/changelog`。只改清单不用重新发 APK 的情况：仅网页改动。
+- 打包环境：JDK 17 + Android SDK（platform-34、build-tools 34.0.0）+ Gradle 8.5。
+- 签名密钥 `android/keystore/qinghe.jks`（alias `qinghe`）**必须妥善备份**；换密钥后旧版本无法覆盖安装，只能卸载重装。
+- 版本沿革：v1.2 及更早使用旧密钥（私钥已丢失），v1.3 起换用新密钥，因此 v1.2 用户需卸载后重装一次，之后可正常在线更新。
 - 苹果端（iOS）需 Mac 与 Apple 开发者账号才能打包，本仓库暂不提供。
 
 ## 图片提问
@@ -111,3 +122,9 @@ npm run build
 ```
 
 具体结果见 `VERIFICATION.md`。API 见 `API-CONTRACT.md`。
+
+## 近期更新与路线图
+
+- **组织与权限页整合（本期）**：员工管理与部门管理合并为单一「组织与权限」页面——左侧部门筛选栏（带人数）、右侧员工表（搜索/角色/状态筛选、分页）、右侧滑出编辑面板（基本信息 / 部门与权限 / 账号安全）。部门改为筛选而非跳转；「角色（能做什么）」与「数据范围（全部部门，含以后新增）」明确区分。
+- **记忆与进化（设计中）**：为本地模型增加长期记忆（事实 / 偏好 / 约束三类 × 本人 / 部门 / 全员三档范围）与“从反馈提炼偏好规则”的进化能力。写入走异步队列、读取每轮注入 `system_prompt`、硬预算约 600 token；红线是只从「用户陈述」与「被采纳答案」抽取，避免把模型错误固化为长期事实。
+- **向量召回（P2）**：引入 `bge-m3`（via Ollama `/api/embed`）做语义检索，替代当前轻量关键词片段召回。

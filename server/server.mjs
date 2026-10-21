@@ -7,6 +7,7 @@ import { openRepository } from "./repository.mjs";
 import { createGateway } from "./model-gateway.mjs";
 import { createWorkspace } from "./workspace.mjs";
 import { createImageServer } from "./image-server.mjs";
+import { createVoice } from "./voice.mjs";
 import { loadEnv } from "./env.mjs";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url))),
@@ -71,6 +72,7 @@ const workspace = createWorkspace({
   },
 });
 await workspace.start();
+const voice = createVoice({ env, json, readBody, gateway, workspace });
 const allowedOrigins = new Set(
   (
     env.ALLOWED_ORIGINS ||
@@ -83,14 +85,16 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.headers.origin && !allowedOrigins.has(req.headers.origin))
       return json(res, 403, { error: "页面来源未授权" });
+    const url = new URL(req.url, "http://127.0.0.1");
     if (
       req.method === "POST" &&
+      !url.pathname.startsWith("/api/v2/voice/asr") &&
       !String(req.headers["content-type"] || "").startsWith("application/json")
     )
       return json(res, 415, { error: "需要 application/json" });
-    const url = new URL(req.url, "http://127.0.0.1");
     if (req.method === "GET" && url.pathname === "/api/v1/health")
       return json(res, 200, { ok: true, version: "0.4.0", storage: repo.type });
+    if (await voice.handle(req, res, url)) return;
     if (await imageServer.handle(req, res, url)) return;
     if (await workspace.handle(req, res, url)) return;
     if (url.pathname.startsWith("/api/v1/"))

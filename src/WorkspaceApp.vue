@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 import {
   Sprout,
   MessageSquare,
@@ -16,6 +16,10 @@ import {
   Building2,
   FolderKanban,
   Menu,
+  Mic,
+  PhoneOff,
+  Volume2,
+  Sparkles,
 } from "lucide-vue-next";
 import { call, download } from "./workspace-api";
 const user = ref(null),
@@ -28,9 +32,35 @@ const user = ref(null),
 const login = ref({ username: "", name: "", password: "" }),
   domains = ["种植管理", "农业物联网", "农业销售", "设计"];
 const conversations = ref([]),
+  teamConvs = ref([]),
+  teamTurns = ref([]),
+  teamConv = ref(null),
+  teamUsers = ref([]),
+  teamFilters = ref({ q: "", dept: "", owner: "", range: "7" }),
+  teamPage = ref(1),
+  teamTotal = ref(0),
+  teamStats = ref({}),
+  teamLoading = ref(false),
+  teamOpen = ref(""),
+  teamRanges = [
+    { value: "today", label: "今天" },
+    { value: "7", label: "近 7 天" },
+    { value: "30", label: "近 30 天" },
+    { value: "all", label: "全部" },
+  ],
   conversationId = ref(""),
   turns = ref([]),
   question = ref(""),
+  deep = ref(false),
+  deptFilter = ref("all"),
+  empSearch = ref(""),
+  empRole = ref(""),
+  empStatus = ref(""),
+  empPage = ref(1),
+  panelOpen = ref(false),
+  deptDialog = ref(false),
+  deptMenu = ref(""),
+  nowTick = ref(Date.now()),
   domain = ref(domains[0]),
   draft = ref(null),
   pendingImage = ref(null),
@@ -58,6 +88,7 @@ const users = ref([]),
     password: "",
     role: "employee",
     dept_ids: [],
+    scope_all: false,
     active: true,
   }),
   models = ref({}),
@@ -82,6 +113,38 @@ const domainOptions = computed(() =>
 );
 // 移动端侧边栏抽屉开关。
 const menuOpen = ref(false);
+
+// ── 语音通话 ─────────────────────────────────────────
+// 安卓壳通过 window.QingHeVoice 暴露原生识别/朗读；桌面浏览器回退 Web Speech API。
+const voiceMode = ref(false);
+const voiceState = ref("idle"); // idle | listening | thinking | speaking
+const voiceText = ref("");
+const voiceError = ref("");
+let voiceRec = null;
+let voiceAwaiting = false;
+let voiceSpokenTurn = "";
+
+const voiceNative = () =>
+  typeof window !== "undefined" && window.QingHeVoice ? window.QingHeVoice : null;
+const voiceSupported = computed(() => {
+  if (typeof window === "undefined") return false;
+  const n = voiceNative();
+  if (n && typeof n.available === "function") {
+    try {
+      if (n.available() === "1") return true;
+    } catch (e) {}
+  }
+  return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+});
+const voiceStateText = computed(
+  () =>
+    ({
+      idle: "点击开始说话",
+      listening: "请说话…",
+      thinking: "正在思考…",
+      speaking: "正在播报…",
+    })[voiceState.value] || ""
+);
 const imageStatus = {
   queued: "排队中",
   running: "生成中",
@@ -91,6 +154,101 @@ const imageStatus = {
 };
 const expert = computed(() => ["expert", "admin"].includes(user.value?.role)),
   admin = computed(() => user.value?.role === "admin");
+// 部门管理员：只能看/管自己部门的人
+const manager = computed(
+  () => user.value?.role === "manager" || user.value?.scope_all === true
+);
+const canManageUsers = computed(() => admin.value || manager.value);
+const manageableDepartments = computed(() =>
+  admin.value
+    ? departments.value
+    : departments.value.filter((d) =>
+        (user.value?.dept_ids || []).includes(d.id)
+      )
+);
+const teamOwnerName = computed(() => {
+  const id = teamFilters.value.owner;
+  return teamUsers.value.find((u) => u.id === id)?.name || "全部成员";
+});
+const teamRangeLabel = computed(
+  () =>
+    teamRanges.value.find((r) => r.value === teamFilters.value.range)?.label ||
+    "近 7 天"
+);
+const teamDepartments = computed(() =>
+  admin.value || user.value?.scope_all
+    ? departments.value
+    : departments.value.filter((d) =>
+        (user.value?.dept_ids || []).includes(d.id)
+      )
+);
+const activeDepts = computed(() =>
+  departments.value.filter((d) => d.active !== false)
+);
+const inactiveDepts = computed(() =>
+  departments.value.filter((d) => d.active === false)
+);
+const unassignedCount = computed(
+  () => users.value.filter((u) => !(u.dept_ids || []).length).length
+);
+function deptCount(id) {
+  return users.value.filter((u) => (u.dept_ids || []).includes(id)).length;
+}
+const filteredEmployees = computed(() => {
+  const q = empSearch.value.trim().toLowerCase();
+  return users.value
+    .filter((u) => {
+      if (deptFilter.value === "none") {
+        if ((u.dept_ids || []).length) return false;
+      } else if (deptFilter.value !== "all") {
+        if (!(u.dept_ids || []).includes(deptFilter.value)) return false;
+      }
+      if (empRole.value && u.role !== empRole.value) return false;
+      if (empStatus.value === "active" && !u.active) return false;
+      if (empStatus.value === "inactive" && u.active) return false;
+      if (q) {
+        const hay = `${u.name || ""} ${u.username || ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    })
+    .sort((a, b) =>
+      String(a.name || a.username).localeCompare(String(b.name || b.username), "zh-CN")
+    );
+});
+const empPageCount = computed(() =>
+  Math.max(1, Math.ceil(filteredEmployees.value.length / 20))
+);
+const pagedEmployees = computed(() =>
+  filteredEmployees.value.slice((empPage.value - 1) * 20, empPage.value * 20)
+);
+const accountDeptOptions = computed(() =>
+  manageableDepartments.value.filter(
+    (d) => d.active !== false && !(account.value.dept_ids || []).includes(d.id)
+  )
+);
+const assignableRoles = computed(() =>  admin.value
+    ? roleNames
+    : { employee: roleNames.employee, expert: roleNames.expert }
+);
+// 员工的问题领域跟随所属部门，不再手动选
+const myDepts = computed(() =>
+  departments.value.filter(
+    (d) => d.active !== false && (user.value?.dept_ids || []).includes(d.id)
+  )
+);
+const autoDomain = computed(() => myDepts.value[0]?.name || "");
+// 非管理员只能看到自己部门的领域；管理员为全部
+const allowedDomainOptions = computed(() =>
+  admin.value
+    ? domainOptions.value
+    : domainOptions.value.filter((n) =>
+        myDepts.value.some((d) => d.name === n)
+      )
+);
+const singleDomain = computed(() =>
+  allowedDomainOptions.value.length === 1 ? allowedDomainOptions.value[0] : ""
+);
 const annotationStatus = computed(() => {
   const a = annotation.value?.annotation;
   if (!a) return { class: "neutral", text: "未标注" };
@@ -98,7 +256,12 @@ const annotationStatus = computed(() => {
     return { class: "success", text: `已确认 v${a.revision}` };
   return { class: "amber", text: `草稿 v${a.revision}` };
 });
-const roleNames = { employee: "普通员工", expert: "领域专家", admin: "管理员" };
+const roleNames = {
+  employee: "普通员工",
+  expert: "领域专家",
+  manager: "部门管理员",
+  admin: "管理员",
+};
 const statusNames = {
   queued: "待处理",
   running: "处理中",
@@ -111,6 +274,8 @@ const statusNames = {
   partial: "单路可用",
   failed: "失败",
   generating: "正在回答",
+  canceled: "已取消",
+  interrupted: "已中断",
   degraded: "本地降级",
   unavailable: "无法比较",
   parsing: "解析中",
@@ -138,6 +303,9 @@ const choices = {
 const nav = computed(() => {
   return [
     { id: "chat", label: "农业问答", icon: MessageSquare },
+    ...(canManageUsers.value
+      ? [{ id: "team", label: "团队提问", icon: Users }]
+      : []),
     { id: "images", label: "生成图片", icon: ImagePlus },
     { id: "documents", label: "知识资料", icon: Library },
     ...(expert.value
@@ -146,12 +314,11 @@ const nav = computed(() => {
           { id: "metrics", label: "质量看板", icon: LayoutDashboard },
         ]
       : []),
+    ...(canManageUsers.value
+      ? [{ id: "users", label: "组织与权限", icon: Users }]
+      : []),
     ...(admin.value
-      ? [
-          { id: "departments", label: "部门管理", icon: FolderKanban },
-          { id: "users", label: "员工管理", icon: Users },
-          { id: "settings", label: "模型与规则", icon: Settings },
-        ]
+      ? [{ id: "settings", label: "模型与规则", icon: Settings }]
       : []),
   ];
 });
@@ -166,6 +333,7 @@ const filteredReviews = computed(() =>
   ),
 );
 let timer,
+  clock,
   polling = false,
   disposed = false;
 async function act(fn) {
@@ -196,10 +364,15 @@ async function authenticate() {
 }
 async function loadDepartments() {
   departments.value = (await call("/departments")).items;
-  // 若当前领域已被停用/不在新列表，回退到第一个 active 部门。
-  if (domainOptions.value.length && !domainOptions.value.includes(domain.value))
+  // 管理员在部门停用/变动时回退到第一个；其他人由所属部门推导，不默认归属
+  if (
+    admin.value &&
+    domainOptions.value.length &&
+    !domainOptions.value.includes(domain.value)
+  )
     domain.value = domainOptions.value[0];
   if (
+    admin.value &&
     domainOptions.value.length &&
     !domainOptions.value.includes(upload.value.domain)
   )
@@ -225,7 +398,113 @@ async function go(id) {
   detail.value = null;
   doc.value = null;
   await act(refresh);
+  if (id === "team") {
+    try {
+      await Promise.all([loadTeamUsers(), loadTeam()]);
+    } catch (e) {
+      error.value = e.message;
+    }
+  }
 }
+
+function elapsedSeconds(t) {
+  const start = new Date(t.created_at || 0).getTime();
+  if (!start) return 0;
+  const s = Math.floor((nowTick.value - start) / 1000);
+  return s > 0 ? s : 0;
+}
+
+function formatTime(v) {
+  if (!v) return "";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime()))
+    return String(v).slice(0, 16).replace("T", " ");
+  return d.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function relativeTime(v) {
+  const d = new Date(v || 0);
+  if (Number.isNaN(d.getTime())) return "";
+  const diff = (Date.now() - d.getTime()) / 60000;
+  if (diff < 1) return "刚刚";
+  if (diff < 60) return Math.floor(diff) + " 分钟前";
+  if (diff < 1440) return Math.floor(diff / 60) + " 小时前";
+  return Math.floor(diff / 1440) + " 天前";
+}
+
+function teamRangeFrom() {
+  const r = teamFilters.value.range;
+  if (r === "all") return "";
+  const d = new Date();
+  d.setDate(d.getDate() - (r === "today" ? 0 : Number(r)));
+  return d.toISOString().slice(0, 10);
+}
+
+function toggleTeamFilter(key) {
+  teamOpen.value = teamOpen.value === key ? "" : key;
+}
+
+function pickTeamFilter(key, value) {
+  teamFilters.value[key] = value;
+  teamOpen.value = "";
+  loadTeam();
+}
+
+async function loadTeamUsers() {
+  try {
+    const r = await call("/users");
+    teamUsers.value = r.items || [];
+  } catch (e) {
+    teamUsers.value = [];
+  }
+}
+
+async function loadTeam(reset = true) {
+  if (reset) teamPage.value = 1;
+  teamLoading.value = true;
+  try {
+    const f = teamFilters.value;
+    const params = new URLSearchParams({
+      scope: "team",
+      page: String(teamPage.value),
+      pageSize: "20",
+    });
+    if (f.q.trim()) params.set("q", f.q.trim());
+    if (f.dept) params.set("dept", f.dept);
+    if (f.owner) params.set("owner", f.owner);
+    const from = teamRangeFrom();
+    if (from) params.set("from", from);
+    const r = await call("/conversations?" + params.toString());
+    teamConvs.value = r.items || [];
+    teamTotal.value = r.total || 0;
+    teamStats.value = r.stats || {};
+    if (
+      teamConv.value &&
+      !teamConvs.value.some((c) => c.id === teamConv.value.id)
+    ) {
+      teamConv.value = null;
+      teamTurns.value = [];
+    }
+  } finally {
+    teamLoading.value = false;
+  }
+}
+
+async function openTeamConv(c) {
+  teamConv.value = c;
+  const r = await call("/turns?scope=team&conversation_id=" + c.id);
+  teamTurns.value = r.items || [];
+}
+async function refreshCurrent() {
+  await refresh();
+  if (page.value === "team") await loadTeam();
+}
+
 async function refresh() {
   if (!user.value) return;
   const identity = user.value.id,
@@ -433,17 +712,23 @@ function clearImage() {
   draft.value = null;
 }
 async function ask() {
+  if (!allowedDomainOptions.value.length) {
+    notice.value = "还没有分配部门，请联系管理员分配后再提问。";
+    return;
+  }
   await act(async () => {
     if (
       !draft.value ||
       draft.value.question !== question.value ||
       draft.value.conversation_id !== conversationId.value ||
+      Boolean(draft.value.deep) !== Boolean(deep.value) ||
       Boolean(draft.value.image) !== Boolean(pendingImage.value)
     )
       draft.value = {
         request_id: crypto.randomUUID(),
         question: question.value,
         domain: domain.value,
+        deep: deep.value,
         conversation_id: conversationId.value || undefined,
         image: pendingImage.value
           ? { data: pendingImage.value.data, mime: pendingImage.value.mime }
@@ -550,6 +835,10 @@ async function exportSet(kind) {
   });
 }
 async function uploadFile() {
+  if (!allowedDomainOptions.value.length) {
+    notice.value = "还没有分配部门，请联系管理员分配后再上传资料。";
+    return;
+  }
   await act(async () => {
     if (!file.value) throw Error("请选择文件");
     if (file.value.size > 8 * 1024 * 1024) throw Error("单个文件不能超过 8 MB");
@@ -737,6 +1026,43 @@ async function makeTrainingQuestion() {
     await refresh();
   });
 }
+function openNewUser() {
+  resetUser();
+  panelOpen.value = true;
+}
+function openEditUser(u) {
+  editUser(u);
+  panelOpen.value = true;
+}
+function closeUserPanel() {
+  panelOpen.value = false;
+  resetUser();
+}
+function resetEmpFilters() {
+  empSearch.value = "";
+  empRole.value = "";
+  empStatus.value = "";
+  deptFilter.value = "all";
+  empPage.value = 1;
+}
+function addAccountDept(id) {
+  if (!id) return;
+  if (!account.value.dept_ids.includes(id))
+    account.value.dept_ids = [...account.value.dept_ids, id];
+}
+function removeAccountDept(id) {
+  account.value.dept_ids = account.value.dept_ids.filter((x) => x !== id);
+}
+function openNewDept() {
+  editingDept.value = null;
+  deptForm.value = { name: "" };
+  deptDialog.value = true;
+}
+function openEditDept(d) {
+  editDept(d);
+  deptMenu.value = "";
+  deptDialog.value = true;
+}
 function editUser(u) {
   account.value = {
     ...u,
@@ -752,12 +1078,16 @@ function resetUser() {
     password: "",
     role: "employee",
     dept_ids: [],
+    scope_all: false,
     active: true,
   };
 }
 async function saveUser() {
   await act(async () => {
+    if (account.value.role === "manager" && !(account.value.dept_ids || []).length)
+      throw Error("部门管理员至少选择一个所属部门");
     await call("/users", account.value);
+    panelOpen.value = false;
     resetUser();
     await refresh();
     notice.value = "员工账号已保存。";
@@ -775,6 +1105,34 @@ function deptNames(u) {
 function deptName(id) {
   return departments.value.find((d) => d.id === id)?.name || id;
 }
+function manualCheckUpdate() {
+  const n = voiceNative();
+  if (n && typeof n.checkUpdate === "function") {
+    notice.value = "正在检查更新…";
+    try {
+      n.checkUpdate();
+    } catch (e) {
+      notice.value = "检查更新失败";
+    }
+  } else {
+    notice.value = "请在「京阳智农」安卓应用内检查更新";
+  }
+}
+function roleBadge(role) {  return role === "admin"
+    ? "danger"
+    : role === "manager"
+      ? "amber"
+      : role === "expert"
+        ? "cloud"
+        : "neutral";
+}
+function permissionText(u) {
+  if (u.role === "admin") return "账号、部门、模型规则";
+  if (u.scope_all) return "全部部门（含新增）· 管理员工";
+  if (u.role === "manager") return "管理本部门员工";
+  if (u.role === "expert") return "问答、评审、资料";
+  return "问答与资料";
+}
 function resetDeptForm() {
   editingDept.value = null;
   deptForm.value = { name: "" };
@@ -790,6 +1148,7 @@ async function saveDept() {
       await call("/departments", { id: editingDept.value.id, name: deptForm.value.name }, "PUT");
     else await call("/departments", { name: deptForm.value.name });
     notice.value = editingDept.value ? "部门已更新。" : "部门已新增。";
+    deptDialog.value = false;
     resetDeptForm();
     await refresh();
   });
@@ -894,7 +1253,621 @@ async function retryJob(j) {
     notice.value = "裁判已重新排队。";
   });
 }
+// ── 语音通话 v2：服务端语音 + 流式回答 ─────────────────
+const voiceSetupOpen = ref(false);
+const voiceSetupSteps = ref([]);
+const voiceAnswerText = ref("");
+const voiceLevel = ref(0);
+let voiceHistory = [];
+let voiceConversationId = "";
+let voiceQueue = [];
+let voiceSpeaking = false;
+let voiceStreamDone = true;
+let voiceCapture = null;
+let voiceAudio = null;
+let voiceSpeakResolve = null;
+let voiceServer = { ok: false, asr: false, tts: false };
+
+function showVoiceSetup(steps) {
+  voiceSetupSteps.value = steps;
+  voiceSetupOpen.value = true;
+  voiceState.value = "idle";
+}
+
+function startCall() {
+  voiceMode.value = true;
+  voiceError.value = "";
+  voiceText.value = "";
+  voiceAnswerText.value = "";
+  voiceSetupOpen.value = false;
+  voiceHistory = [];
+  voiceConversationId = "";
+  voiceQueue = [];
+  voiceSpeaking = false;
+  voiceStreamDone = true;
+  probeAndStart();
+}
+
+async function probeAndStart() {
+  const n = voiceNative();
+  let diag = null;
+  if (n && typeof n.diagnose === "function") {
+    try {
+      diag = JSON.parse(n.diagnose());
+    } catch (e) {}
+  }
+  try {
+    const r = await fetch("/api/v2/voice/status", {
+      headers: { "X-Workbench": "1" },
+    });
+    voiceServer = r.ok ? await r.json() : { ok: false, asr: false, tts: false };
+  } catch (e) {
+    voiceServer = { ok: false, asr: false, tts: false };
+  }
+
+  const nativeAsr = Boolean(diag && diag.asr);
+  const mic = diag ? diag.mic : "unknown";
+
+  if (nativeAsr && mic === "denied") {
+    if (n.requestMic) {
+      try {
+        n.requestMic();
+      } catch (e) {}
+    }
+    showVoiceSetup([
+      "语音通话需要麦克风权限。",
+      "点「授权麦克风」，在系统弹窗里选择「允许」。",
+      "若之前拒绝过：点「打开应用设置」→ 权限 → 麦克风 → 允许。",
+    ]);
+    return;
+  }
+  if (nativeAsr) {
+    startNativeListening();
+    return;
+  }
+  if (diag && diag.rec) {
+    startNativeRec();
+    return;
+  }
+  if (voiceServer.asr) {
+    startCapture();
+    return;
+  }
+
+  showVoiceSetup([
+    "这台设备没有可用的语音识别服务。",
+    voiceServer.ok
+      ? "服务器语音模型正在加载，请稍等十几秒再试。"
+      : "服务器语音服务未启动，请联系管理员。",
+    "仍可用文字输入提问，或安装最新安卓应用。",
+  ]);
+}
+
+function startNativeRec() {
+  voiceState.value = "listening";
+  voiceText.value = "";
+  voiceError.value = "";
+  const n = voiceNative();
+  try {
+    n.recStart();
+  } catch (e) {
+    voiceError.value = "无法启动录音：" + e;
+    voiceState.value = "idle";
+  }
+}
+
+async function uploadAudio(blob, ext) {
+  voiceState.value = "thinking";
+  try {
+    const r = await fetch("/api/v2/voice/asr?ext=" + ext, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream", "X-Workbench": "1" },
+      body: blob,
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || "识别失败");
+    const text = String(j.text || "").trim();
+    if (!text) {
+      voiceError.value = "没有听清，请再说一次";
+      resumeListening();
+      return;
+    }
+    voiceText.value = text;
+    await askStreaming(text);
+  } catch (e) {
+    voiceError.value = e.message || "识别失败";
+    voiceState.value = "idle";
+  }
+}
+
+function base64ToBlob(b64, ext) {
+  const bin = window.atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: ext === "m4a" ? "audio/mp4" : "audio/webm" });
+}
+
+function startNativeListening() {
+  voiceState.value = "listening";
+  voiceText.value = "";
+  voiceError.value = "";
+  const n = voiceNative();
+  try {
+    n.startListening();
+  } catch (e) {
+    voiceError.value = "无法启动麦克风";
+    voiceState.value = "idle";
+  }
+}
+
+async function startCapture() {
+  if (!voiceMode.value) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    voiceError.value = "当前页面环境不支持录音";
+    showVoiceSetup([
+      "浏览器在 http:// 页面下禁止调用麦克风，所以不会弹授权框。",
+      "请使用「京阳智农」安卓应用进行语音通话（应用内可直接录音）。",
+      "电脑上请用 localhost 访问，或让管理员配置 HTTPS 域名。",
+    ]);
+    return;
+  }
+  voiceState.value = "listening";
+  voiceText.value = "";
+  voiceError.value = "";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new Ctx();
+    const src = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    src.connect(analyser);
+    const chunks = [];
+    const mime =
+      window.MediaRecorder &&
+      MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : "audio/webm";
+    let rec;
+    try {
+      rec = new MediaRecorder(stream, { mimeType: mime });
+    } catch (e) {
+      rec = new MediaRecorder(stream);
+    }
+    rec.ondataavailable = (e) => {
+      if (e.data && e.data.size) chunks.push(e.data);
+    };
+    rec.start();
+    const cap = { stream, ctx, rec, chunks, raf: 0, speech: false, silence: 0, stopped: false };
+    voiceCapture = cap;
+    const data = new Uint8Array(analyser.fftSize);
+    const tick = () => {
+      if (!voiceMode.value || cap.stopped) return;
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const x = (data[i] - 128) / 128;
+        sum += x * x;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      voiceLevel.value = Math.min(1, rms * 14);
+      const now = performance.now();
+      if (rms > 0.02) {
+        cap.speech = true;
+        cap.silence = 0;
+      } else if (cap.speech) {
+        if (!cap.silence) cap.silence = now;
+        else if (now - cap.silence > 900) {
+          finishCapture();
+          return;
+        }
+      }
+      cap.raf = requestAnimationFrame(tick);
+    };
+    cap.raf = requestAnimationFrame(tick);
+  } catch (e) {
+    voiceError.value =
+      e && e.name === "NotAllowedError" ? "麦克风权限被拒绝" : e.message || "无法打开麦克风";
+    showVoiceSetup([
+      "浏览器没有拿到麦克风权限。",
+      "安卓应用内：设置 → 应用 → 京阳智农 → 权限 → 麦克风 → 允许。",
+      "电脑浏览器：点地址栏左侧的锁图标 → 麦克风 → 允许。",
+    ]);
+  }
+}
+
+function finishCapture() {
+  const cap = voiceCapture;
+  if (!cap || cap.stopped) return;
+  cap.stopped = true;
+  try {
+    cancelAnimationFrame(cap.raf);
+  } catch (e) {}
+  const done = async () => {
+    const blob = new Blob(cap.chunks, { type: "audio/webm" });
+    cleanupCapture();
+    if (blob.size < 2500) {
+      if (voiceMode.value) startCapture();
+      return;
+    }
+    await uploadAudio(blob, "webm");
+  };
+  try {
+    cap.rec.onstop = done;
+    cap.rec.stop();
+  } catch (e) {
+    done();
+  }
+}
+
+function cleanupCapture() {
+  const cap = voiceCapture;
+  voiceCapture = null;
+  voiceLevel.value = 0;
+  if (!cap) return;
+  try {
+    cancelAnimationFrame(cap.raf);
+  } catch (e) {}
+  try {
+    cap.stream.getTracks().forEach((t) => t.stop());
+  } catch (e) {}
+  try {
+    cap.ctx.close();
+  } catch (e) {}
+}
+
+async function askStreaming(text) {
+  voiceState.value = "thinking";
+  voiceAnswerText.value = "";
+  voiceQueue = [];
+  voiceSpeaking = false;
+  voiceStreamDone = false;
+  let full = "";
+  let pending = "";
+  try {
+    const chosenDomain =
+      domain.value && allowedDomainOptions.value.includes(domain.value)
+        ? domain.value
+        : allowedDomainOptions.value[0];
+    const res = await fetch("/api/v2/voice/turn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Workbench": "1" },
+      body: JSON.stringify({
+        request_id:
+          (window.crypto &&
+            typeof window.crypto.randomUUID === "function" &&
+            window.crypto.randomUUID()) ||
+          "voice-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        question: text,
+        conversation_id: voiceConversationId || undefined,
+        domain: chosenDomain,
+      }),
+    });
+    if (!res.ok || !res.body) {
+      const j = await res.json().catch(() => ({}));
+      throw new Error(j.error || "服务返回 " + res.status);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const part = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        if (!part.startsWith("data:")) continue;
+        const raw = part.slice(5).trim();
+        if (!raw) continue;
+        let obj;
+        try {
+          obj = JSON.parse(raw);
+        } catch (e) {
+          continue;
+        }
+        if (obj.type === "meta") {
+          if (obj.conversation_id) voiceConversationId = obj.conversation_id;
+          continue;
+        }
+        if (obj.error) throw new Error(obj.error);
+        if (obj.delta) {
+          full += obj.delta;
+          pending += obj.delta;
+          voiceAnswerText.value = full;
+          let m;
+          while ((m = pending.match(/^([\s\S]*?[。！？!?；;\n])([\s\S]*)$/))) {
+            const sentence = m[1].trim();
+            pending = m[2];
+            if (sentence) enqueueSpeech(sentence);
+          }
+        }
+      }
+    }
+    if (pending.trim()) enqueueSpeech(pending.trim());
+    voiceHistory.push({ role: "user", content: text }, { role: "assistant", content: full });
+    voiceHistory = voiceHistory.slice(-8);
+    voiceStreamDone = true;
+    refresh().catch(() => {});
+    if (!voiceSpeaking && voiceQueue.length === 0) resumeListening();
+  } catch (e) {
+    voiceError.value = e.message || "生成失败";
+    voiceState.value = "idle";
+    voiceStreamDone = true;
+  }
+}
+
+function enqueueSpeech(text) {
+  const t = stripForSpeech(text);
+  if (!t) return;
+  voiceQueue.push(t);
+  if (!voiceSpeaking) playNext();
+}
+
+async function playNext() {
+  const text = voiceQueue.shift();
+  if (!text) {
+    voiceSpeaking = false;
+    if (voiceStreamDone && voiceMode.value) resumeListening();
+    return;
+  }
+  voiceSpeaking = true;
+  voiceState.value = "speaking";
+  let ok = false;
+  if (voiceServer.tts) {
+    try {
+      await playServerTts(text);
+      ok = true;
+    } catch (e) {
+      ok = false;
+    }
+  }
+  if (!ok) {
+    try {
+      await playFallbackTts(text);
+    } catch (e) {}
+  }
+  voiceSpeaking = false;
+  playNext();
+}
+
+function playServerTts(text) {
+  return new Promise((resolve, reject) => {
+    fetch("/api/v2/voice/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Workbench": "1" },
+      body: JSON.stringify({ text }),
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error("TTS " + r.status);
+        return r.blob();
+      })
+      .then((blob) => {
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        voiceAudio = audio;
+        audio.onended = () => {
+          URL.revokeObjectURL(url);
+          voiceAudio = null;
+          resolve();
+        };
+        audio.onerror = () => {
+          URL.revokeObjectURL(url);
+          voiceAudio = null;
+          reject(Error("播放失败"));
+        };
+        audio.play().catch(reject);
+      })
+      .catch(reject);
+  });
+}
+
+function playFallbackTts(text) {
+  return new Promise((resolve) => {
+    const n = voiceNative();
+    if (n && typeof n.speak === "function") {
+      voiceSpeakResolve = resolve;
+      try {
+        n.speak(text);
+      } catch (e) {
+        resolve();
+      }
+      return;
+    }
+    if (window.speechSynthesis) {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "zh-CN";
+      u.onend = resolve;
+      u.onerror = resolve;
+      window.speechSynthesis.speak(u);
+      return;
+    }
+    resolve();
+  });
+}
+
+function resumeListening() {
+  if (!voiceMode.value || voiceCapture) return;
+  window.setTimeout(() => {
+    if (!voiceMode.value || voiceCapture) return;
+    const n = voiceNative();
+    if (n && typeof n.diagnose === "function") {
+      let d = null;
+      try {
+        d = JSON.parse(n.diagnose());
+      } catch (e) {}
+      if (d && d.asr) {
+        startNativeListening();
+        return;
+      }
+      if (d && d.rec) {
+        startNativeRec();
+        return;
+      }
+    }
+    if (voiceServer.asr) startCapture();
+  }, 250);
+}
+
+function handleVoiceEvent(ev) {
+  if (typeof ev === "string") {
+    try {
+      ev = JSON.parse(ev);
+    } catch (e) {
+      return;
+    }
+  }
+  if (!ev || !voiceMode.value) return;
+  if (ev.type === "audio") {
+    uploadAudio(base64ToBlob(ev.data || "", ev.ext || "m4a"), ev.ext || "m4a");
+    return;
+  }
+  if (ev.type === "partial") {
+    voiceText.value = ev.text || "";
+  } else if (ev.type === "result") {
+    const text = String(ev.text || "").trim();
+    voiceText.value = text;
+    if (text) askStreaming(text);
+  } else if (ev.type === "error") {
+    const msg = ev.message || "语音识别失败";
+    if (msg.indexOf("忙") >= 0) {
+      window.setTimeout(() => {
+        if (voiceMode.value) startNativeListening();
+      }, 800);
+      return;
+    }
+    voiceError.value = msg;
+    if (msg.indexOf("权限") >= 0) {
+      showVoiceSetup([
+        "麦克风权限被拒绝。",
+        "点「打开应用设置」→ 权限 → 麦克风 → 允许，然后重新发起通话。",
+      ]);
+    } else if (voiceState.value === "listening") {
+      voiceState.value = "idle";
+    }
+  } else if (ev.type === "speakEnd") {
+    if (voiceSpeakResolve) {
+      const fn = voiceSpeakResolve;
+      voiceSpeakResolve = null;
+      fn();
+    }
+  }
+}
+
+function stopSpeaking() {
+  voiceQueue = [];
+  if (voiceAudio) {
+    try {
+      voiceAudio.pause();
+      voiceAudio.currentTime = 0;
+    } catch (e) {}
+    voiceAudio = null;
+  }
+  const n = voiceNative();
+  try {
+    n && n.stopSpeaking();
+  } catch (e) {}
+  if (window.speechSynthesis) window.speechSynthesis.cancel();
+  if (voiceSpeakResolve) {
+    const fn = voiceSpeakResolve;
+    voiceSpeakResolve = null;
+    fn();
+  }
+  voiceSpeaking = false;
+  if (voiceMode.value) resumeListening();
+}
+
+function endCall() {
+  voiceMode.value = false;
+  voiceState.value = "idle";
+  voiceSetupOpen.value = false;
+  voiceQueue = [];
+  voiceSpeaking = false;
+  cleanupCapture();
+  if (voiceAudio) {
+    try {
+      voiceAudio.pause();
+    } catch (e) {}
+    voiceAudio = null;
+  }
+  const n = voiceNative();
+  try {
+    n && n.stopListening();
+  } catch (e) {}
+  try {
+    n && n.recCancel();
+  } catch (e) {}
+  try {
+    n && n.stopSpeaking();
+  } catch (e) {}
+  if (window.speechSynthesis) window.speechSynthesis.cancel();
+  if (voiceSpeakResolve) {
+    const fn = voiceSpeakResolve;
+    voiceSpeakResolve = null;
+    fn();
+  }
+}
+
+function nativeRequestMic() {
+  const n = voiceNative();
+  if (n && n.requestMic) {
+    voiceSetupOpen.value = false;
+    try {
+      n.requestMic();
+    } catch (e) {}
+    window.setTimeout(() => {
+      voiceMode.value = true;
+      probeAndStart();
+    }, 1200);
+  }
+}
+
+function nativeOpenSettings() {
+  const n = voiceNative();
+  if (n && n.openAppSettings) {
+    try {
+      n.openAppSettings();
+    } catch (e) {}
+  }
+}
+
+function stripForSpeech(value) {
+  return String(value || "")
+    .replace(/```[\s\S]*?```/g, " 代码块 ")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/[#>*_`~]/g, "")
+    .replace(/^\s*[-·]\s+/gm, "")
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 1200);
+}
+
+// 问题领域跟随所属部门，不再让员工手选
+watch(
+  [departments, user],
+  () => {
+    if (!user.value || admin.value) return;
+    if (!allowedDomainOptions.value.length) {
+      domain.value = "";
+      upload.value.domain = "";
+      return;
+    }
+    if (!allowedDomainOptions.value.includes(domain.value))
+      domain.value = allowedDomainOptions.value[0];
+    if (!allowedDomainOptions.value.includes(upload.value.domain))
+      upload.value.domain = allowedDomainOptions.value[0];
+  },
+  { immediate: true }
+);
+
 onMounted(async () => {
+  // 接收安卓壳的语音事件
+  window.__qingheVoice = handleVoiceEvent;
   try {
     const status = await call("/auth/status");
     setup.value = status.setup_required;
@@ -909,10 +1882,14 @@ onMounted(async () => {
     ready.value = true;
   }
   timer = setInterval(poll, 3000);
+  clock = setInterval(() => (nowTick.value = Date.now()), 1000);
 });
 onUnmounted(() => {
   disposed = true;
   clearInterval(timer);
+  clearInterval(clock);
+  if (window.__qingheVoice === handleVoiceEvent) delete window.__qingheVoice;
+  endCall();
 });
 </script>
 
@@ -980,6 +1957,8 @@ onUnmounted(() => {
       <div class="wb-profile">
         <strong>{{ user.name }}</strong
         ><span>{{ roleNames[user.role] }}</span
+        ><button @click="manualCheckUpdate">
+          <RefreshCw :size="16" />检查更新</button
         ><button @click="logout"><LogOut :size="16" />退出登录</button>
       </div>
     </aside>
@@ -1000,10 +1979,9 @@ onUnmounted(() => {
       <div class="wb-content">
         <div class="heading">
           <div>
-            <div class="eyebrow">AGRICULTURAL INTELLIGENCE</div>
             <h1>{{ title }}</h1>
           </div>
-          <button class="outline" :disabled="busy" @click="act(refresh)">
+          <button class="outline" :disabled="busy" @click="act(refreshCurrent)">
             <RefreshCw :size="16" />刷新
           </button>
         </div>
@@ -1068,9 +2046,16 @@ onUnmounted(() => {
                   >
                     停止
                   </button>
-                  <p>{{ t.question }}</p>
+                  <p>
+                    <span v-if="t.source === 'voice'" class="badge amber"
+                      >语音</span
+                    >{{ t.question }}
+                  </p>
                 </div>
-                <div class="wb-answers">
+                <div
+                  class="wb-answers"
+                  :class="{ single: t.candidates.length === 1 }"
+                >
                   <section
                     v-for="c in t.candidates"
                     :key="c.label"
@@ -1091,7 +2076,11 @@ onUnmounted(() => {
                       </template>
                       <template v-else>
                         <span
-                          v-if="c.status === 'generating'"
+                          v-if="c.status === 'generating' && t.deep && !c.text"
+                          style="display:block;font-size:13px;color:#7c3aed;"
+                        >深度思考中… {{ elapsedSeconds(t) }}s</span>
+                        <span
+                          v-else-if="c.status === 'generating'"
                           style="display:block;font-size:13px;color:#7c3aed;"
                         >正在回答…</span>
                         <span
@@ -1102,6 +2091,10 @@ onUnmounted(() => {
                           v-else-if="c.status === 'stopped'"
                           style="display:block;font-size:13px;color:#64748b;"
                         >已停止</span>
+                        <span
+                          v-else-if="c.status === 'canceled'"
+                          style="display:block;font-size:13px;color:#64748b;"
+                        >已取消，未生成完整回答</span>
                         <span v-if="c.text" class="cand-text">{{ c.text }}</span>
                       </template>
                     </p>
@@ -1150,6 +2143,7 @@ onUnmounted(() => {
                 </div>
                 <div
                   v-if="
+                    t.source !== 'voice' &&
                     t.status === 'generating' &&
                     t.candidates.some((c) => c.status === 'completed') &&
                     t.candidates.some(
@@ -1177,7 +2171,10 @@ onUnmounted(() => {
                     {{ r.name }} · v{{ r.version }} · {{ r.location }}
                   </p>
                 </details>
-                <div v-if="t.status !== 'generating'" class="feedback-bar">
+                <div
+                  v-if="t.status !== 'generating' && t.source !== 'voice'"
+                  class="feedback-bar"
+                >
                   <span>哪个更有帮助？</span
                   ><button
                     v-for="(label, key) in choices"
@@ -1206,11 +2203,22 @@ onUnmounted(() => {
                 </div>
               </article>
               <form class="panel composer-v3" @submit.prevent="ask">
-                <label v-if="!conversationId"
+                <label v-if="!conversationId && allowedDomainOptions.length > 1"
                   >问题领域<select v-model="domain">
-                    <option v-for="d in domainOptions">{{ d }}</option>
+                    <option v-for="d in allowedDomainOptions">{{ d }}</option>
                   </select></label
-                ><label
+                ><div
+                  v-else-if="!conversationId && singleDomain"
+                  class="domain-note"
+                >
+                  问题领域：<strong>{{ singleDomain }}</strong>
+                  <small>（按你的所属部门自动确定）</small>
+                </div><div
+                  v-else-if="!conversationId"
+                  class="domain-warn"
+                >
+                  还没有分配部门，请联系管理员分配后再提问。
+                </div><label
                   >{{ turns.length ? "继续追问" : "你的问题"
                   }}<textarea
                     v-model="question"
@@ -1237,7 +2245,8 @@ onUnmounted(() => {
                   </button>
                 </div>
                 <div class="form-bottom">
-                  <span class="image-pick">
+                  <div class="composer-tools">
+                    <span class="image-pick">
                     <label class="inline-check"
                       ><input
                         type="file"
@@ -1245,9 +2254,29 @@ onUnmounted(() => {
                         @change="pickImage"
                       /><ImagePlus :size="16" />附图片（PNG/JPG/WEBP/GIF，≤8MB，随问题发给模型）</label
                     >
-                  </span>
-                  <small
-                    >追问使用你采用的回答；未选择时优先沿用本地有效回答。选择修改不改写已生成的历史。</small
+                    </span>
+                  <button
+                    type="button"
+                    class="deep-toggle"
+                    :class="{ active: deep }"
+                    :disabled="busy"
+                    :title="deep ? '已开启：本轮使用 27B 深度思考，响应会变慢' : '开启后本轮使用 27B 深度思考，响应会变慢'"
+                    @click="deep = !deep"
+                  >
+                    <Sparkles :size="15" />深度思考
+                    <span class="deep-state">{{ deep ? "开" : "关" }}</span>
+                  </button>
+                </div>
+                <small
+                  >追问使用你采用的回答；未选择时优先沿用本地有效回答。选择修改不改写已生成的历史。</small
+                ><button
+                  type="button"
+                  class="voice-entry"
+                    :disabled="busy || turns.some((t) => t.status === 'generating')"
+                    @click="startCall"
+                  >
+                    <Mic :size="16" />语音通话
+                  </button
                   ><button
                     class="primary"
                     :disabled="
@@ -1619,12 +2648,16 @@ onUnmounted(() => {
           </p>
           <section class="panel block" v-if="!doc">
             <h2>上传资料</h2>
-            <div class="field-grid">
-              <label
-                >领域<select v-model="upload.domain">
-                  <option v-for="d in domainOptions">{{ d }}</option>
-                </select></label
-              ><label
+                <div class="field-grid">
+                  <label v-if="allowedDomainOptions.length > 1"
+                    >领域<select v-model="upload.domain">
+                      <option v-for="d in allowedDomainOptions">{{ d }}</option>
+                    </select></label
+                  ><label v-else-if="singleDomain"
+                    >领域<input :value="singleDomain" readonly /></label
+                  ><label v-else
+                    >领域<input value="未分配部门，请联系管理员" readonly /></label
+                  ><label
                 >来源 / 版本<input
                   v-model="upload.source"
                   placeholder="如：园区种植 SOP 2026.10" /></label
@@ -1643,13 +2676,13 @@ onUnmounted(() => {
               支持 TXT、MD、CSV、JSONL、DOCX、文字 PDF、XLSX，单个最大 8
               MB。扫描 PDF 需先 OCR。
             </p>
-            <button
-              class="primary"
-              :disabled="busy || !file"
-              @click="uploadFile"
-            >
-              <Upload :size="16" />上传并清洗
-            </button>
+                            <button
+                  class="primary"
+                  :disabled="busy || !file || !allowedDomainOptions.length"
+                  @click="uploadFile"
+                >
+                  <Upload :size="16" />上传并清洗
+                </button>
           </section>
           <template v-if="doc"
             ><button class="text-button" @click="doc = null">← 返回资料</button>
@@ -1910,173 +2943,529 @@ onUnmounted(() => {
             <p v-if="!docs.length" class="empty">还没有可见资料。</p>
           </section>
         </template>
-        <template v-if="page === 'users' && admin"
-          ><section class="panel block">
-            <h2>{{ account.id ? "修改员工" : "添加员工" }}</h2>
-            <form @submit.prevent="saveUser">
-              <div class="field-grid">
-                <label
-                  >登录账号<input v-model="account.username" required /></label
-                ><label
-                  >显示名<input
-                    v-model="account.name"
-                    placeholder="昵称或工号" /></label
-                ><label
-                  >{{ account.id ? "新密码（留空不改）" : "初始密码"
-                  }}<input
-                    v-model="account.password"
-                    type="password"
-                    autocomplete="new-password"
-                    :required="!account.id"
-                    minlength="10"
-                    maxlength="128" /></label
-                ><label
-                  >身份<select v-model="account.role">
-                    <option v-for="(label, key) in roleNames" :value="key">
-                      {{ label }}
-                    </option>
-                  </select></label
-                >
+        <template v-if="page === 'team'">
+          <div class="team-page">
+            <header class="team-head">
+              <p class="subtle team-sub">
+                只读查看员工问答 · {{ admin || user.scope_all ? "全部部门" : "本部门" }}
+              </p>
+              <div class="team-kpis">
+                <div><strong>{{ teamStats.conversations || 0 }}</strong><span>会话</span></div>
+                <div><strong>{{ teamStats.turns || 0 }}</strong><span>提问</span></div>
+                <div><strong>{{ teamStats.people || 0 }}</strong><span>参与人</span></div>
+                <div><strong>{{ teamStats.today || 0 }}</strong><span>今日</span></div>
+                <div><strong>{{ teamStats.voice || 0 }}</strong><span>语音会话</span></div>
               </div>
-              <div class="toolbar">
-                <label v-for="d in departments" class="inline-check"
-                  ><input
-                    type="checkbox"
-                    v-model="account.dept_ids"
-                    :value="d.id"
-                  />{{ d.name }}</label
-                >
-              </div>
-              <label class="inline-check"
-                ><input
-                  type="checkbox"
-                  v-model="account.active"
-                />启用账号</label
-              >
-              <div class="toolbar">
-                <button class="primary" :disabled="busy">保存账号</button
-                ><button type="button" class="outline" @click="resetUser">
-                  清空
+            </header>
+
+            <div class="team-filters">
+              <input
+                v-model="teamFilters.q"
+                placeholder="搜索问题标题…"
+                @keyup.enter="loadTeam()"
+              />
+              <div class="sel">
+                <button type="button" class="sel-btn" @click.stop="toggleTeamFilter('dept')">
+                  <span>{{ teamFilters.dept || "全部部门" }}</span>
                 </button>
+                <div v-if="teamOpen === 'dept'" class="sel-menu">
+                  <button type="button" :class="{ active: !teamFilters.dept }" @click.stop="pickTeamFilter('dept', '')">全部部门</button>
+                  <button
+                    v-for="d in teamDepartments"
+                    :key="d.id"
+                    type="button"
+                    :class="{ active: teamFilters.dept === d.name }"
+                    @click.stop="pickTeamFilter('dept', d.name)"
+                  >{{ d.name }}</button>
+                </div>
               </div>
-            </form>
-          </section>
-          <section class="panel block">
-            <h2>员工列表</h2>
-            <button v-for="u in users" class="list-row" @click="editUser(u)">
-              <div>
-                <strong>{{ u.name }} · {{ u.username }}</strong
-                ><small>{{ deptNames(u) }}</small>
-              </div>
-              <span
-                >{{ roleNames[u.role] }} ·
-                {{ u.active ? "启用" : "停用" }}</span
-              >
-            </button>
-          </section></template
-        >
-        <template v-if="page.startsWith('dept:')">
-          <p class="subtle intro">
-            {{ currentDept?.name || "部门" }}条目：管理员维护，所属部门员工查看。
-          </p>
-          <section v-if="admin" class="panel block">
-            <h2>{{ entryForm.id ? "编辑条目" : "新增条目" }}</h2>
-            <form @submit.prevent="saveEntry">
-              <div class="field-grid">
-                <label
-                  >名称<input v-model="entryForm.name" required /></label
-                ><label>编号<input v-model="entryForm.code" /></label
-                ><label>状态<input v-model="entryForm.status" /></label
-                ><label>负责人<input v-model="entryForm.owner" /></label>
-              </div>
-              <label
-                >说明<textarea
-                  v-model="entryForm.note"
-                  rows="2"
-                ></textarea></label
-              >
-              <div class="toolbar">
-                <button class="primary" :disabled="busy">保存条目</button
-                ><button type="button" class="outline" @click="resetEntry">
-                  清空
+              <div class="sel">
+                <button type="button" class="sel-btn" @click.stop="toggleTeamFilter('owner')">
+                  <span>{{ teamOwnerName }}</span>
                 </button>
+                <div v-if="teamOpen === 'owner'" class="sel-menu">
+                  <button type="button" :class="{ active: !teamFilters.owner }" @click.stop="pickTeamFilter('owner', '')">全部成员</button>
+                  <button
+                    v-for="u in teamUsers"
+                    :key="u.id"
+                    type="button"
+                    :class="{ active: teamFilters.owner === u.id }"
+                    @click.stop="pickTeamFilter('owner', u.id)"
+                  >{{ u.name }}</button>
+                </div>
               </div>
-            </form>
-          </section>
-          <section class="panel block">
-            <h2>条目列表</h2>
-            <table v-if="deptEntries.length" class="grid-table">
-              <thead>
-                <tr>
-                  <th>名称</th><th>编号</th><th>状态</th><th>负责人</th
-                  ><th>说明</th><th>更新时间</th><th v-if="admin"></th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="e in deptEntries" :key="e.id">
-                  <td>{{ e.name }}</td>
-                  <td>{{ e.code || "—" }}</td>
-                  <td>{{ e.status || "—" }}</td>
-                  <td>{{ e.owner || "—" }}</td>
-                  <td>{{ e.note || "—" }}</td>
-                  <td>{{ new Date(e.updated_at).toLocaleString() }}</td>
-                  <td v-if="admin">
-                    <button class="link" @click="editEntry(e)">编辑</button
-                    ><button class="link danger" @click="deleteEntry(e)">
-                      删除
-                    </button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-            <p v-else class="subtle">暂无条目，管理员可在此新增。</p>
-          </section>
-        </template>
-        <template v-if="page === 'departments' && admin">
-          <p class="subtle intro">
-            部门用于员工归属与条目权限；被员工或条目引用的部门只能停用，不能删除。新部门自动生成通用条目页，但不会自动具备工单流转、库存扣减、设备控制等专业业务。
-          </p>
-          <section class="panel block">
-            <h2>{{ editingDept ? "编辑部门" : "新增部门" }}</h2>
-            <form @submit.prevent="saveDept">
-              <div class="field-grid">
-                <label
-                  >部门名称<input v-model="deptForm.name" required /></label
-                >
-              </div>
-              <div class="toolbar">
-                <button class="primary" :disabled="busy">
-                  {{ editingDept ? "保存" : "新增" }}
-                </button
-                ><button type="button" class="outline" @click="resetDeptForm">
-                  清空
+              <div class="sel">
+                <button type="button" class="sel-btn" @click.stop="toggleTeamFilter('range')">
+                  <span>{{ teamRangeLabel }}</span>
                 </button>
+                <div v-if="teamOpen === 'range'" class="sel-menu">
+                  <button
+                    v-for="r in teamRanges"
+                    :key="r.value"
+                    type="button"
+                    :class="{ active: teamFilters.range === r.value }"
+                    @click.stop="pickTeamFilter('range', r.value)"
+                  >{{ r.label }}</button>
+                </div>
               </div>
-            </form>
-          </section>
-          <section class="panel block">
-            <h2>部门列表</h2>
-            <div v-for="d in departments" :key="d.id" class="list-row">
-              <div style="flex: 1">
-                <strong>{{ d.name }}</strong
-                ><small
-                  >员工 {{ d.user_count }} · 条目 {{ d.entry_count }} ·
-                  {{ d.active !== false ? "启用" : "已停用" }}</small
-                >
-              </div>
-              <span style="display: flex; gap: 6px; align-items: center">
-                <button class="link" @click="go('dept:' + d.id)">查看</button
-                ><button class="link" @click="editDept(d)">编辑</button
-                ><button class="link" @click="toggleDept(d)">
-                  {{ d.active !== false ? "停用" : "启用" }}
-                </button
-                ><button class="link danger" @click="deleteDept(d)">
-                  删除
-                </button>
-              </span>
+              <div v-if="teamOpen" class="sel-mask" @click="teamOpen = ''"></div>
             </div>
-            <p v-if="!departments.length" class="subtle">暂无部门。</p>
-          </section>
+
+            <div class="team-layout">
+              <section class="team-list panel">
+                <div v-if="teamLoading" class="team-empty">加载中…</div>
+                <template v-else>
+                  <button
+                    v-for="c in teamConvs"
+                    :key="c.id"
+                    :class="['team-row', { active: teamConv && teamConv.id === c.id }]"
+                    @click="openTeamConv(c)"
+                  >
+                    <span class="team-avatar">{{ (c.owner_name || "?").slice(0, 1) }}</span>
+                    <span class="team-row-main">
+                      <span class="team-row-top">
+                        <strong>{{ c.owner_name }}</strong>
+                        <small>{{ relativeTime(c.last_at) }}</small>
+                      </span>
+                      <span class="team-row-title">{{ c.title }}</span>
+                      <span class="team-row-meta">
+                        <span class="chip">{{ c.domain }}</span>
+                        <span v-if="c.has_voice" class="chip amber">语音</span>
+                        <span class="chip">{{ c.turn_count }} 轮</span>
+                      </span>
+                    </span>
+                  </button>
+                  <p v-if="!teamConvs.length" class="team-empty">没有符合条件的提问。</p>
+                  <div class="team-pager">
+                    <button
+                      class="outline"
+                      :disabled="teamPage <= 1"
+                      @click="teamPage--; loadTeam(false)"
+                    >上一页</button>
+                    <span>{{ teamPage }} / {{ Math.max(1, Math.ceil(teamTotal / 20)) }}</span>
+                    <button
+                      class="outline"
+                      :disabled="teamPage >= Math.ceil(teamTotal / 20)"
+                      @click="teamPage++; loadTeam(false)"
+                    >下一页</button>
+                  </div>
+                </template>
+              </section>
+
+              <section class="team-detail panel">
+                <template v-if="teamConv">
+                  <header class="team-detail-head">
+                    <div>
+                      <h2>{{ teamConv.title }}</h2>
+                      <p class="subtle">
+                        {{ teamConv.owner_name }} · {{ teamConv.domain }} ·
+                        {{ teamConv.turn_count }} 轮 · {{ formatTime(teamConv.created_at) }}
+                      </p>
+                    </div>
+                    <span class="chip">只读</span>
+                  </header>
+                  <div class="team-thread">
+                    <div v-for="t in teamTurns" :key="t.id" class="team-msg">
+                      <div class="team-bubble q">
+                        <div class="team-who">{{ t.owner_name }}</div>
+                        {{ t.question }}
+                      </div>
+                      <div v-for="c in t.candidates" :key="c.label" class="team-bubble a">
+                        <div class="team-who">
+                          AI · {{ statusNames[t.status] || t.status }}
+                          <span v-if="t.source === 'voice'" class="chip amber">语音</span>
+                        </div>
+                        <div class="team-answer">{{ c.text || statusNames[c.status] || "无内容" }}</div>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+                <div v-else class="team-empty">从左侧选择一条会话查看。</div>
+              </section>
+            </div>
+          </div>
+        </template>
+        <template v-if="page === 'users' && canManageUsers">
+          <div class="org-page">
+            <header class="org-head">
+              <div>
+                <p class="subtle">
+                  按部门筛选员工，编辑角色与账号状态。{{
+                    admin ? "部门可新增、重命名、停用。" : "仅显示你负责的部门。"
+                  }}
+                </p>
+              </div>
+              <button class="primary" @click="openNewUser">＋ 新增员工</button>
+            </header>
+
+            <div class="org-layout">
+              <aside class="panel org-side">
+                <button
+                  class="org-side-item"
+                  :class="{ active: deptFilter === 'all' }"
+                  @click="deptFilter = 'all'"
+                >
+                  <span>全部员工</span
+                  ><span class="org-side-count">{{ users.length }}</span>
+                </button>
+                <button
+                  class="org-side-item"
+                  :class="{ active: deptFilter === 'none' }"
+                  @click="deptFilter = 'none'"
+                >
+                  <span>未分配部门</span
+                  ><span class="org-side-count">{{ unassignedCount }}</span>
+                </button>
+                <div class="org-side-sep"></div>
+                <div class="org-side-label">部门</div>
+                <div
+                  v-for="d in activeDepts"
+                  :key="d.id"
+                  class="org-side-row"
+                >
+                  <button
+                    class="org-side-item"
+                    :class="{ active: deptFilter === d.id }"
+                    @click="deptFilter = d.id"
+                  >
+                    <span>{{ d.name }}</span
+                    ><span class="org-side-count">{{ deptCount(d.id) }}</span>
+                  </button>
+                  <div v-if="admin" class="org-more">
+                    <button
+                      class="org-more-btn"
+                      @click.stop="deptMenu = deptMenu === d.id ? '' : d.id"
+                    >
+                      ⋯
+                    </button>
+                    <div v-if="deptMenu === d.id" class="org-menu">
+                      <button @click.stop="openEditDept(d)">重命名</button>
+                      <button
+                        @click.stop="
+                          toggleDept(d);
+                          deptMenu = '';
+                        "
+                      >
+                        {{ d.active !== false ? "停用" : "启用" }}
+                      </button>
+                      <button
+                        class="danger"
+                        :disabled="d.user_count > 0 || d.entry_count > 0"
+                        :title="
+                          d.user_count > 0 || d.entry_count > 0
+                            ? '有员工或条目，只能停用'
+                            : '删除部门'
+                        "
+                        @click.stop="
+                          deleteDept(d);
+                          deptMenu = '';
+                        "
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <template v-if="inactiveDepts.length">
+                  <div class="org-side-label">已停用</div>
+                  <div
+                    v-for="d in inactiveDepts"
+                    :key="d.id"
+                    class="org-side-row"
+                  >
+                    <button
+                      class="org-side-item muted"
+                      :class="{ active: deptFilter === d.id }"
+                      @click="deptFilter = d.id"
+                    >
+                      <span>{{ d.name }}</span
+                      ><span class="org-side-count">{{ deptCount(d.id) }}</span>
+                    </button>
+                    <div v-if="admin" class="org-more">
+                      <button
+                        class="org-more-btn"
+                        @click.stop="deptMenu = deptMenu === d.id ? '' : d.id"
+                      >
+                        ⋯
+                      </button>
+                      <div v-if="deptMenu === d.id" class="org-menu">
+                        <button @click.stop="openEditDept(d)">重命名</button>
+                        <button
+                          @click.stop="
+                            toggleDept(d);
+                            deptMenu = '';
+                          "
+                        >
+                          启用
+                        </button>
+                        <button
+                          class="danger"
+                          :disabled="d.user_count > 0 || d.entry_count > 0"
+                          @click.stop="
+                            deleteDept(d);
+                            deptMenu = '';
+                          "
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+                <button v-if="admin" class="org-add-dept" @click="openNewDept">
+                  ＋ 新增部门
+                </button>
+              </aside>
+
+              <section class="panel org-main">
+                <div class="org-toolbar">
+                  <input v-model="empSearch" placeholder="搜索姓名 / 账号" />
+                  <select v-model="empRole">
+                    <option value="">全部角色</option>
+                    <option value="employee">普通员工</option>
+                    <option value="expert">领域专家</option>
+                    <option value="manager">部门管理员</option>
+                    <option value="admin">系统管理员</option>
+                  </select>
+                  <select v-model="empStatus">
+                    <option value="">全部状态</option>
+                    <option value="active">启用</option>
+                    <option value="inactive">停用</option>
+                  </select>
+                  <button class="outline" @click="resetEmpFilters">重置</button>
+                </div>
+
+                <div class="org-table">
+                  <div class="org-thead">
+                    <span>姓名 / 账号</span><span>所属部门</span
+                    ><span>角色</span><span>状态</span><span>操作</span>
+                  </div>
+                  <div v-for="u in pagedEmployees" :key="u.id" class="org-trow">
+                    <div class="org-cell-name">
+                      <strong>{{ u.name || u.username }}</strong>
+                      <small v-if="u.name && u.name !== u.username">{{
+                        u.username
+                      }}</small>
+                    </div>
+                    <div class="org-cell-depts">
+                      <template v-if="(u.dept_ids || []).length">
+                        <span
+                          v-for="id in (u.dept_ids || []).slice(0, 2)"
+                          :key="id"
+                          class="org-dept-chip"
+                          >{{ deptName(id) }}</span
+                        >
+                        <span
+                          v-if="u.dept_ids.length > 2"
+                          class="org-dept-more"
+                          :title="u.dept_ids.map(deptName).join('、')"
+                          >+{{ u.dept_ids.length - 2 }}</span
+                        >
+                      </template>
+                      <span v-else class="org-dept-none">待分配</span>
+                    </div>
+                    <div class="org-cell-role">
+                      <span class="badge" :class="roleBadge(u.role)">{{
+                        roleNames[u.role]
+                      }}</span>
+                      <span
+                        v-if="u.scope_all"
+                        class="badge amber"
+                        title="数据范围：全部部门（含以后新增）"
+                        >全部部门</span
+                      >
+                    </div>
+                    <div class="org-cell-status" :class="{ off: !u.active }">
+                      <i></i>{{ u.active ? "启用" : "停用" }}
+                    </div>
+                    <div class="org-cell-actions">
+                      <button class="link" @click="openEditUser(u)">编辑</button>
+                    </div>
+                  </div>
+                  <p v-if="!filteredEmployees.length" class="empty-inline">
+                    没有符合条件的员工。
+                  </p>
+                </div>
+
+                <div class="org-pager">
+                  <span>共 {{ filteredEmployees.length }} 人</span>
+                  <span class="org-pager-pages">
+                    <button
+                      class="outline"
+                      :disabled="empPage <= 1"
+                      @click="empPage--"
+                    >
+                      上一页
+                    </button>
+                    <span>第 {{ empPage }} / {{ empPageCount }} 页</span>
+                    <button
+                      class="outline"
+                      :disabled="empPage >= empPageCount"
+                      @click="empPage++"
+                    >
+                      下一页
+                    </button>
+                  </span>
+                </div>
+              </section>
+            </div>
+
+            <div
+              v-if="panelOpen"
+              class="org-drawer-mask"
+              @click="closeUserPanel"
+            ></div>
+            <aside v-if="panelOpen" class="org-drawer">
+              <header class="org-drawer-head">
+                <div>
+                  <h3>{{ account.id ? "编辑员工" : "新增员工" }}</h3>
+                  <small>{{ account.id ? account.username : "创建一个新账号" }}</small>
+                </div>
+                <button class="org-drawer-close" @click="closeUserPanel">×</button>
+              </header>
+              <form class="org-drawer-body" @submit.prevent="saveUser">
+                <section class="drawer-section">
+                  <h4>基本信息</h4>
+                  <label
+                    >显示姓名<input
+                      v-model="account.name"
+                      placeholder="昵称或工号" /></label
+                  ><label
+                    >登录账号<input v-model="account.username" required /></label
+                  >
+                  <div class="drawer-inline">
+                    <span>账号状态</span>
+                    <label class="inline-check"
+                      ><input
+                        type="radio"
+                        :value="true"
+                        v-model="account.active"
+                      />启用</label
+                    >
+                    <label class="inline-check"
+                      ><input
+                        type="radio"
+                        :value="false"
+                        v-model="account.active"
+                      />停用</label
+                    >
+                  </div>
+                </section>
+
+                <section class="drawer-section">
+                  <h4>部门与权限</h4>
+                  <div class="drawer-field">
+                    <span>所属部门</span>
+                    <div class="dept-chips">
+                      <span
+                        v-for="id in account.dept_ids"
+                        :key="id"
+                        class="dept-chip"
+                        >{{ deptName(id)
+                        }}<button
+                          type="button"
+                          @click="removeAccountDept(id)"
+                        >
+                          ×
+                        </button></span
+                      >
+                      <select
+                        class="dept-add"
+                        :disabled="account.scope_all"
+                        @change="
+                          addAccountDept($event.target.value);
+                          $event.target.value = '';
+                        "
+                      >
+                        <option value="">＋ 选择部门</option>
+                        <option
+                          v-for="d in accountDeptOptions"
+                          :key="d.id"
+                          :value="d.id"
+                        >
+                          {{ d.name }}
+                        </option>
+                      </select>
+                    </div>
+                  </div>
+                  <label
+                    >角色<select v-model="account.role">
+                      <option
+                        v-for="(label, key) in assignableRoles"
+                        :key="key"
+                        :value="key"
+                      >
+                        {{ label }}
+                      </option>
+                    </select></label
+                  >
+                  <label v-if="admin" class="inline-check scope-check">
+                    <input type="checkbox" v-model="account.scope_all" />
+                    全部部门（含以后新增）
+                  </label>
+                  <p v-if="admin" class="drawer-hint">
+                    这是数据范围，可查看和管理全部部门的员工与资料，不等同于系统管理员。
+                  </p>
+                  <p class="drawer-hint">
+                    {{
+                      account.role === "manager"
+                        ? "可管理所选部门内的员工与资料，不能授予超出范围的权限。"
+                        : "可访问所选部门的问答与资料。"
+                    }}
+                  </p>
+                </section>
+
+                <section class="drawer-section">
+                  <h4>账号安全</h4>
+                  <label
+                    >{{
+                      account.id ? "重置密码（留空不改）" : "初始密码"
+                    }}<input
+                      v-model="account.password"
+                      type="password"
+                      autocomplete="new-password"
+                      :required="!account.id"
+                      minlength="10"
+                      maxlength="128" /></label
+                  >
+                </section>
+              </form>
+              <footer class="org-drawer-foot">
+                <button type="button" class="outline" @click="closeUserPanel">
+                  取消</button
+                ><button
+                  type="button"
+                  class="primary"
+                  :disabled="busy"
+                  @click="saveUser"
+                >
+                  保存
+                </button>
+              </footer>
+            </aside>
+
+            <div
+              v-if="deptDialog"
+              class="org-modal-mask"
+              @click.self="deptDialog = false"
+            >
+              <div class="org-modal">
+                <h3>{{ editingDept ? "重命名部门" : "新增部门" }}</h3>
+                <input
+                  v-model="deptForm.name"
+                  placeholder="部门名称"
+                  @keyup.enter="saveDept"
+                />
+                <div class="org-modal-foot">
+                  <button class="outline" @click="deptDialog = false">
+                    取消</button
+                  ><button class="primary" :disabled="busy" @click="saveDept">
+                    保存
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
         </template>
         <template v-if="page === 'settings' && admin"
           ><p class="subtle intro">
@@ -2340,8 +3729,84 @@ onUnmounted(() => {
           </section></template
         >
       </div>
-    </main>
+</main>
+</div>
+
+<!-- 语音通话浮层 -->
+<div v-if="voiceMode" class="voice-overlay">
+  <div class="voice-card">
+    <template v-if="voiceSetupOpen">
+      <div class="voice-orb is-idle"><Mic :size="30" /></div>
+      <h2 class="voice-title">语音通话需要准备一下</h2>
+      <ul class="voice-steps">
+        <li v-for="(step, i) in voiceSetupSteps" :key="i">{{ step }}</li>
+      </ul>
+      <div class="voice-actions">
+        <button
+          v-if="voiceNative()"
+          type="button"
+          class="primary"
+          @click="nativeRequestMic"
+        >
+          授权麦克风
+        </button>
+        <button
+          v-if="voiceNative()"
+          type="button"
+          class="outline"
+          @click="nativeOpenSettings"
+        >
+          打开应用设置
+        </button>
+        <button type="button" class="outline" @click="endCall">关闭</button>
+      </div>
+      <p class="voice-tip">授权完成后重新点「语音通话」即可</p>
+    </template>
+
+    <template v-else>
+      <div class="voice-orb" :class="'is-' + voiceState"><Mic :size="30" /></div>
+      <h2 class="voice-title">{{ voiceStateText }}</h2>
+      <p class="voice-sub">
+        <template v-if="voiceState === 'listening'">说完停顿一下，我会自动提交</template>
+        <template v-else-if="voiceState === 'thinking'">正在生成回答，听到第一句就会开念</template>
+        <template v-else-if="voiceState === 'speaking'">正在朗读，可随时停止</template>
+        <template v-else>点击「再说一次」继续</template>
+      </p>
+      <div v-if="voiceState === 'listening'" class="voice-level">
+        <i :style="{ width: Math.round(voiceLevel * 100) + '%' }"></i>
+      </div>
+      <div v-if="voiceText" class="voice-transcript">
+        <span class="voice-role">你说</span>{{ voiceText }}
+      </div>
+      <div v-if="voiceAnswerText" class="voice-transcript answer">
+        <span class="voice-role">回答</span>{{ voiceAnswerText }}
+      </div>
+      <p v-if="voiceError" class="voice-error">{{ voiceError }}</p>
+      <div class="voice-actions">
+        <button
+          type="button"
+          class="outline"
+          :disabled="voiceState === 'listening' || voiceState === 'thinking'"
+          @click="resumeListening"
+        >
+          <Mic :size="16" />再说一次
+        </button>
+        <button
+          v-if="voiceState === 'speaking'"
+          type="button"
+          class="outline"
+          @click="stopSpeaking"
+        >
+          <Volume2 :size="16" />停止播报
+        </button>
+        <button type="button" class="voice-hangup" @click="endCall">
+          <PhoneOff :size="16" />挂断
+        </button>
+      </div>
+      <p class="voice-tip">说完停顿一下自动提交；回答边生成边朗读</p>
+    </template>
   </div>
+</div>
 </template>
 
 <style scoped>
@@ -2464,7 +3929,7 @@ onUnmounted(() => {
   color: #7c8b81;
 }
 .wb-content {
-  padding: 30px 38px;
+  padding: 20px 38px 30px;
   max-width: 1600px;
   margin: auto;
 }
@@ -2473,7 +3938,7 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-  margin-bottom: 20px;
+  margin-bottom: 14px;
 }
 .heading .eyebrow {
   margin-bottom: 8px;
@@ -2659,6 +4124,9 @@ select {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
+}
+.wb-answers.single {
+  grid-template-columns: 1fr;
 }
 .candidate {
   padding: 20px;
@@ -3016,12 +4484,41 @@ a.text-button {
   .heading h1 {
     font-size: 24px;
   }
+  /* 移动端：追问区三列不换行会溢出，导致「发送问题」被挤出屏幕 */
   .form-bottom {
-    align-items: flex-end;
+    flex-wrap: wrap;
+    align-items: stretch;
     gap: 10px;
   }
+  .form-bottom .image-pick {
+    width: 100%;
+    max-width: 100%;
+  }
+  .form-bottom .image-pick .inline-check {
+    white-space: normal;
+    width: 100%;
+    max-width: 100%;
+    justify-content: flex-start;
+    text-align: left;
+    line-height: 1.7;
+    font-size: 13px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    overflow-wrap: anywhere;
+  }
+  .form-bottom small {
+    width: 100%;
+    max-width: 100%;
+    flex: 1 1 100%;
+  }
   .form-bottom .primary {
+    width: 100%;
     white-space: nowrap;
+  }
+  .composer-v3,
+  .composer-v3 .form-bottom {
+    max-width: 100%;
+    overflow-x: clip;
   }
   .list-row {
     gap: 10px;
@@ -3035,5 +4532,559 @@ a.text-button {
   .metric {
     padding: 17px;
   }
+  .voice-entry {
+    width: 100%;
+  }
+}
+
+.composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.form-bottom small {
+  flex: 1;
+  min-width: 0;
+}
+.deep-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 10px 0 12px;
+  border-radius: 999px;
+  border: 1px solid #dfe7db;
+  background: #fff;
+  color: #5f7468;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s;
+}
+.deep-toggle:hover {
+  border-color: #b9d4c0;
+  color: #216b50;
+  background: #f7fbf5;
+}
+.deep-toggle.active {
+  background: #216b50;
+  border-color: #216b50;
+  color: #fff;
+  box-shadow: 0 2px 10px rgba(33, 107, 80, 0.22);
+}
+.deep-state {
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: #eef3ee;
+  color: #7b8f82;
+  font-weight: 600;
+}
+.deep-toggle.active .deep-state {
+  background: rgba(255, 255, 255, 0.18);
+  color: #d9f3e3;
+}
+
+/* ── 语音通话 ─────────────────────────── */
+.voice-entry {
+  border: 1px solid #cfe3d6;
+  background: #eef7f1;
+  color: #1f6b4c;
+  border-radius: 8px;
+  min-height: 40px;
+  padding: 10px 14px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.voice-entry:hover:not(:disabled) {
+  background: #e2f1e8;
+}
+.voice-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(12, 34, 27, 0.92);
+  backdrop-filter: blur(6px);
+}
+.voice-card {
+  width: 360px;
+  max-width: 100%;
+  background: #fff;
+  border-radius: 22px;
+  padding: 30px 24px 22px;
+  text-align: center;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+}
+.voice-orb {
+  width: 92px;
+  height: 92px;
+  margin: 0 auto 18px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: #e6f2ec;
+  color: #1f6b4c;
+  position: relative;
+}
+.voice-orb::after {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: 50%;
+  border: 2px solid rgba(33, 107, 80, 0.25);
+  opacity: 0;
+}
+.voice-orb.is-listening {
+  background: #d8efe3;
+}
+.voice-orb.is-listening::after {
+  opacity: 1;
+  animation: voicePulse 1.6s ease-out infinite;
+}
+.voice-orb.is-thinking {
+  background: #f4f1e3;
+  color: #8a7a35;
+}
+.voice-orb.is-thinking::after {
+  opacity: 1;
+  border-color: rgba(138, 122, 53, 0.3);
+  animation: voicePulse 1.2s ease-out infinite;
+}
+.voice-orb.is-speaking {
+  background: #e8f0e2;
+}
+.voice-orb.is-speaking::after {
+  opacity: 1;
+  border-color: rgba(80, 120, 60, 0.3);
+  animation: voicePulse 1.4s ease-out infinite;
+}
+@keyframes voicePulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.8;
+  }
+  100% {
+    transform: scale(1.35);
+    opacity: 0;
+  }
+}
+.voice-title {
+  font-size: 18px;
+  color: #21443a;
+}
+.voice-sub {
+  font-size: 12px;
+  color: #8d9c95;
+  margin-top: 8px;
+}
+.voice-level {
+  height: 6px;
+  width: 70%;
+  margin: 14px auto 0;
+  background: #eef3ee;
+  border-radius: 99px;
+  overflow: hidden;
+}
+.voice-level i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #8fd3a8, #216b50);
+  border-radius: 99px;
+  transition: width 80ms linear;
+}
+.voice-transcript {
+  margin-top: 16px;
+  padding: 12px 14px;
+  background: #f6f9f3;
+  border: 1px solid #e6ece0;
+  border-radius: 10px;
+  font-size: 14px;
+  line-height: 1.7;
+  color: #3d5447;
+  text-align: left;
+  min-height: 44px;
+  max-height: 160px;
+  overflow: auto;
+}
+.voice-error {
+  font-size: 12px;
+  color: #b4473a;
+  margin-top: 12px;
+}
+.voice-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+.voice-actions .outline,
+.voice-hangup {
+  min-height: 40px;
+  padding: 10px 16px;
+  border-radius: 8px;
+}
+.voice-hangup {
+  background: #b4473a;
+  color: #fff;
+}
+.voice-hangup:hover {
+  background: #9c3b30;
+}
+.voice-tip {
+  font-size: 11px;
+  color: #a2ada7;
+  margin-top: 16px;
+}
+.voice-card {
+  max-height: 86vh;
+  overflow: auto;
+}
+.voice-steps {
+  text-align: left;
+  margin: 16px 0 4px;
+  padding-left: 18px;
+  color: #55705f;
+  font-size: 13px;
+  line-height: 1.9;
+}
+.voice-role {
+  display: inline-block;
+  font-size: 11px;
+  color: #7e9187;
+  background: #eef3ef;
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-right: 8px;
+  vertical-align: 1px;
+}
+.voice-transcript.answer {
+  background: #f2f7ee;
+  border-color: #e0ead7;
+  max-height: 220px;
+}
+.domain-note {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: #55705f;
+  background: #f2f7ee;
+  border: 1px solid #e0ead7;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.domain-note strong {
+  color: #2c6a4c;
+}
+.domain-note small {
+  color: #8d9c95;
+  font-size: 12px;
+}
+.domain-warn {
+  font-size: 13px;
+  color: #8a5a1f;
+  background: #fdf6e7;
+  border: 1px solid #f2e3c4;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.users-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.org-grid {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.org-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #f8faf6;
+  border: 1px solid #eef2ed;
+  border-radius: 10px;
+  padding: 12px;
+}
+.org-form strong {
+  font-size: 13px;
+  color: #31493d;
+}
+.org-list {
+  display: flex;
+  flex-direction: column;
+}
+.org-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 4px;
+  border-bottom: 1px solid #f1f4f0;
+}
+.org-row:last-child {
+  border-bottom: 0;
+}
+.org-row-main strong {
+  display: block;
+  font-size: 13px;
+  color: #31493d;
+}
+.org-row-main small {
+  font-size: 11px;
+  color: #8d9c95;
+}
+.org-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+@media (max-width: 760px) {
+  .org-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.users-thead,
+.users-trow {
+  display: grid;
+  grid-template-columns: minmax(130px, 1.2fr) minmax(100px, 0.9fr) minmax(200px, 1.8fr) 64px;
+  gap: 12px;
+  align-items: center;
+  text-align: left;
+  width: 100%;
+}
+.users-thead {
+  font-size: 12px;
+  color: #93a096;
+  padding: 8px 10px;
+  border-bottom: 1px solid #eef2ed;
+}
+.users-trow {
+  padding: 14px 10px;
+  border-bottom: 1px solid #f1f4f0;
+  border-radius: 8px;
+}
+.users-trow:hover {
+  background: #f7faf5;
+}
+.u-name strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+  color: #31493d;
+}
+.u-name small {
+  display: block;
+  font-size: 11px;
+  color: #93a096;
+  margin-top: 3px;
+}
+.u-dept {
+  font-size: 12px;
+  color: #5f7268;
+}
+.u-perm {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  min-width: 0;
+}
+.u-roles {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.u-roles .badge {
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 1px 8px;
+  border-radius: 999px;
+}
+.u-perm small {
+  font-size: 11px;
+  color: #87968d;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.u-status {
+  justify-self: start;
+  min-width: 52px;
+  text-align: center;
+}
+@media (max-width: 760px) {
+  .users-thead {
+    display: none;
+  }
+  .users-trow {
+    grid-template-columns: 1fr auto;
+    grid-template-areas: "name status" "dept dept" "perm perm";
+    gap: 6px 10px;
+  }
+  .u-name {
+    grid-area: name;
+  }
+  .u-status {
+    grid-area: status;
+  }
+  .u-dept {
+    grid-area: dept;
+  }
+  .u-perm {
+    grid-area: perm;
+  }
+}
+
+.team-page { display: flex; flex-direction: column; gap: 14px; }
+.team-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.team-head h1 { font-size: 20px; margin: 0 0 4px; color: #2c4a3b; }
+.team-kpis { display: flex; gap: 10px; flex-wrap: wrap; }
+.team-kpis > div { background: #f5f9f3; border: 1px solid #e6ede1; border-radius: 10px; padding: 8px 14px; text-align: center; min-width: 66px; }
+.team-kpis strong { display: block; font-size: 18px; color: #216b50; }
+.team-kpis span { font-size: 11px; color: #8d9c95; }
+.team-filters { display: grid; grid-template-columns: minmax(180px, 1.4fr) repeat(3, minmax(120px, 1fr)) auto; gap: 8px; }
+.sel { position: relative; }
+.sel-btn { width: 100%; height: 36px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border: 1px solid #dfe7db; border-radius: 8px; background: #fff; font-size: 13px; color: #33453b; cursor: pointer; }
+.sel-btn::after { content: ""; width: 7px; height: 7px; border-right: 1.5px solid #8d9c95; border-bottom: 1.5px solid #8d9c95; transform: rotate(45deg) translateY(-1px); margin-left: 8px; flex-shrink: 0; }
+.sel-menu { position: absolute; top: 40px; left: 0; right: 0; background: #fff; border: 1px solid #e5ece1; border-radius: 10px; box-shadow: 0 8px 24px rgba(20, 60, 40, 0.12); padding: 6px; z-index: 40; max-height: 260px; overflow: auto; }
+.sel-menu button { display: block; width: 100%; text-align: left; padding: 8px 10px; border-radius: 6px; font-size: 13px; color: #33453b; background: none; border: 0; cursor: pointer; }
+.sel-menu button:hover, .sel-menu button.active { background: #eef6ec; color: #216b50; }
+.sel-mask { position: fixed; inset: 0; z-index: 30; }
+.team-filters input, .team-filters select { height: 36px; padding: 0 10px; }
+.team-layout { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; gap: 14px; align-items: start; }
+.team-list { max-height: calc(100vh - 300px); overflow: auto; padding: 8px; }
+.team-row { display: flex; gap: 10px; width: 100%; text-align: left; padding: 10px; border-radius: 10px; border: 1px solid transparent; background: transparent; }
+.team-row:hover { background: #f7faf5; }
+.team-row.active { background: #eef6ec; border-color: #d9e8d3; }
+.team-avatar { width: 34px; height: 34px; border-radius: 50%; background: #dcebdc; color: #2c6a4c; display: inline-flex; align-items: center; justify-content: center; font-weight: 600; flex-shrink: 0; }
+.team-row-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.team-row-top { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: #31493d; }
+.team-row-top small { color: #9aa8a0; font-size: 11px; font-weight: 400; }
+.team-row-title { font-size: 12px; color: #6b7d72; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.team-row-meta { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 2px; }
+.team-row-meta .chip { font-size: 10px; padding: 1px 7px; }
+.team-empty { color: #94a3a0; font-size: 13px; padding: 24px 12px; text-align: center; }
+.team-pager { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 6px 4px; font-size: 12px; color: #7c8b82; }
+.team-detail { min-height: 320px; padding: 16px; }
+.team-detail-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; border-bottom: 1px solid #eef2ed; padding-bottom: 10px; margin-bottom: 12px; }
+.team-detail-head .chip { flex-shrink: 0; white-space: nowrap; align-self: flex-start; }
+.team-detail-head h2 { font-size: 16px; margin: 0 0 4px; color: #2c4a3b; }
+.team-thread { display: flex; flex-direction: column; gap: 12px; max-height: calc(100vh - 380px); overflow: auto; padding-right: 4px; }
+.team-msg { display: flex; flex-direction: column; gap: 8px; }
+.team-bubble { border-radius: 12px; padding: 10px 12px; font-size: 14px; line-height: 1.7; }
+.team-bubble.q { background: #f4f7f2; color: #33453b; }
+.team-bubble.a { background: #fff; border: 1px solid #e9efe6; color: #33453b; }
+.team-who { font-size: 11px; color: #8d9c95; margin-bottom: 4px; display: flex; gap: 6px; align-items: center; }
+.team-answer { white-space: pre-wrap; }
+@media (max-width: 900px) {
+  .team-filters { grid-template-columns: 1fr 1fr; }
+  .team-layout { grid-template-columns: 1fr; }
+  .team-list { max-height: 46vh; }
+  .team-thread { max-height: none; }
+}
+
+/* ── 组织与权限 ───────────────────────── */
+.org-page { display: flex; flex-direction: column; gap: 14px; }
+.org-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.org-head .subtle { margin: 0; }
+.org-layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 14px; align-items: start; }
+.org-side { padding: 10px; position: sticky; top: 12px; }
+.org-side-item { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 8px 10px; border-radius: 8px; font-size: 13px; color: #40564a; background: none; border: 0; cursor: pointer; text-align: left; }
+.org-side-item:hover { background: #f5f9f3; }
+.org-side-item.active { background: #eaf4e7; color: #1f6b4c; font-weight: 600; }
+.org-side-item.muted { color: #9aa8a0; }
+.org-side-count { font-size: 11px; color: #8d9c95; background: #f1f4ef; border-radius: 9px; padding: 1px 7px; }
+.org-side-item.active .org-side-count { background: #d9ebd3; color: #216b50; }
+.org-side-sep { height: 1px; background: #eef2ed; margin: 8px 4px; }
+.org-side-label { font-size: 11px; color: #9aa8a0; padding: 8px 10px 4px; }
+.org-side-row { display: flex; align-items: center; gap: 2px; }
+.org-side-row .org-side-item { flex: 1; min-width: 0; }
+.org-more { position: relative; }
+.org-more-btn { width: 24px; height: 24px; border: 0; background: none; color: #9aa8a0; cursor: pointer; border-radius: 6px; font-size: 14px; line-height: 1; }
+.org-more-btn:hover { background: #eef3ec; color: #40564a; }
+.org-menu { position: absolute; right: 0; top: 26px; z-index: 20; background: #fff; border: 1px solid #e6ede1; border-radius: 8px; box-shadow: 0 8px 24px rgba(20, 60, 40, 0.12); padding: 4px; min-width: 112px; }
+.org-menu button { display: block; width: 100%; text-align: left; padding: 7px 9px; font-size: 12px; border: 0; background: none; color: #40564a; border-radius: 5px; cursor: pointer; }
+.org-menu button:hover { background: #f5f9f3; }
+.org-menu button.danger { color: #b4453a; }
+.org-menu button:disabled { color: #c3ccc6; cursor: not-allowed; }
+.org-add-dept { margin-top: 8px; width: 100%; border: 1px dashed #d9e3d5; background: #fbfdf9; color: #216b50; border-radius: 8px; padding: 8px; font-size: 12px; cursor: pointer; }
+.org-main { padding: 12px; min-width: 0; }
+.org-toolbar { display: grid; grid-template-columns: minmax(180px, 1fr) 150px 130px auto; gap: 8px; margin-bottom: 10px; }
+.org-toolbar input, .org-toolbar select { height: 34px; padding: 0 10px; line-height: normal; }
+.org-table { max-height: calc(100vh - 285px); overflow: auto; border: 1px solid #f0f3ef; border-radius: 10px; }
+.org-thead, .org-trow { display: grid; grid-template-columns: minmax(150px, 1.3fr) minmax(130px, 1.1fr) minmax(110px, 0.9fr) 72px 64px; gap: 10px; align-items: center; padding: 0 12px; }
+.org-thead { position: sticky; top: 0; z-index: 2; background: #f9fbf7; height: 36px; font-size: 11px; color: #93a096; border-bottom: 1px solid #eef2ed; }
+.org-trow { height: 58px; border-bottom: 1px solid #f3f6f2; font-size: 13px; }
+.org-trow:last-child { border-bottom: 0; }
+.org-trow:hover { background: #fbfdf9; }
+.org-cell-name { min-width: 0; }
+.org-cell-name strong { display: block; font-size: 13px; color: #31493d; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.org-cell-name small { display: block; font-size: 11px; color: #9aa8a0; }
+.org-cell-depts { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.org-dept-chip { font-size: 11px; background: #f1f5ef; color: #5f7268; border-radius: 5px; padding: 1px 6px; }
+.org-dept-more { font-size: 10px; color: #7c8b82; background: #eef3ec; border-radius: 5px; padding: 1px 5px; }
+.org-dept-none { font-size: 11px; color: #b98a3a; background: #fdf6e7; border-radius: 5px; padding: 1px 6px; }
+.org-cell-role { display: flex; gap: 4px; flex-wrap: wrap; }
+.org-cell-role .badge { font-size: 10px; padding: 1px 7px; border-radius: 999px; }
+.org-cell-status { font-size: 12px; color: #2f7a52; display: flex; align-items: center; gap: 5px; }
+.org-cell-status i { width: 6px; height: 6px; border-radius: 50%; background: #3fa46a; display: inline-block; }
+.org-cell-status.off { color: #9aa8a0; }
+.org-cell-status.off i { background: #c3ccc6; }
+.org-cell-actions { text-align: right; }
+.org-pager { display: flex; justify-content: space-between; align-items: center; padding: 10px 4px 2px; font-size: 12px; color: #7c8b82; }
+.org-pager-pages { display: flex; align-items: center; gap: 8px; }
+.org-pager-pages .outline { height: 28px; padding: 0 10px; font-size: 12px; }
+
+.org-drawer-mask { position: fixed; inset: 0; background: rgba(20, 40, 30, 0.28); z-index: 60; }
+.org-drawer { position: fixed; top: 0; right: 0; height: 100vh; width: min(520px, 100vw); background: #fff; z-index: 61; display: flex; flex-direction: column; box-shadow: -8px 0 30px rgba(20, 60, 40, 0.18); }
+.org-drawer-head { display: flex; justify-content: space-between; align-items: flex-start; padding: 18px 20px 12px; border-bottom: 1px solid #eef2ed; }
+.org-drawer-head h3 { margin: 0 0 3px; font-size: 16px; color: #2c4a3b; }
+.org-drawer-head small { color: #9aa8a0; font-size: 11px; }
+.org-drawer-close { border: 0; background: none; font-size: 22px; line-height: 1; color: #8d9c95; cursor: pointer; }
+.org-drawer-body { flex: 1; overflow: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 18px; }
+.drawer-section { display: flex; flex-direction: column; gap: 10px; }
+.drawer-section h4 { margin: 0; font-size: 12px; color: #8d9c95; font-weight: 600; }
+.drawer-section label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: #5f7268; }
+.drawer-section input, .drawer-section select { height: 34px; padding: 0 10px; line-height: normal; }
+.drawer-inline { display: flex; align-items: center; gap: 14px; font-size: 12px; color: #5f7268; }
+.drawer-inline .inline-check { flex-direction: row; gap: 5px; }
+.drawer-field { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #5f7268; }
+.dept-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-height: 34px; }
+.dept-chip { display: inline-flex; align-items: center; gap: 4px; background: #eef6ec; color: #216b50; border-radius: 999px; padding: 3px 8px; font-size: 12px; }
+.dept-chip button { border: 0; background: none; color: #5f8a72; cursor: pointer; font-size: 13px; line-height: 1; padding: 0; }
+.dept-add { height: 32px; border: 1px dashed #cfe0c9; border-radius: 999px; background: #fbfdf9; color: #216b50; font-size: 12px; padding: 0 10px; }
+.scope-check { margin-top: 2px; }
+.drawer-hint { margin: 0; font-size: 11px; line-height: 1.7; color: #8d9c95; }
+.org-drawer-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 12px 20px; border-top: 1px solid #eef2ed; }
+
+.org-modal-mask { position: fixed; inset: 0; background: rgba(20, 40, 30, 0.28); z-index: 70; display: flex; align-items: center; justify-content: center; padding: 20px; }
+.org-modal { background: #fff; border-radius: 12px; padding: 18px; width: min(360px, 100%); display: flex; flex-direction: column; gap: 12px; }
+.org-modal h3 { margin: 0; font-size: 15px; color: #2c4a3b; }
+.org-modal input { height: 36px; padding: 0 10px; }
+.org-modal-foot { display: flex; justify-content: flex-end; gap: 8px; }
+
+@media (max-width: 900px) {
+  .org-layout { grid-template-columns: 1fr; }
+  .org-side { position: static; display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
+  .org-side-sep, .org-side-label, .org-side-row { grid-column: 1 / -1; }
+  .org-toolbar { grid-template-columns: 1fr 1fr; }
+  .org-thead { display: none; }
+  .org-trow { grid-template-columns: 1fr auto; height: auto; padding: 10px 12px; gap: 4px 10px; }
+  .org-cell-actions { text-align: left; }
 }
 </style>

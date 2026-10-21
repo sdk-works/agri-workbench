@@ -144,7 +144,13 @@ export function createGateway(
     return msgs;
   }
   async function call(role, messages, json = false, images = undefined, onToken = undefined, opts = {}) {
-    const c = { ...config[role] };
+    const c = {
+      ...config[role],
+      ...(opts.model ? { model: String(opts.model) } : {}),
+    };
+    // 开关必须真正控制调用：禁用后不发起任何出站请求
+    if (c?.enabled === false)
+      throw Object.assign(Error(`${role} 模型已停用`), { code: "disabled" });
     if (!c?.base_url || !c.model || (c.adapter === "compatible" && !c.api_key))
       throw Object.assign(Error(`${role} 模型未配置`), {
         code: "configuration",
@@ -166,6 +172,7 @@ export function createGateway(
       execSignal = opts.signal
         ? AbortSignal.any([opts.signal, AbortSignal.timeout(timeoutMs)])
         : AbortSignal.timeout(timeoutMs);
+      console.log(`[gateway] role=${role} model=${c.model} target=${c.base_url}`);
       return await run();
     } catch (e) {
       if (opts.signal?.aborted)
@@ -181,6 +188,7 @@ export function createGateway(
       release?.();
     }
     async function run() {
+      const effort = opts.reasoning_effort || c.reasoning_effort;
       const payload = local
       ? {
           model: c.model,
@@ -188,6 +196,7 @@ export function createGateway(
           stream,
           options: { temperature: json ? 0.1 : 0.5 },
           ...(json ? { format: "json" } : {}),
+          ...(opts.think !== undefined ? { think: opts.think } : {}),
         }
       : {
           // compatible(OpenAI/兼容) 接口：不传 temperature/top_p。
@@ -195,6 +204,7 @@ export function createGateway(
           model: c.model,
           messages: withImages(messages, images, { local: false }),
           stream,
+          ...(effort ? { reasoning_effort: effort } : {}),
         };
     let res;
     try {
@@ -431,5 +441,12 @@ export function createGateway(
     call,
     judge,
     fallbackEnabled: () => config.fallback.enabled,
+    modelFor: (role) => config[role]?.model || "",
+    roleEnabled: (role) =>
+      Boolean(config[role]) &&
+      config[role].enabled !== false &&
+      Boolean(config[role].base_url) &&
+      Boolean(config[role].model) &&
+      (config[role].adapter === "ollama" || Boolean(config[role].api_key)),
   };
 }
