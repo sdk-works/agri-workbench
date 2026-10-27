@@ -23,6 +23,9 @@ import {
   Camera,
   Radio,
   X,
+  ChevronLeft,
+  Square,
+  FileText,
 } from "lucide-vue-next";
 import { call, download } from "./workspace-api";
 // 附图状态机：六态与「什么才算上传成功」都在这份纯逻辑里，便于单测
@@ -158,6 +161,112 @@ const voiceStateText = computed(() => {
       failed: "没成功，可以重试",
     }[voiceState.value] || ""
   );
+});
+
+// ── 语音界面视图层（对齐 10-26 那版 vc 布局）─────────────────
+// 通话计时：进语音开始走，挂断停
+const voiceClockText = ref("00:00");
+let voiceClockT0 = 0;
+let voiceClockTimer = 0;
+function startVoiceClock() {
+  stopVoiceClock();
+  voiceClockT0 = Date.now();
+  voiceClockText.value = "00:00";
+  voiceClockTimer = window.setInterval(() => {
+    const s = Math.max(0, Math.floor((Date.now() - voiceClockT0) / 1000));
+    voiceClockText.value =
+      String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+  }, 1000);
+}
+function stopVoiceClock() {
+  if (voiceClockTimer) {
+    window.clearInterval(voiceClockTimer);
+    voiceClockTimer = 0;
+  }
+}
+// 小球配色只区分 idle / thinking / speaking；收听时用默认绿色（跟着音量放大）
+const voiceOrbState = computed(() => {
+  const s = voiceState.value;
+  if (s === "listening") return "live";
+  if (s === "recognizing" || s === "thinking") return "thinking";
+  if (s === "speaking") return "speaking";
+  return "idle";
+});
+const voiceHintText = computed(() => {
+  if (voiceState.value === "listening")
+    return voiceCancelArmed.value
+      ? "松开取消，不发送"
+      : voiceHandsFree.value
+        ? "我在听，说完停顿一下就会发送"
+        : "松开发送 · 上滑取消";
+  if (voiceState.value === "recognizing") return "正在把你说的转成文字…";
+  if (voiceState.value === "thinking")
+    return voicePhase.value === "queued" ? "排队中，马上开始…" : "正在查资料，听到第一句就开念";
+  if (voiceState.value === "speaking") return "正在朗读，可以随时打断";
+  if (voiceState.value === "failed") return "这一句没成功，点重试就好";
+  if (voicePaused.value) return "已暂停收听，点麦克风继续";
+  if (voiceHandsFree.value)
+    return voiceText.value ? "回答完了，直接说下一句" : "可以开口问，说一句就开始";
+  return "直接说话，或点下方麦克风";
+});
+// 大圆按钮上的字：随模式与状态变，不能一直写"按住说话"
+const holdLabel = computed(() => {
+  if (voiceRequesting.value) return "请求权限";
+  if (voiceHandsFree.value)
+    return voiceState.value === "listening" ? "暂停收听" : voicePaused.value ? "继续收听" : "开始说";
+  if (voiceHolding.value)
+    return voiceCancelArmed.value ? "松开取消" : (voiceHoldMs.value / 1000).toFixed(1) + "s";
+  if (voiceState.value === "thinking" || voiceState.value === "speaking") return "按住打断";
+  return "按住说话";
+});
+// 附图条配色：六态映射到旧版三套（ok / bad / busy）
+const attachToneClass = computed(() => {
+  const tone = attachInfo.value.tone;
+  if (tone === "ok") return "ok";
+  if (tone === "err") return "bad";
+  if (tone === "busy" || tone === "warn") return "busy";
+  return "";
+});
+const attachSubText = computed(() => {
+  switch (attach.value.status) {
+    case "picked":
+      return "还没上传，说完问题会自动带上";
+    case "uploading":
+      return "正在传到服务器…";
+    case "received":
+      // 主文案已经说清"服务器已收到"，这里不再重复
+      return "";
+    case "analyzing":
+      return "正在看这张图…";
+    case "done":
+      return "分析完成";
+    case "failed":
+      return "没成功，可以重试";
+    default:
+      return "";
+  }
+});
+function retryAttach() {
+  if (attachRetryUpload.value) retryUploadAttach();
+  else if (attachRetryAnalyze.value) analyzeAgain();
+}
+// 音色与语速：跟旧版一致，存在本地，下次进来自动恢复
+const voiceName = ref("");
+const voiceRate = ref(1);
+try {
+  voiceName.value = localStorage.getItem("agri.voice.name") || "";
+  const r = Number(localStorage.getItem("agri.voice.rate"));
+  voiceRate.value = r === 0.85 || r === 1 || r === 1.15 || r === 1.3 ? r : 1;
+} catch (e) {}
+watch(voiceName, (v) => {
+  try {
+    localStorage.setItem("agri.voice.name", v || "");
+  } catch (e) {}
+});
+watch(voiceRate, (v) => {
+  try {
+    localStorage.setItem("agri.voice.rate", String(v || 1));
+  } catch (e) {}
 });
 const imageStatus = {
   queued: "排队中",
@@ -1396,6 +1505,7 @@ function showVoiceSetup(steps) {
 
 function startCall() {
   voiceMode.value = true;
+  startVoiceClock();
   voiceError.value = "";
   voiceText.value = "";
   voiceAnswerText.value = "";
@@ -2713,7 +2823,7 @@ function playServerTts(text) {
     fetch("/api/v2/voice/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Workbench": "1" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, voice: voiceName.value || "" }),
       signal: ac.signal,
     })
       .then((r) => {
@@ -2893,6 +3003,7 @@ function endCall() {
   voiceHolding.value = false;
   voiceHoldMs.value = 0;
   voiceMode.value = false;
+  stopVoiceClock();
   voiceState.value = "idle";
   voiceSetupOpen.value = false;
   voiceQueue = [];
@@ -4869,252 +4980,245 @@ onUnmounted(() => {
 </main>
 </div>
 
-<!-- 语音通话浮层 -->
-<div v-if="voiceMode" class="voice-overlay">
-  <div class="voice-card">
-    <template v-if="voiceSetupOpen">
-      <div class="voice-orb is-idle"><Mic :size="30" /></div>
-      <h2 class="voice-title">语音通话需要准备一下</h2>
-      <ul class="voice-steps">
-        <li v-for="(step, i) in voiceSetupSteps" :key="i">{{ step }}</li>
-      </ul>
-      <div class="voice-actions">
-        <button
-          v-if="voiceNative()"
-          type="button"
-          class="primary"
-          @click="nativeRequestMic"
-        >
-          授权麦克风
-        </button>
-        <button
-          v-if="voiceNative()"
-          type="button"
-          class="outline"
-          @click="nativeOpenSettings"
-        >
-          打开应用设置
-        </button>
-        <button type="button" class="outline" @click="endCall">关闭</button>
-      </div>
-      <p class="voice-tip">授权完成后重新点「语音通话」即可</p>
-    </template>
-
-    <template v-else>
-      <div class="voice-orb" :class="'is-' + voiceState"><Mic :size="30" /></div>
-      <h2 class="voice-title">{{ voiceStateText }}</h2>
-      <p class="voice-sub">
-        <template v-if="voiceState === 'listening'">
-          {{ voiceCancelArmed ? '松开取消，不发送' : (voiceHandsFree ? '我在听，说完停顿一下就会发送' : '松开发送 · 上滑取消') }}
-        </template>
-        <template v-else-if="voiceState === 'recognizing'">正在把你说的转成文字…</template>
-        <template v-else-if="voiceState === 'thinking'">
-          {{ voicePhase === 'queued' ? '排队中，马上开始…' : '正在查资料、生成回答，听到第一句就会开念' }}
-        </template>
-        <template v-else-if="voiceState === 'speaking'">正在朗读，可随时停止</template>
-        <template v-else-if="voiceHandsFree">
-          {{ voicePaused ? '已暂停收听，点麦克风继续' : (voiceText ? '回答完了，或点下方麦克风可以接着问' : '可以开口问，说一句就开始') }}
-        </template>
-        <template v-else>按住下方按钮说话，松开发送</template>
-      </p>
-      <div v-if="voiceState === 'listening'" class="voice-level">
-        <i :style="{ width: Math.round(voiceLevel * 100) + '%' }"></i>
-      </div>
-      <div class="voice-tools">
-        <button
-          type="button"
-          class="voice-tool"
-          :disabled="voiceState === 'recognizing'"
-          @click="openCamSheet"
-          title="拍照提问"
-        >
-          <Camera :size="16" />拍照
-        </button>
-        <button
-          type="button"
-          class="voice-tool"
-          :class="{ on: voiceHandsFree }"
-          @click="toggleHandsFree"
-          :title="voiceHandsFree ? '已切换为按住说话' : '已切换为免按键'"
-        >
-          <Radio :size="16" />{{ voiceHandsFree ? '免按键' : '按住' }}
-        </button>
-        <button
-          v-if="attach.url"
-          type="button"
-          class="voice-tool"
-          @click="removeAttach"
-          title="删除这张图"
-        >
-          <X :size="16" />删除图片
-        </button>
-      </div>
-      <!-- 附图：六态显式区分。缩略图只代表「本地有这张图」，不代表服务器收到了 -->
-      <div v-if="attach.url" class="voice-attach" :class="'tone-' + attachInfo.tone">
-        <img :src="attach.url" alt="这一轮的照片" />
-        <div class="voice-attach-meta">
-          <span class="voice-attach-state">{{ attachInfo.text }}</span>
+    <!-- 语音通话浮层：整屏沉浸式（对齐 10-26 那版 vc 布局） -->
+    <div v-if="voiceMode" class="vc">
+      <!-- 准备/授权引导：保留原有卡片 -->
+      <div v-if="voiceSetupOpen" class="vc-setup">
+        <div class="voice-orb is-idle"><Mic :size="30" /></div>
+        <h2 class="voice-title">语音通话需要准备一下</h2>
+        <ul class="voice-steps">
+          <li v-for="(step, i) in voiceSetupSteps" :key="i">{{ step }}</li>
+        </ul>
+        <div class="voice-actions">
           <button
-            v-if="attachRetryUpload"
+            v-if="voiceNative()"
             type="button"
-            class="voice-attach-retry"
-            @click="retryUploadAttach"
+            class="primary"
+            @click="nativeRequestMic"
           >
-            重试上传
+            授权麦克风
           </button>
           <button
-            v-else-if="attachRetryAnalyze"
+            v-if="voiceNative()"
             type="button"
-            class="voice-attach-retry"
-            @click="analyzeAgain"
+            class="outline"
+            @click="nativeOpenSettings"
           >
-            重试分析
+            打开应用设置
+          </button>
+          <button type="button" class="outline" @click="endCall">关闭</button>
+        </div>
+        <p class="voice-tip">授权完成后重新点「语音通话」即可</p>
+      </div>
+
+      <template v-else>
+        <header class="vc-top">
+          <button type="button" class="vc-icon" title="返回" @click="endCall">
+            <ChevronLeft :size="20" />
+          </button>
+          <div class="vc-clock">
+            <b>语音通话</b>
+            <span>{{ voiceClockText }}</span>
+          </div>
+          <button
+            type="button"
+            class="vc-mode"
+            :title="voiceHandsFree ? '已切换为按住说话' : '已切换为免按键'"
+            @click="toggleHandsFree"
+          >
+            <Mic :size="14" />{{ voiceHandsFree ? '免按键' : '按住说' }}
+          </button>
+        </header>
+
+        <div class="vc-stage">
+          <div
+            class="vc-orb"
+            :class="'is-' + voiceOrbState"
+            :style="{ '--lv': voiceLevel }"
+          >
+            <i class="vc-halo h1"></i>
+            <i class="vc-halo h2"></i>
+            <i class="vc-halo h3"></i>
+            <b class="vc-core"><Mic :size="30" /></b>
+          </div>
+          <h2 class="vc-state">{{ voiceStateText }}</h2>
+          <p class="vc-hint">{{ voiceHintText }}</p>
+
+          <div class="vc-caption">
+            <p v-if="voiceText" class="vc-said">你说：{{ voiceText }}</p>
+            <p v-if="voiceAnswerText" class="vc-say">{{ voiceAnswerText }}</p>
+
+            <!-- 本轮附图：六态真实反馈，缩略图不等于已上传 -->
+            <div v-if="attach.url" class="vc-shot" :class="attachToneClass">
+              <img :src="attach.url" alt="本轮附图" />
+              <div class="vc-shot-side">
+                <b class="vc-shot-label">{{ attachInfo.text }}</b>
+                <span v-if="attachSubText" class="vc-shot-sub">{{ attachSubText }}</span>
+                <p v-if="attach.error" class="vc-shot-err">{{ attach.error }}</p>
+                <div class="vc-shot-acts">
+                  <button
+                    v-if="attach.status === 'failed'"
+                    type="button"
+                    class="vc-shot-act"
+                    @click="retryAttach"
+                  >
+                    重试
+                  </button>
+                  <button
+                    type="button"
+                    class="vc-shot-x"
+                    title="删除这张图"
+                    @click="removeAttach"
+                  >
+                    <X :size="14" />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <p v-if="voiceError" class="vc-error">{{ voiceError }}</p>
+            <button
+              v-if="voiceError && voiceText && voiceState === 'idle'"
+              type="button"
+              class="vc-retry"
+              @click="retryAnswer"
+            >
+              重试回答
+            </button>
+          </div>
+        </div>
+
+        <footer class="vc-bottom">
+          <div class="vc-keys">
+            <button
+              type="button"
+              class="vc-key big"
+              :class="{ on: voiceHolding || (voiceHandsFree && voiceState === 'listening') }"
+              @pointerdown.prevent="holdVoiceStart"
+              @pointerup.prevent="holdVoiceEnd"
+              @pointercancel.prevent="holdVoiceCancel"
+              @pointermove="holdVoiceMove"
+              @contextmenu.prevent
+            >
+              <Mic :size="24" />
+              <small>{{ holdLabel }}</small>
+            </button>
+            <button
+              type="button"
+              class="vc-key"
+              :disabled="voiceState === 'recognizing'"
+              title="拍照或从相册选图"
+              @click="openCamSheet"
+            >
+              <Camera :size="20" />
+              <small>拍照</small>
+            </button>
+            <button
+              type="button"
+              class="vc-key"
+              :disabled="voiceState !== 'speaking'"
+              title="停止播报"
+              @click="stopSpeaking"
+            >
+              <Square :size="18" />
+              <small>停止</small>
+            </button>
+            <button
+              type="button"
+              class="vc-key"
+              title="回到文字输入"
+              @click="endCall"
+            >
+              <FileText :size="18" />
+              <small>文字</small>
+            </button>
+            <button type="button" class="vc-key danger" @click="endCall">
+              <PhoneOff :size="18" />
+              <small>挂断</small>
+            </button>
+          </div>
+          <div class="vc-more">
+            <label>
+              声音
+              <select v-model="voiceName">
+                <option value="">默认（晓晓）</option>
+                <option value="zh-CN-XiaoxiaoNeural">晓晓 · 女声</option>
+                <option value="zh-CN-YunxiNeural">云希 · 男声（轻快）</option>
+                <option value="zh-CN-YunjianNeural">云健 · 男声（沉稳）</option>
+                <option value="zh-CN-XiaoyiNeural">晓伊 · 女声（活泼）</option>
+                <option value="zh-CN-YunyangNeural">云扬 · 男声（播报）</option>
+              </select>
+            </label>
+            <label>
+              语速
+              <select v-model.number="voiceRate">
+                <option :value="0.85">慢 0.85×</option>
+                <option :value="1">正常 1.0×</option>
+                <option :value="1.15">快 1.15×</option>
+                <option :value="1.3">更快 1.3×</option>
+              </select>
+            </label>
+            <span class="vc-tip">单次最长 60 秒</span>
+          </div>
+        </footer>
+      </template>
+
+      <!-- 页面内相机：实时取景 + 快门 -->
+      <div v-if="voiceCamOpen" class="vc-cam">
+        <video ref="voiceCamVideo" playsinline muted autoplay></video>
+        <div class="vc-cam-top">
+          <button type="button" class="vc-icon" title="关闭相机" @click="closeCamera">
+            <X :size="20" />
+          </button>
+          <span>对准叶片，按中间白色快门</span>
+        </div>
+        <div class="vc-cam-bar">
+          <button
+            type="button"
+            class="vc-shutter"
+            :disabled="!voiceCamReady"
+            @click="shootPhoto"
+          >
+            <i></i>
           </button>
         </div>
+        <p v-if="voiceCamError" class="vc-cam-err">{{ voiceCamError }}</p>
       </div>
-      <button
-        type="button"
-        :style="{
-          margin: '10px auto 4px',
-          padding: '16px 28px',
-          minWidth: '220px',
-          borderRadius: '999px',
-          border: voiceCancelArmed ? '2px solid #d9534f' : '2px solid #153e34',
-          background: (voiceHolding || (voiceHandsFree && voiceState === 'listening')) ? (voiceCancelArmed ? '#fdecea' : '#e8f3ef') : '#fff',
-          color: voiceCancelArmed ? '#d9534f' : '#153e34',
-          fontWeight: 600,
-          fontSize: '16px',
-          touchAction: 'none',
-          userSelect: 'none',
-          webkitUserSelect: 'none'
-        }"
-        @pointerdown.prevent="holdVoiceStart"
-        @pointerup.prevent="holdVoiceEnd"
-        @pointercancel.prevent="holdVoiceCancel"
-        @pointermove="holdVoiceMove"
-        @contextmenu.prevent
+
+      <!-- 拍照/选图后的预览：先看清楚，再决定用这张、重拍还是取消 -->
+      <div v-if="camShot && !voiceCamOpen" class="vc-cam vc-preview">
+        <img :src="camShot.url" alt="待上传的照片预览" />
+        <div class="vc-preview-tip">看清楚了吗？确认后才会传到服务器</div>
+        <div class="vc-preview-bar">
+          <button type="button" class="vc-preview-btn" @click="cancelShot">取消</button>
+          <button type="button" class="vc-preview-btn primary" @click="confirmShot">
+            用这张
+          </button>
+          <button type="button" class="vc-preview-btn" @click="retakeShot">重拍</button>
+        </div>
+      </div>
+
+      <!-- 图片来源选择 -->
+      <div
+        v-if="voiceSheetOpen"
+        class="vc-sheet-mask"
+        @click.self="voiceSheetOpen = false"
       >
-        <template v-if="voiceRequesting">正在请求麦克风…</template>
-        <template v-else-if="voiceHandsFree">
-          {{ voiceState === 'listening' ? '暂停收听' : (voicePaused ? '点一下继续听' : '点一下开始说') }}
-        </template>
-        <template v-else-if="voiceHolding">
-          {{ voiceCancelArmed ? '松开取消' : (voiceHoldMs / 1000).toFixed(1) + 's · 松开发送' }}
-        </template>
-        <template v-else-if="voiceState === 'thinking' || voiceState === 'speaking'">按住打断并提问</template>
-        <template v-else>按住说话</template>
-      </button>
-      <div v-if="voiceText" class="voice-transcript">
-        <span class="voice-role">你说</span>{{ voiceText }}
-      </div>
-      <div v-if="voiceAnswerText" class="voice-transcript answer">
-        <span class="voice-role">回答</span>{{ voiceAnswerText }}
-      </div>
-      <!-- 本轮实际引用的是哪张图：以服务端回的附件编号为准 -->
-      <div v-if="voiceAnswerText && turnRefId" class="voice-ref">
-        <img
-          v-if="attach.id === turnRefId && attach.url"
-          :src="attach.url"
-          alt="本轮引用的照片"
-        />
-        <span v-if="attach.id === turnRefId">本轮引用了上面这张照片</span>
-        <span v-else>本轮引用了附件 {{ turnRefId.slice(0, 8) }}（当前夹带的是另一张）</span>
-      </div>
-      <p v-if="voiceError" class="voice-error">{{ voiceError }}</p>
-      <button
-        v-if="voiceError && voiceText && voiceState === 'idle'"
-        type="button"
-        class="outline"
-        style="margin: 6px auto"
-        @click="retryAnswer"
-      >
-        重试回答
-      </button>
-      <div class="voice-actions">
-        <button
-          type="button"
-          class="outline"
-          :disabled="voiceState === 'listening' || voiceState === 'thinking'"
-          @click="resumeListening"
-        >
-          <Mic :size="16" />再说一次
-        </button>
-        <button
-          v-if="voiceState === 'speaking'"
-          type="button"
-          class="outline"
-          @click="stopSpeaking"
-        >
-          <Volume2 :size="16" />停止播报
-        </button>
-        <button type="button" class="voice-hangup" @click="endCall">
-          <PhoneOff :size="16" />挂断
-        </button>
-      </div>
-      <p class="voice-tip">
-        {{ voiceHandsFree
-          ? '免按键：直接说话，停顿一下自动发送；回答播完自动继续听；单次最长 60 秒'
-          : '按住说话、松开发送；上滑取消；单次最长 60 秒；回答边生成边朗读' }}
-      </p>
-    </template>
-
-    <!-- 页面内相机：实时取景 + 快门 -->
-    <div v-if="voiceCamOpen" class="voice-cam">
-      <video ref="voiceCamVideo" playsinline muted autoplay></video>
-      <div class="voice-cam-top">
-        <button type="button" class="vc-icon" @click="closeCamera" title="关闭相机">
-          <X :size="20" />
-        </button>
-        <span>对准叶片，按中间白色快门</span>
-      </div>
-      <div class="voice-cam-bottom">
-        <button
-          type="button"
-          class="vc-shutter"
-          :disabled="!voiceCamReady"
-          @click="shootPhoto"
-        >
-          <i></i>
-        </button>
-      </div>
-      <p v-if="voiceCamError" class="voice-cam-error">{{ voiceCamError }}</p>
-    </div>
-
-    <!-- 拍照/选图后的预览：先看清楚，再决定用这张、重拍还是取消 -->
-    <div v-if="camShot && !voiceCamOpen" class="voice-cam vc-preview">
-      <img :src="camShot.url" alt="待上传的照片预览" />
-      <div class="vc-preview-tip">看清楚了吗？确认后才会传到服务器</div>
-      <div class="voice-cam-bottom vc-preview-bar">
-        <button type="button" class="vc-preview-btn" @click="cancelShot">取消</button>
-        <button type="button" class="vc-preview-btn primary" @click="confirmShot">
-          用这张
-        </button>
-        <button type="button" class="vc-preview-btn" @click="retakeShot">重拍</button>
+        <div class="vc-sheet">
+          <button type="button" @click="openInPageCamera">
+            <Camera :size="18" /><span>打开相机（页面内）</span>
+          </button>
+          <button type="button" @click="fromAlbum">
+            <ImagePlus :size="18" /><span>从相册选择</span>
+          </button>
+          <button type="button" @click="useSystemCamera">
+            <Camera :size="18" /><span>系统相机</span>
+          </button>
+          <p v-if="voiceCamError" class="err">{{ voiceCamError }}</p>
+          <button type="button" class="cancel" @click="voiceSheetOpen = false">取消</button>
+        </div>
       </div>
     </div>
-
-    <!-- 图片来源选择 -->
-    <div
-      v-if="voiceSheetOpen"
-      class="vc-sheet-mask"
-      @click.self="voiceSheetOpen = false"
-    >
-      <div class="vc-sheet">
-        <button type="button" @click="openInPageCamera">
-          <Camera :size="18" /><span>打开相机（页面内）</span>
-        </button>
-        <button type="button" @click="fromAlbum">
-          <ImagePlus :size="18" /><span>从相册选择</span>
-        </button>
-        <button type="button" @click="useSystemCamera">
-          <Camera :size="18" /><span>系统相机</span>
-        </button>
-        <p v-if="voiceCamError" class="err">{{ voiceCamError }}</p>
-        <button type="button" class="cancel" @click="voiceSheetOpen = false">取消</button>
-      </div>
-    </div>
-  </div>
-</div>
 </template>
 
 <style scoped>
@@ -6659,4 +6763,84 @@ a.text-button {
   .org-trow { grid-template-columns: 1fr auto; height: auto; padding: 10px 12px; gap: 4px 10px; }
   .org-cell-actions { text-align: left; }
 }
+
+/* ── 语音通话整屏界面（沿用 10-26 那版 .vc 样式）────────── */
+@keyframes voicePulse{0%{transform:scale(1);opacity:.8}to{transform:scale(1.35);opacity:0}}
+@keyframes vcSpin{to{transform:rotate(360deg)}}
+.vc{position:fixed;top:0;right:0;bottom:0;left:0;z-index:130;display:flex;flex-direction:column;color:#eaf6f0;background:radial-gradient(ellipse at 50% 26%,#123c2f,#0a1f18 55%,#060f0c);padding:max(12px,env(safe-area-inset-top)) 16px max(14px,env(safe-area-inset-bottom))}
+.vc-setup{margin:auto;width:360px;max-width:100%;background:#fff;color:#21443a;border-radius:22px;padding:30px 24px 22px;text-align:center}
+.vc-top{display:flex;align-items:center;gap:10px}
+.vc-icon{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;background:#ffffff14;color:#d9efe5;border:0}
+.vc-clock{flex:1;display:flex;flex-direction:column;align-items:center;line-height:1.25}
+.vc-clock b{font-size:15px;font-weight:600;letter-spacing:.3px}
+.vc-clock span{font-size:12px;color:#9fc4b5;font-variant-numeric:tabular-nums}
+.vc-mode{display:inline-flex;align-items:center;gap:5px;height:32px;padding:0 12px;border-radius:999px;background:#ffffff14;color:#cfeee0;border:0;font-size:12px}
+.vc-stage{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;padding:6px 0}
+.vc-orb{position:relative;width:176px;height:176px;display:grid;place-items:center;margin-bottom:4px}
+.vc-halo{position:absolute;top:0;right:0;bottom:0;left:0;border-radius:50%;background:radial-gradient(circle,#60dca880,#60dca800 68%);transition:transform .09s linear,opacity .2s linear}
+.vc-halo.h1{transform:scale(calc(.78 + var(--lv) * .42));opacity:calc(.35 + var(--lv) * .5)}
+.vc-halo.h2{transform:scale(calc(.62 + var(--lv) * .3));opacity:calc(.5 + var(--lv) * .4)}
+.vc-halo.h3{transform:scale(calc(.48 + var(--lv) * .18));opacity:.8}
+.vc-core{position:relative;width:88px;height:88px;border-radius:50%;display:grid;place-items:center;color:#06231a;background:linear-gradient(160deg,#8ff0c4,#43c58f);box-shadow:0 0 0 1px #ffffff40,0 18px 44px #34be8a59;transform:scale(calc(1 + var(--lv) * .12));transition:transform .09s linear}
+.vc-orb.is-idle .vc-core{background:linear-gradient(160deg,#cfe3d8,#9db8ab);color:#1e3b31;box-shadow:0 12px 32px #78aa9640}
+.vc-orb.is-idle .vc-halo{background:radial-gradient(circle,rgba(150,190,170,.28),transparent 68%)}
+.vc-orb.is-thinking .vc-core{background:linear-gradient(160deg,#ffe9a8,#e5c15c);color:#4a3a10;box-shadow:0 12px 32px #dcb95a4d}
+.vc-orb.is-thinking .vc-halo{background:radial-gradient(circle,rgba(240,210,120,.45),transparent 68%)}
+.vc-orb.is-speaking .vc-core{background:linear-gradient(160deg,#a9e9ff,#4fb8e8);color:#062733;box-shadow:0 12px 32px #5abee64d}
+.vc-orb.is-speaking .vc-halo{background:radial-gradient(circle,rgba(120,205,240,.45),transparent 68%)}
+.vc-state{margin:2px 0 0;font-size:20px;font-weight:600;letter-spacing:.5px}
+.vc-hint{margin:0;font-size:13px;color:#9fc4b5;min-height:18px}
+.vc-caption{width:min(520px,100%);max-height:28vh;overflow:auto}
+.vc-said{margin:8px 0 0;font-size:13px;color:#9fc4b5}
+.vc-say{margin:6px 0 0;font-size:16px;line-height:1.6;color:#eefaf3}
+.vc-error{margin:4px 0;font-size:12.5px;color:#ffb3ae}
+.vc-retry{color:#d9efe5;border-color:#ffffff4d;background:transparent}
+.vc-cam-note{display:flex;align-items:center;gap:5px;margin:2px 0;font-size:12.5px;color:#ffc9a3}
+.vc-drawer{width:min(560px,100%);max-height:32vh;overflow:auto;text-align:left;background:#ffffff0f;border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:10px 12px;margin-top:4px}
+.vc-line{display:flex;gap:8px;padding:5px 0;font-size:13px;line-height:1.55;color:#dbeee5}
+.vc-line em{flex:none;font-style:normal;color:#7fd3ab;font-weight:600}
+.vc-line.assistant em{color:#8fc6e8}
+.vc-empty{margin:4px 0;font-size:12px;color:#8fb2a4}
+.vc-bottom{display:flex;flex-direction:column;gap:10px;align-items:center}
+.vc-keys{display:flex;align-items:center;gap:12px}
+.vc-key{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;width:62px;height:62px;border-radius:50%;border:0;background:#ffffff1a;color:#dff2e9}
+.vc-key small{font-size:10.5px;opacity:.85}
+.vc-key.big{width:78px;height:78px;background:#ffffff24}
+.vc-key.on{background:linear-gradient(160deg,#8ff0c4,#43c58f);color:#06231a}
+.vc-key.danger{background:#e0574f;color:#fff}
+.vc-key:disabled{opacity:.35}
+.vc-more{display:flex;align-items:center;gap:14px;font-size:12px;color:#9fc4b5;flex-wrap:wrap;justify-content:center}
+.vc-more select{background:#ffffff1a;color:#eaf6f0;border:0;border-radius:8px;padding:5px 8px;font-size:12px}
+.vc-tip{opacity:.7}
+.vc-shot{display:flex;align-items:center;gap:10px;width:min(520px,100%);margin-top:6px;padding:8px 10px;border-radius:14px;background:#ffffff12;border:1px solid rgba(255,255,255,.12);text-align:left}
+.vc-shot.ok{border-color:#78dcaf73}
+.vc-shot.bad{border-color:#ff8c8273}
+.vc-shot img{width:56px;height:56px;flex:none;border-radius:10px;object-fit:cover;background:#0b1a15}
+.vc-shot-side{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.vc-shot-label{display:flex;align-items:center;gap:4px;font-size:12.5px;color:#dff2e9}
+.vc-shot.ok .vc-shot-label{color:#8ff0c4}
+.vc-shot.bad .vc-shot-label{color:#ffb3ae}
+.vc-shot.busy .vc-shot-label{color:#ffd98a}
+.vc-shot-bar{display:block;height:3px;border-radius:3px;background:#ffffff29;overflow:hidden}
+.vc-shot-bar i{display:block;height:100%;background:linear-gradient(90deg,#8ff0c4,#43c58f);transition:width .18s linear}
+.vc-shot-sub{font-size:11.5px;color:#9fc4b5}
+.vc-shot-err{font-size:11.5px;color:#ffb3ae}
+.vc-shot-acts{display:flex;gap:6px;margin-top:2px}
+.vc-shot-act{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:999px;border:1px solid rgba(255,255,255,.26);background:transparent;color:#dff2e9;font-size:11.5px}
+.vc-shot-x{flex:none;width:30px;height:30px;border-radius:50%;border:0;background:#ffffff1a;color:#dff2e9;display:grid;place-items:center}
+.vc-spin{animation:vcSpin .9s linear infinite}
+.vc-cam{position:fixed;top:0;right:0;bottom:0;left:0;z-index:200;background:#000;display:flex;flex-direction:column}
+.vc-cam video{flex:1;width:100%;min-height:0;object-fit:cover;background:#000}
+.vc-cam-top{position:absolute;top:max(12px,env(safe-area-inset-top));left:12px;right:12px;display:flex;align-items:center;gap:10px;color:#eaf6f0;font-size:12.5px;text-shadow:0 1px 4px rgba(0,0,0,.6)}
+.vc-cam-bar{position:absolute;bottom:max(20px,env(safe-area-inset-bottom));left:0;right:0;display:flex;justify-content:center}
+.vc-shutter{width:74px;height:74px;border-radius:50%;border:4px solid rgba(255,255,255,.85);background:transparent;display:grid;place-items:center}
+.vc-shutter i{width:56px;height:56px;border-radius:50%;background:#fff;display:block}
+.vc-shutter:disabled{opacity:.4}
+.vc-cam-err{position:absolute;bottom:110px;left:0;right:0;text-align:center;color:#ffb3ae;font-size:12.5px;padding:0 20px}
+.vc-sheet-mask{position:fixed;top:0;right:0;bottom:0;left:0;z-index:210;background:#00000073;display:flex;align-items:flex-end;justify-content:center}
+.vc-sheet{width:100%;max-width:480px;background:#10231c;border-radius:18px 18px 0 0;padding:10px 12px max(14px,env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:4px;border-top:1px solid rgba(255,255,255,.1)}
+.vc-sheet button{display:flex;align-items:center;gap:10px;height:50px;padding:0 12px;border:0;border-radius:12px;background:transparent;color:#eaf6f0;font-size:15px}
+.vc-sheet button:active{background:#ffffff14}
+.vc-sheet button.cancel{color:#9fc4b5;font-size:14px;margin-top:2px;border-top:1px solid rgba(255,255,255,.08);border-radius:0 0 12px 12px}
+.vc-file{display:none}
 </style>
