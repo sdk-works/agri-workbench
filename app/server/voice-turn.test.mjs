@@ -156,11 +156,15 @@ test("语音轮次：追读视图、取消语义、生成中禁止追问", async
   const b = await f.add("emp-voice4", "employee", [domains[0]]);
   assert.equal(await f.ws.voiceTurnView(b.user, r.turn_id), null);
 
-  // 排队阶段取消：与文字同一套 cancelJob，不产生"假完成"
+  // 排队阶段取消：与文字同一套 cancelJob，不产生"假完成"。
+  // 2026-10-27 8ce38df 起「取消」是独立终态 canceled，不再混进 failed 污染失败率；
+  // 被取消的候选仍记 failed / error_code=canceled（保证没有半截成功）。
   const canceled = await f.ws.cancelTurn(a.user, r.turn_id);
-  assert.equal(canceled.status, "failed");
+  assert.equal(canceled.status, "canceled");
   const after = await f.repo.get("turns", r.turn_id);
-  assert.equal(after.status, "failed");
+  assert.equal(after.status, "canceled");
+  assert.equal(after.ended_reason, "canceled");
+  assert.notEqual(after.status, "generating");
   assert.equal(after.candidates[0].status, "failed");
   assert.equal(after.candidates[0].error_code, "canceled");
 });

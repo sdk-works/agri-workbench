@@ -74,7 +74,11 @@ test("调度：语音恒单候选，无图走 fast，带图走 vision", async (t
   assert.equal(saved.source, "voice");
   assert.equal(saved.candidates.length, 1);
   assert.deepEqual(saved.candidates.map((c) => c.role), ["local"]);
-  assert.equal(saved.candidates[0].model_requested, "qwen3:30b-a3b-bench");
+  // 2026-10-27 603826c 起语音不套短问快通道（useFast 加 && !voice）：
+  // 语音一律留在强角色，且不再把 local 的模型名覆盖成 fast 的模型名。
+  // 断言必须落在"没被覆盖"上——写成"等于某个快模型名"等于给整类语音降级放行。
+  assert.equal(saved.candidates[0].model_requested, "");
+  assert.equal(saved.model_plan.role, "local");
 
   // 语音带图 → 单候选 vision
   saved = await f.repo.get(
