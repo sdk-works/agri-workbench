@@ -34,3 +34,7 @@ __pycache__/
 tmp/
 .DS_Store
 toolchain/
+
+# TLS 私钥不入库：证书私钥只放服务器磁盘，仓库里只留证书
+deploy/tls/*.key
+deploy/tls/**/*.key
