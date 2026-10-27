@@ -1503,6 +1503,45 @@ function showVoiceSetup(steps) {
   voiceState.value = "idle";
 }
 
+// ── 安全上下文判定 ──
+// 浏览器的麦克风与页内相机只在“安全上下文”里可用：https（任意端口）、http://localhost。
+// 通过 http://公网IP 打开时，Chrome 会直接把 navigator.mediaDevices 整个抹掉——
+// 不是权限被拒，而是接口压根不存在。所以这两种情况必须分开说，
+// 否则用户明明点了“允许”，界面还在说“没有拿到麦克风权限”，只会让人反复授权也没用。
+function isSecurePage() {
+  try {
+    if (window.isSecureContext) return true;
+  } catch (e) {}
+  const h = location.hostname || "";
+  return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+function hasMediaApi() {
+  return Boolean(
+    typeof navigator !== "undefined" &&
+      navigator.mediaDevices &&
+      navigator.mediaDevices.getUserMedia,
+  );
+}
+// 非安全上下文时的统一指引：说清是“地址不安全”，并给出可直接点的证书下载与 https 入口
+function insecurePageSteps(what) {
+  const host = location.hostname || "当前地址";
+  const port = location.port || "";
+  // 生产公网入口是标准 443，所以带 8080 的 http 地址对应的 https 入口不带端口
+  const httpsUrl =
+    port && port !== "80" && port !== "443" ? `https://${host}:${port}` : `https://${host}`;
+  // 首次装证书时浏览器还不信任本站，证书只能走 http 下载（这是根 CA，不是业务数据）
+  const caUrl = `http://${host}${port ? ":" + port : ""}/jingyang-ca.crt`;
+  return [
+    `当前是 http 访问，浏览器在「不安全页面」里不提供${what}接口——不是权限问题，你授权多少次都没用。`,
+    {
+      text: "① 点此下载根证书 jingyang-ca.crt（下载后按提示安装并信任）",
+      href: caUrl,
+    },
+    `② 装好后改用 https 打开：${httpsUrl}`,
+    "也可以改用「京阳智农」安卓应用，应用内录音拍照不受此限制。",
+  ];
+}
+
 function startCall() {
   voiceMode.value = true;
   startVoiceClock();
@@ -1774,6 +1813,13 @@ async function beginRecording() {
     };
     cap.raf = requestAnimationFrame(tick);
   } catch (e) {
+    // 两种失败必须分开：接口不存在（页面不安全）≠ 权限被拒
+    if (!hasMediaApi()) {
+      voiceError.value = "当前页面不是安全连接，浏览器不提供麦克风接口";
+      voiceState.value = "idle";
+      showVoiceSetup(insecurePageSteps("麦克风"));
+      return;
+    }
     const why =
       e && e.name === "NotAllowedError"
         ? "麦克风权限被拒绝"
@@ -1818,14 +1864,12 @@ function holdVoiceStart(ev) {
   // 再按一次 = 打断：立即停播、清待播、取消上一轮生成，然后开始新录音
   if (voiceState.value === "thinking" || voiceState.value === "speaking") interruptVoice();
   voiceInterrupted = false; // 新一轮开始：旧轮次的隔离由 voiceEpoch 负责
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+  if (!hasMediaApi()) {
     if (!voiceNativeCaps.rec && !voiceNativeCaps.asr) {
-      voiceError.value = "当前页面环境不支持录音";
-      showVoiceSetup([
-        "浏览器在 http:// 页面下禁止调用麦克风，所以不会弹授权框。",
-        "请使用「京阳智农」安卓应用进行语音通话（应用内可直接录音）。",
-        "电脑上请用 localhost 访问，或让管理员配置 HTTPS 域名。",
-      ]);
+      // 关键：这里不是“权限被拒”，是页面不在安全上下文，浏览器连接口都没给。
+      // 旧文案让用户以为要去授权，授权多少次都没用。
+      voiceError.value = "当前页面不是安全连接，浏览器不提供麦克风接口";
+      showVoiceSetup(insecurePageSteps("麦克风"));
       return;
     }
   }
@@ -2146,14 +2190,12 @@ function openCamSheet() {
     voiceError.value = "还没有对话，先开始语音通话再拍照";
     return;
   }
-  // http 页面下浏览器直接拒绝 getUserMedia，提前说明，别让用户点了没反应
-  const secure =
-    window.isSecureContext ||
-    location.hostname === "localhost" ||
-    location.hostname === "127.0.0.1";
+  // http 页面下浏览器直接拒绝 getUserMedia，提前说明，别让用户点了没反应。
+  // 但要说清"系统相机仍可用"——走 file input，不依赖安全上下文。
+  const secure = isSecurePage();
   voiceCamError.value = secure
     ? ""
-    : "当前不是安全连接，页面内相机不可用，请改用系统相机";
+    : "当前不是安全连接，页面内相机不可用；请用「系统相机」拍照，它不受此限制。";
   voiceSheetOpen.value = true;
 }
 
@@ -2161,8 +2203,8 @@ async function openInPageCamera() {
   voiceSheetOpen.value = false;
   voiceCamError.value = "";
   voiceCamReady.value = false;
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    voiceError.value = "打不开相机：当前页面环境不支持";
+  if (!hasMediaApi()) {
+    voiceError.value = "当前页面不是安全连接，浏览器不提供相机接口，请用「系统相机」拍照";
     return;
   }
   try {
@@ -2246,6 +2288,7 @@ function pickPhotoFile(capture) {
   if (capture) input.capture = "environment";
   input.onchange = async () => {
     const f = input.files && input.files[0];
+    cleanup();
     if (!f) return;
     if (!/^image\//.test(f.type || "")) {
       voiceError.value = "这不是图片文件";
@@ -2264,6 +2307,31 @@ function pickPhotoFile(capture) {
       voiceError.value = "这张图片读不出来，换一张试试";
     }
   };
+  // 必须先把 input 挂进文档再 click()：安卓 Chrome / 多数 WebView 里，
+  // 对一个没有插入 DOM 的 input 调 click() 不会拉起相机或文件选择器，
+  // 表现为"点了系统相机什么也没发生"。input 用完立刻从 DOM 摘掉。
+  input.style.position = "fixed";
+  input.style.left = "-9999px";
+  input.style.width = "1px";
+  input.style.height = "1px";
+  input.style.opacity = "0";
+  document.body.appendChild(input);
+  const cleanup = () => {
+    try {
+      if (input.parentNode) input.parentNode.removeChild(input);
+    } catch (e) {}
+  };
+  // 用户直接返回（取消）时 onchange 不会触发，靠 focus 兜底清理，避免 input 残留
+  window.addEventListener(
+    "focus",
+    () => {
+      setTimeout(() => {
+        if (document.body.contains(input) && !(input.files && input.files.length))
+          cleanup();
+      }, 800);
+    },
+    { once: true },
+  );
   input.click();
 }
 
@@ -4987,7 +5055,10 @@ onUnmounted(() => {
         <div class="voice-orb is-idle"><Mic :size="30" /></div>
         <h2 class="voice-title">语音通话需要准备一下</h2>
         <ul class="voice-steps">
-          <li v-for="(step, i) in voiceSetupSteps" :key="i">{{ step }}</li>
+          <li v-for="(step, i) in voiceSetupSteps" :key="i">
+            <template v-if="typeof step === 'string'">{{ step }}</template>
+            <a v-else :href="step.href" target="_blank" rel="noreferrer">{{ step.text }}</a>
+          </li>
         </ul>
         <div class="voice-actions">
           <button
@@ -6428,6 +6499,12 @@ a.text-button {
   color: #55705f;
   font-size: 13px;
   line-height: 1.9;
+}
+.voice-steps a {
+  color: #12603e;
+  font-weight: 600;
+  text-decoration: underline;
+  word-break: break-all;
 }
 .voice-role {
   display: inline-block;

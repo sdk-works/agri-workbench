@@ -379,9 +379,14 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
         turn_id: turnId,
         status: "queued",
         source: "voice",
-        // 服务端确认这一轮绑了哪张附件：前端据此显示"本轮引用"，不靠本地残留
+        // 服务端确认这一轮绑了哪张附件：前端据此显示"本轮引用"，不靠本地残留。
+        // 必须优先取 image_attachment：同一张图追问时不再重复送图（image 为空），
+        // 但这一轮引用的仍然是那张附件，取 image 会返回空串、让前端以为没带图。
         image_attachment_id:
-          (created.turn && created.turn.image && created.turn.image.attachment_id) || "",
+          (created.turn &&
+            ((created.turn.image_attachment && created.turn.image_attachment.id) ||
+              (created.turn.image && created.turn.image.attachment_id))) ||
+          "",
         duplicate: created.duplicate === true,
       });
 

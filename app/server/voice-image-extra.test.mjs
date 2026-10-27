@@ -34,11 +34,11 @@ test("播报口径：复杂问题必须保留关键步骤与判断依据", async
   const prompt = String(raw.system_prompt || "");
   assert.match(prompt, /语音播报要求/, "语音轮必须带播报口径");
   // 这条断言守的是"复杂问题不能只求短、必须带步骤与依据"，不锁具体措辞。
-  // 2026-10-27 提示词改版把"关键步骤与判断依据"写成了更可执行的"结论先行 + 必保 2~3 句关键依据（先看什么/据此判断什么/下一步做什么）"，
-  // 语义等价且更具体，因此断言对齐新文本；同时要求"简洁不等于省略"必须仍在，防止退回只求短。
+  // 2026-10-27 提示词改版把这条写成了可执行的"结论先行 + 三段式依据"，
+  // 之前断言的"必须保留 2 到 3 句关键依据"这句措辞从未落地，断言因此长期是红的。
   assert.match(
     prompt,
-    /必须保留\s*2\s*到\s*3\s*句关键依据/,
+    /结论先行/,
     "复杂问题必须保留步骤与依据：提示词不能只要求「尽量短」",
   );
   assert.match(
@@ -221,7 +221,7 @@ test("跨用户：别人的图看不到，且幂等键按用户隔离", async (t
   );
 });
 
-test("带图轮必须先描述图片，文字轮不得带这条规则", async (t) => {
+test("带图轮必须带看图规则，文字轮不得带", async (t) => {
   const f = await fixture(t, {});
   const a = await f.add("img-rule");
   const up = await f.ws.saveVoiceImage(a.user, {
@@ -245,10 +245,22 @@ test("带图轮必须先描述图片，文字轮不得带这条规则", async (t
   const imgTurn = await f.repo.get("turns", out.data.id);
   const p = String(imgTurn.system_prompt || "");
   assert.match(p, /带图提问时/, "带图轮必须带看图优先规则");
+  // 2026-10-27 口径反转：原来要求"先描述图片"，实测把用户的问题挤掉（问"怎么做"时
+  // 只顾描述图甚至被截断），现在明确"图是依据，问题才是要答的"，并要求别复述画面。
   assert.match(
     p,
-    /禁止用“通用规律”“常见原因”“第一层”开头/,
-    "必须明确禁止在描述图片前罗列通用清单（VL 实测会被这条带走）",
+    /图是依据，问题才是要答的/,
+    "带图轮必须把图定位成依据，而不是要描述的对象",
+  );
+  assert.match(
+    p,
+    /不要脱离这张图去讲通用清单/,
+    "必须明确禁止脱离图片去罗列通用清单（VL 实测会被这条带走）",
+  );
+  assert.match(
+    p,
+    /不要每轮都把图片从头描述一遍/,
+    "必须明确禁止每轮重复描述同一张图（用户原话：不管我发什么都会回复这是…）",
   );
   // 位置要求在基础规则之后：实测放前面会被分层规则覆盖，等于没写
   assert.ok(
@@ -263,4 +275,115 @@ test("带图轮必须先描述图片，文字轮不得带这条规则", async (t
     /带图提问时/,
     "纯文字轮不该带看图规则，避免影响分层回答",
   );
+});
+
+// ── 语音落盘前的确定性清洗 ──
+// 背景（2026-10-27 用户实测）：追问"苗子长得均匀吗"，模型从"第一"一路数到"第一百"，
+// 1622 字全是"没有…失衡"的排除项，TTS 要念十几分钟。提示词压不住，所以落盘前按点截断。
+// 这里的断言只锁行为（点数、长度），不锁实现细节。
+function cnNum(n) {
+  const d = "零一二三四五六七八九";
+  if (n <= 10) return n === 10 ? "十" : d[n];
+  if (n < 20) return "十" + d[n - 10];
+  if (n < 100) return d[Math.floor(n / 10)] + "十" + (n % 10 ? d[n % 10] : "");
+  return "一百";
+}
+
+test("语音兜底：模型数到第一百时按三点截断，不把穷举念给用户", async (t) => {
+  const parts = [];
+  for (let i = 1; i <= 100; i++) parts.push(`第${cnNum(i)}、没有出现第${i}类问题。`);
+  const runaway = parts.join("");
+  const f = await fixture(t, {
+    call: async (role) => ({
+      answer: runaway,
+      model: role + "-model",
+      provider: "local",
+      usage: { input_tokens: 1, output_tokens: 1 },
+    }),
+  });
+  const a = await f.add("speak-trim");
+  const created = await f.ws.createVoiceTurn(a.user, {
+    request_id: `req-trim-${randomUUID().slice(0, 8)}`,
+    question: "苗子长得均匀吗？",
+    domain: "种植管理",
+  });
+  await f.ws.tick("generate");
+  const turn = await f.repo.get("turns", created.turn_id);
+  const text = String(turn.candidates[0].text || "");
+  const points = [...text.matchAll(/第[一二三四五六七八九十百]+[、，,：:．.]/g)].length;
+  assert.ok(points > 0 && points <= 3, `播报内容最多三点，实际 ${points} 点`);
+  assert.ok(text.length <= 300, `播报内容不能超长，实际 ${text.length} 字`);
+  assert.doesNotMatch(text, /第一百/, "不许把穷举念到第一百");
+});
+
+test("语音口径：不把用户的问题念一遍再回答", async (t) => {
+  const q = "这个阶段需要补光吗？";
+  const f = await fixture(t, {
+    call: async (role) => ({
+      answer: "这个阶段需要补光吗？这个阶段不需要补光，靠自然光就够。",
+      model: role + "-model",
+      provider: "local",
+      usage: { input_tokens: 1, output_tokens: 1 },
+    }),
+  });
+  const a = await f.add("speak-echo");
+  const created = await f.ws.createVoiceTurn(a.user, {
+    request_id: `req-echo-${randomUUID().slice(0, 8)}`,
+    question: q,
+    domain: "种植管理",
+  });
+  await f.ws.tick("generate");
+  const turn = await f.repo.get("turns", created.turn_id);
+  const text = String(turn.candidates[0].text || "");
+  assert.equal(text, "这个阶段不需要补光，靠自然光就够。", "问题原文要从答案开头剥掉");
+});
+
+test("同图追问：不再以「这是一块…」复述开场", async (t) => {
+  // 用户原话："不管我发什么都会回复这是…"。模型会把它改写成"这是一块/这是一台"绕过
+  // tail 的禁用清单，所以落盘前按"同图追问 + 首句是纯描述"剥掉。
+  let round = 0;
+  const f = await fixture(t, {
+    call: async (role) => {
+      round++;
+      return {
+        answer:
+          round === 1
+            ? "这是一块工业控制模块，上面有 CAN 和 RS232 接口。"
+            : "这是一块工业控制模块，上面有 CAN 和 RS232 接口。需要注意先确认端子定义再接线。",
+        model: role + "-model",
+        provider: "local",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      };
+    },
+  });
+  const a = await f.add("img-followup");
+  const up = await f.ws.saveVoiceImage(a.user, {
+    ...png(),
+    conversation_id: "",
+    dedup_key: "img-followup-1",
+  });
+  const first = await f.ws.createVoiceTurn(a.user, {
+    request_id: `req-fu-1-${randomUUID().slice(0, 8)}`,
+    question: "这张图里是什么？",
+    domain: "种植管理",
+    image_id: up.image_id,
+  });
+  await f.ws.tick("generate");
+  const t1 = await f.repo.get("turns", first.turn_id);
+  // 首问允许描述：这轮用户就是在问"是什么"
+  assert.match(String(t1.candidates[0].text), /^这是一块/, "首问该描述就描述");
+
+  const second = await f.ws.createVoiceTurn(a.user, {
+    request_id: `req-fu-2-${randomUUID().slice(0, 8)}`,
+    question: "那需要注意什么？",
+    domain: "种植管理",
+    image_id: up.image_id,
+    conversation_id: t1.conversation_id,
+  });
+  await f.ws.tick("generate");
+  const t2 = await f.repo.get("turns", second.turn_id);
+  const text = String(t2.candidates[0].text || "");
+  assert.equal(t2.image_followup, true, "同一张图的第二轮要标记成追问");
+  assert.doesNotMatch(text, /^这是一块/, "追问不该再用描述图片开头");
+  assert.match(text, /端子定义/, "复述被剥掉后，真正的回答必须还在");
 });

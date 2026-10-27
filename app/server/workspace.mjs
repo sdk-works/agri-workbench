@@ -27,10 +27,13 @@ const scrypt = promisify(scryptCallback);
 const VOICE_SPOKEN_RULES = `【语音播报要求｜覆盖上面所有关于输出格式的规定】
 这一轮会被逐句朗读成声音，所以：
 · 不用 Markdown、列表、标题、表格、表情符号、括号补充，不写“第一层”“首先”这类书面结构词。
-· 用口语短句，每句不超过 30 字。需要分点时直接说“第一、第二”。
+· 用口语短句，每句不超过 30 字。
+· 要分点时最多说到第三点（“第一”“第二”“第三”），说到第三就收尾。
+  ｜绝不许继续往下数，也绝不许罗列一连串“没有……”“不……”“不存在……”的排除项来凑数。
+  ｜宁可只说两点讲清楚，也不要为了显得全面把清单铺满。
 · 数字、型号、单位用口语说出来，不写符号。
 · 结论先行：先说怎么办，再说依据（先看什么、据此判断什么、下一步做什么）。
-· 整段回答不超过 200 字，超出就只讲最关键的，不要罗列。
+· 整段回答控制在 200 字以内。说满三点就停，剩下的等用户问再说。
 · 用户问"怎么做""怎么接""用什么"时，即使型号或现场条件不明，也必须先给做法框架：
   需要哪些部件、信号或动力怎么走、按什么顺序做、做完怎么验证能不能用。最后一句再说
   具体端子、线径、型号要按设备手册和现场确认。只回一句"请提供型号"不算回答。
@@ -39,30 +42,120 @@ const VOICE_SPOKEN_RULES = `【语音播报要求｜覆盖上面所有关于输�
 
 `;
 export const domains = ["种植管理", "农业物联网", "农业销售", "设计"];
+// 语音播报的条数兜底。VOICE_SPOKEN_RULES 里写了"最多说到第三点"，但模型偶尔完全无视：
+// 实测出现过追问"苗子长得均匀吗"，回答从"第一"一路数到"第一百"，1622 字全是
+// "没有…失衡"的排除项。这种内容 TTS 要念十几分钟，信息量却是零。
+// 所以落盘前按"第X、"标记数点，超过三点就在第三点末尾截断——只在语音轮、只在
+// 明显超长且确实数到第 4 点以上时才动手，正常回答一个字都不改。
+function trimSpokenPoints(text) {
+  const s = String(text || "");
+  if (s.length <= 220) return s;
+  const marks = [...s.matchAll(/第[一二三四五六七八九十百]+[、，,：:．.]/g)];
+  if (marks.length < 4) return s;
+  const head = s.slice(0, marks[3].index).trim().replace(/[、，,;；\s]+$/, "");
+  // 截断点太靠前说明标记是别的语义（不是逐条列举），宁可不截。
+  // 阈值不能定高：模型跑飞时每条往往很短（"第一、没有虫。第二、没有病。"），
+  // 三点加起来才三十来字，按 40 字判会把真正要截的漏掉（已踩过一次）。
+  return head.length >= 12 ? head + "。" : s;
+}
+// 追问同一张图时，模型往往还是先复述一句再答题（实测原句："这是一块工业控制模块，
+// 上面有 CAN、RS232 接口…。需要注意以下几点：…"）。tail 里禁了"这是…"开头，
+// 模型就改写成"这是一块""这是一台"绕过去，所以这里补一次确定性裁剪：
+// 只在「同一张图的追问」且首句确实是纯描述时才剥掉，首问一个字都不动。
+const REPEAT_OPEN =
+  /^\s*(这(?:一[块台个套种只部根株棵片张])?是|图中|图片中|这张图片?里?|画面|从图[中里])/;
+function stripRepeatedOpening(text, isFollowUp) {
+  const s = String(text || "");
+  if (!isFollowUp) return s;
+  const m = REPEAT_OPEN.exec(s);
+  if (!m) return s;
+  const after = m[0].length;
+  const end = s.slice(after).search(/[。！？!?\n]/);
+  if (end < 0) return s;
+  const rest = s.slice(after + end + 1).trim();
+  // 剥完太短说明整段就是一句复述，保留原文，宁可不剥。
+  // 阈值 10 字：语音追问的答案本来就短（"需要注意先确认端子定义再接线。"才 14 字），
+  // 门槛定高了会把该剥的留下（已踩过一次，20 字时这条规则等于没生效）。
+  return rest.length >= 10 ? rest : s;
+}
+// 模型偶尔把我的问题抄进答案开头（"这个阶段需要补光吗？这个阶段苗子主要靠自然光…"），
+// 念出来像是自言自语。tail 里已经写了"不用复述我的问题"，但这条规则守不住，
+// 所以在落盘前做确定性清洗：只剥掉开头与问题原文逐字重合的部分，后面的内容不动。
+function stripQuestionEcho(text, question) {
+  const t = String(text || "");
+  const bare = (s) => String(s || "").replace(/[\s，。？！、,.?!：:；;～~…“”"'’‘]/g, "");
+  const q = bare(question);
+  if (q.length < 4) return t;
+  let i = 0,
+    j = 0;
+  while (i < t.length && j < q.length) {
+    const ch = bare(t[i]);
+    if (!ch) {
+      i++;
+      continue;
+    }
+    if (ch !== q[j]) break;
+    i++;
+    j++;
+  }
+  if (j < q.length) return t;
+  while (i < t.length && /[\s，。？！、,.?!：:；;～~…]/.test(t[i])) i++;
+  const rest = t.slice(i).trim();
+  // 剥完太短说明整段就是问题复述，那保留原文，交给人工判断
+  return rest.length >= 10 ? rest : t;
+}
+// 追问时模型有时把上一轮的第一句原样搬到本轮开头，甚至逐轮累积
+//（第二问 = 第一问原文 + 新内容，第三问再叠一层）。提示词管不住这种惯性，
+// 所以在落盘前按"首句重复"剥掉：只剥第一句，剥完太短就保留原文。
+// 注意：这是**落盘后清洗**，不往 prompt 里塞历史答案——试过，模型会照着抄得更凶。
+function stripRepeatedOpeningSentence(text, prev) {
+  const s = String(text || "").trim();
+  const m = /^([^。！？!?\n]{6,})[。！？!?]?\s*/.exec(s);
+  if (!m) return s;
+  const norm = (x) => String(x || "").replace(/[\s，、,：:；;]/g, "");
+  if (!norm(prev).startsWith(norm(m[1]))) return s;
+  const rest = s.slice(m[0].length).trim();
+  return rest.length >= 10 ? rest : s;
+}
 // 带图轮的专用规则，必须放在 BASE_RULES 之后（越靠后越管用，实测放前面会被分层规则覆盖）。
 // 背景：VL 模型看图本身很准（能读出型号/端子号/手柄状态），但一问"有什么问题"就被
 // BASE_RULES 的"先讲通用规律"带走，回一堆通用清单，等于没看图。这条把它们掰回来。
-const IMAGE_RULES = `【带图提问时：看清图 + 回答问题是两件事，都要做】
-用户带了图片，图是他给的材料。先看清图里有什么，再回答他问的事——缺一件都算没做好：
-· 看清：设备或作物是什么、有没有型号标识、当前是什么状态、有什么可见异常。
-· 回答：针对他问的问题给出判断和做法，并说明依据是图里的哪一处。
-不要脱离这张图去讲通用清单（“常见原因”“首先”“第一层”），也不要只把图描述一遍就结束。
-图里能看清端子标识、接口名称、指示灯含义（比如 AD0、Y0、RS232、CAN、485、Run）时，就用这些看得见的东西说明怎么接、怎么试，不要装作没看见。
-只有确实看不清的那一处才让用户补拍或提供型号，不要把整张图说成看不清。
+const IMAGE_RULES = `【带图提问时：图是依据，问题才是要答的】
+用户带了图片，图是他给的材料。回答要直接针对他问的事，用图里看得见的东西作依据。
+· 不要脱离这张图去讲通用清单（“常见原因”“首先”“第一层”）。
+· 不要每轮都把图片从头描述一遍。他只问过一次“这是什么”的时候才需要描述；
+  之后接着问“怎么做”“那要注意什么”，直接给做法和判断，别再复述画面。
+· 图里能看清端子标识、接口名称、指示灯含义（比如 AD0、Y0、RS232、CAN、485、Run）时，
+  就用这些看得见的东西说明怎么接、怎么试，不要装作没看见。
+· 只有确实看不清的那一处才让用户补拍或提供型号，不要把整张图说成看不清。
 `;
 // 带图硬兜底：IMAGE_RULES 在 system 里实测只有约 85% 生效（模型有时仍先抛通用清单）。
 // 这条拼在本轮 user 消息末尾——离生成最近、优先级最高。
-// 2026-10-27 修正两次：
+// 2026-10-27 修正四次：
 //   第一版“第一段必须先描述图片”→ 用户问“用它做控制电机怎么做”，模型只顾描述图，把问题挤掉甚至截断。
 //   第二版“不要把回答写成图片说明”→ 走到了另一头，模型答“这个我无法确认”，连“这是什么”都不描述。
-// 现在写成“看清 + 回答两步都要做到”，并要求回答能对得上图里的具体内容。
+//   第三版“看清 + 回答两步都要做到”→ 回答质量稳住了，但用户在追问时反馈“不管我发什么都会回复这是…”。
+//   第四版“第一句就答题，不许用这是…开头”→ 复述没了，但出现新的退化：连着换两个问题，
+//   模型给出的答案是同一段话（实测 3 轮里 2 轮一字不差）。原因是从 tail 里拿不到“这一轮到底
+//   问的是什么”，只能沿用上一轮的模板。所以 tail 改成函数，把**本轮问题原话**贴在最末尾：
+//   离生成最近的文字权重最高，逐字的问题比“回答我的问题”这种抽象指令管用得多。
 // 只改发给模型的消息，不改库里存的 context，保证历史记录可追溯。
-const IMAGE_FORCE_TAIL = `
+// 第五版试过把"上一轮你是这样回答的：『…』"贴进来，想让它知道哪句不能说 —— **反效果**：
+// 模型把那段当成要接着写的内容，逐轮累积（第二问=第一问原文+新内容，第三问又叠一层）。
+// 结论：不要把自己的历史答案喂进 tail，只喂本轮问题。
+function imageForceTail(question) {
+  const q = String(question || "").trim().slice(0, 120);
+  return `
 
 【本轮要求】
-两步都要做到：先看清这张图里有什么（设备或作物、型号标识、当前状态、可见异常），再直接回答我问的问题。
-回答里要能对得上图里的具体内容；不要只描述图片，也不要绕开图去讲通用规律。看不清的地方直接说清是哪一处。
-如果我问的是“怎么做”“怎么接”“用什么”，必须先用图里看得见的东西给出做法（哪些部件、信号怎么走、按什么顺序、怎么验证），需要型号或手册的地方放到最后一句再问。只回一句“请提供型号”不算回答。`;
+第一句就回答我问的事，而且要是判断或做法本身：不许用“这是……”“图中……”“这张图显示……”
+“画面中……”开头（“这是一块”“这是一台”“这是一个”这类变体也不行），也不许把我问的这句话再念一遍。
+我前面已经问过这张图时，我是在接着问，不是让你重新描述一遍。
+用图里看得见的具体内容（设备、型号、端子标识、作物状态、可见异常）作为依据。
+不许脱离图讲通用清单，也不许只回一句“请提供型号”了事：问“怎么做”就先给做法
+（哪些部件、信号怎么走、按什么顺序、怎么验证），需要型号或手册的地方放最后一句再问。
+${q ? `我这一轮问的原话是：“${q}”。回答要逐字对上这句话。` : ""}`;
+}
 // 主提示词：把"能力边界"和"信息不足"写成可执行的分层规则。
 // 抽象要求（如"不编造事实"）模型无法操作化，实测无效；必须逐项列出哪些数据看不到、缺什么先问什么。
 const BASE_RULES = `你是农业园区助手，服务温室种植与农业物联网。涉及领域：种植管理、农业物联网、农业销售、设计。
@@ -908,6 +1001,23 @@ export function createWorkspace({
             { role: "assistant", content: adopted.text },
           );
       }
+      // 同一张图的追问：照常送图，只多记一个标记。
+      // 试过"追问不再重复送图、靠历史上下文承接"，实测更糟：图一撤，本轮连 IMAGE_FORCE_TAIL
+      // 都没有（它跟着 t0.image 走），模型既没有依据也没有约束。用户问"苗子长得均匀吗"，
+      // 它回了一串从"第一"数到"第一百"的空洞排除项（1622 字）。
+      // 复述只是风格问题，"没有依据还硬答"是事实问题——后者不能接受，所以图必须一直在。
+      // 复述改用两条腿压：IMAGE_FORCE_TAIL 的开头约束（治模型）+ 落盘前的
+      // stripRepeatedOpening / stripRepeatedOpeningSentence（治结果）。
+      // image_followup 就是给后一条用的：历史里已有基于这张图的完整回答，说明这轮是追问。
+      const imageFollowUp =
+        Boolean(imageAttachment) &&
+        turns.some(
+          (p) =>
+            p.image_attachment &&
+            p.image_attachment.id === imageAttachment.id &&
+            Array.isArray(p.candidates) &&
+            p.candidates.some(isComplete),
+        );
       context.push({ role: "user", content: question });
       if (JSON.stringify(context).length > 50000) fail("会话较长，请新建会话");
       const docs = await db.list("documents", { tenant: u.tenant, domain });
@@ -990,6 +1100,8 @@ export function createWorkspace({
         image,
         // 附件标识：本轮实际引用的是哪张上传图（换图/切会话时靠它对齐）
         image_attachment: imageAttachment,
+        // 这是对同一张图的追问吗（首问 false）：只影响落盘前要不要剥开头的复述句
+        image_followup: imageFollowUp,
         ...(voice ? { source: "voice" } : {}),
         split: conv.split,
         references,
@@ -1214,6 +1326,19 @@ export function createWorkspace({
           reasoning_effort: t.deep === true ? "medium" : "minimal",
         },
       );
+      // 落盘前的语音/追问清洗链，顺序有讲究：
+      //   1) trimSpokenPoints   先砍掉"第一…第一百"的穷举（语音必做）
+      //   2) stripQuestionEcho  再剥掉把我问题念一遍的开头（语音必做）
+      //   3) stripRepeatedOpening      剥掉"这是一块…"的复述开头（只对同图追问）
+      //   4) stripRepeatedOpeningSentence 剥掉与上一轮首句一字不差的重复（只对同图追问）
+      // 这些只改最终落盘的文本，不动模型原文，也不往 prompt 里塞历史答案。
+      const prevAnswer = (() => {
+        for (let i = (t.context || []).length - 1; i >= 0; i--) {
+          if (t.context[i] && t.context[i].role === "assistant")
+            return String(t.context[i].content || "");
+        }
+        return "";
+      })();
       await repo.transaction(async (db) => {
         const current = await db.get("turns", t.id);
         const cc = current.candidates.find((c) => c.label === candidate.label);
@@ -1232,9 +1357,16 @@ export function createWorkspace({
               ` dosage=[${guarded.dosage.hits.join(" | ")}]`,
           );
         }
+        let finalText = guarded.text;
+        if (t.source === "voice")
+          finalText = stripQuestionEcho(trimSpokenPoints(finalText), t.question);
+        if (t.image_followup === true) {
+          finalText = stripRepeatedOpening(finalText, true);
+          finalText = stripRepeatedOpeningSentence(finalText, prevAnswer);
+        }
         Object.assign(cc, {
           status: "completed",
-          text: guarded.text,
+          text: finalText,
           model: out.model,
           provider: out.provider,
           usage: out.usage,
@@ -1264,8 +1396,10 @@ export function createWorkspace({
         { role: "system", content: t0.system_prompt },
         ...t0.context,
       ];
-      // 带图硬兜底：把"先描述图片"的要求挂到本轮 user 消息末尾。
+      // 带图硬兜底：把"答题、别复述、别复用上一轮答案"的要求挂到本轮 user 消息末尾。
       // system 里的 IMAGE_RULES 是概率生效（实测约 85%），user 末尾这句接近 100%。
+      // tail 里带上本轮问题原话：模型对最近的逐字文字权重最高，只写"回答我的问题"
+      // 它会直接沿用上一轮的模板答案（实测 3 轮里 2 轮一字不差）。
       // 只影响本次调用，库里存的 context 保持原样。
       if (t0.image) {
         const last = messages.length - 1;
@@ -1273,7 +1407,7 @@ export function createWorkspace({
         if (tail && tail.role === "user") {
           messages[last] = {
             ...tail,
-            content: `${tail.content}${IMAGE_FORCE_TAIL}`,
+            content: `${tail.content}${imageForceTail(t0.question)}`,
           };
         }
       }
