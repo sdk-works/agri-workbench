@@ -5165,6 +5165,8 @@ onUnmounted(() => {
               type="button"
               class="vc-key big"
               :class="{ on: voiceHolding || (voiceHandsFree && voiceState === 'listening') }"
+              title="麦克风"
+              aria-label="麦克风"
               @pointerdown.prevent="holdVoiceStart"
               @pointerup.prevent="holdVoiceEnd"
               @pointercancel.prevent="holdVoiceCancel"
