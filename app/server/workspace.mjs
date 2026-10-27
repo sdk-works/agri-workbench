@@ -786,6 +786,44 @@ export function createWorkspace({
         if (old.owner !== u.id || old.tenant !== u.tenant)
           fail("请求编号冲突", 409);
         if (old.question !== question) fail("请求编号不可用于不同问题", 409);
+        // 重试：同一个 request_id 重跑同一轮，不新建轮次。
+        // 前端「失败重试」按钮必须走这里，否则同一问题会变成两条历史记录。
+        // 只允许失败/部分完成的轮次重跑——正在生成或已成功的不能被打回队列。
+        if (b.retry === true) {
+          if (old.status !== "failed" && old.status !== "partial")
+            return Object.assign(safeTurn(old, u), { duplicate: true, retried: false });
+          const again = {
+            ...old,
+            status: "generating",
+            ended_reason: "",
+            error: "",
+            retried_at: now(),
+            retry_count: Number(old.retry_count || 0) + 1,
+            candidates: old.candidates.map((c) => ({
+              label: c.label,
+              role: c.role,
+              model_requested: c.model_requested || "",
+              status: "pending",
+              text: "",
+            })),
+          };
+          // 附件随之回到「分析中」，失败原因不再挂着（但保留原图，不用重拍）
+          if (imageAttachment) {
+            const rec = await db.get("voice_images", imageAttachment.id);
+            if (rec)
+              await db.put("voice_images", {
+                ...rec,
+                status: "attached",
+                stage: "analyzing",
+                error: "",
+              });
+          }
+          await db.put("turns", again);
+          // 旧任务行还在的话 enqueue 会直接返回，必须先清掉才能真的重跑
+          await db.remove("jobs", `generate-${again.id}`);
+          await enqueue(db, again, "generate");
+          return Object.assign(safeTurn(again, u), { duplicate: true, retried: true });
+        }
         // 幂等回放：调用方可据此判断是复用了旧轮次（语音 SSE 追读同一 turn）
         return Object.assign(safeTurn(old, u), { duplicate: true });
       }
@@ -1068,7 +1106,8 @@ export function createWorkspace({
             });
         t.status = t.candidates.some((c) => c.status === "completed")
           ? "partial"
-          : "failed";
+          : "canceled";
+        if (t.status === "canceled") t.ended_reason = "canceled";
         t.judge = { status: "unavailable" };
         await db.put("turns", t);
         await db.put("jobs", {
@@ -1246,7 +1285,17 @@ export function createWorkspace({
       ).length;
       const expected = t.candidates.length;
       const judgeOn = gateway.roleEnabled("judge");
-      t.status = good === expected ? "completed" : good ? "partial" : "failed";
+      // 用户主动取消是独立终态，不能算成失败：否则历史里显示"失败"、
+      // 失败率被污染，用户也会以为是系统出错
+      const canceled = t.candidates.some((c) => c.error_code === "canceled");
+      t.status = canceled && !good
+        ? "canceled"
+        : good === expected
+          ? "completed"
+          : good
+            ? "partial"
+            : "failed";
+      if (t.status === "canceled") t.ended_reason = "canceled";
       // 附件生命周期收尾：看过图才算 analyzed；失败要保留原因（不假装看过）
       if (t.image_attachment && t.image_attachment.id) {
         const rec = await db.get("voice_images", t.image_attachment.id);
@@ -1257,9 +1306,11 @@ export function createWorkspace({
             : "";
           await db.put("voice_images", {
             ...rec,
-            status: failed ? "failed" : "analyzed",
-            stage: failed ? "failed" : "analyzed",
-            error: why,
+            // 取消的图不算失败：图还是好的，用户随时可以再用它重问
+            status: t.status === "canceled" ? "attached" : failed ? "failed" : "analyzed",
+            stage:
+              t.status === "canceled" ? "canceled" : failed ? "failed" : "analyzed",
+            error: t.status === "canceled" ? "已取消" : why,
           });
         }
       }
@@ -2974,6 +3025,11 @@ export function createWorkspace({
       ended_reason: t.ended_reason || "",
       source: t.source || "",
       conversation_id: t.conversation_id,
+      // 本轮实际引用的附件：前端据此显示"这一轮看的是哪张图"，
+      // 而不是只看页面上还留着什么缩略图
+      image_attachment_id: (t.image_attachment && t.image_attachment.id) || "",
+      has_image: Boolean(t.image),
+      role: (c && c.role) || "",
       refs: (t.references || []).length,
     };
   }

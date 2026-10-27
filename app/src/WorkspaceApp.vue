@@ -25,6 +25,8 @@ import {
   X,
 } from "lucide-vue-next";
 import { call, download } from "./workspace-api";
+// 附图状态机：六态与「什么才算上传成功」都在这份纯逻辑里，便于单测
+import * as Attach from "./attach-flow.mjs";
 const user = ref(null),
   ready = ref(false),
   setup = ref(false),
@@ -1287,6 +1289,9 @@ let voiceAbort = null;
 let voiceTurnId = "";
 let voiceRequestId = "";
 let voiceInterrupted = false;
+// 上一次提问的原文与结果：重试时复用它，避免同一问题在历史里出现两条
+let lastQuestionText = "";
+let lastTurnFailed = false;
 // 轮次编号：每次录音/识别自增，迟到的旧识别与旧答案一律作废
 let voiceEpoch = 0;
 let voiceAsrAbort = null;
@@ -1325,14 +1330,27 @@ try {
 // ── 拍照与随问附图：先上传拿 image_id，再随语音轮提交 ──
 const VOICE_IMAGE_MAX = 8 * 1024 * 1024;
 const VOICE_UPLOAD_MS = 45000;
+// 压缩参数：长边 1600 + 0.86 质量。叶片病斑、虫体这类细节靠像素，压太狠就看不出来
+const IMG_MAX_EDGE = 1600;
+const IMG_QUALITY = 0.86;
 const voiceCamOpen = ref(false);
 const voiceCamReady = ref(false);
 const voiceCamVideo = ref(null);
 const voiceCamError = ref("");
 const voiceSheetOpen = ref(false);
-const voiceAttach = ref(null); // { id, url, status, error }
+// 附图状态机（picked/uploading/received/analyzing/done/failed），含 id/dedupKey/requestId
+const attach = ref(Attach.emptyAttach());
+// 拍完/选完先进预览，用户确认才上传：这一步是「预览、重拍、删除」的落点
+const camShot = ref(null); // { url, blob, mime, ext }
+// 服务端确认本轮引用的附件编号（来自 SSE meta/phase），不是页面上的残留
+const turnRefId = ref("");
+const attachInfo = computed(() => Attach.describe(attach.value));
+const attachUploaded = computed(() => Attach.isUploaded(attach.value));
+const attachCanSend = computed(() => Attach.canSend(attach.value));
+const attachBusy = computed(() => Attach.isBusy(attach.value));
+const attachRetryUpload = computed(() => Attach.canRetryUpload(attach.value));
+const attachRetryAnalyze = computed(() => Attach.canRetryAnalysis(attach.value));
 let voiceCamStream = null;
-let voiceImageSeq = 0;
 
 function showVoiceSetup(steps) {
   voiceSetupSteps.value = steps;
@@ -1348,6 +1366,12 @@ function startCall() {
   voiceSetupOpen.value = false;
   voiceHistory = [];
   voiceConversationId = "";
+  // 新会话：上一通电话的图不能跟过来
+  dropAttach();
+  disposeShot();
+  voiceRequestId = "";
+  lastQuestionText = "";
+  lastTurnFailed = false;
   voiceQueue = [];
   voiceSpeaking = false;
   voiceStreamDone = true;
@@ -1938,7 +1962,8 @@ async function shootPhoto() {
       return;
     }
     closeCamera();
-    await attachImageBlob(blob, "jpg");
+    // 先出预览，用户点「用这张」才上传：拍糊了可以立刻重拍
+    showShot(blob, "jpg");
   } catch (e) {
     voiceCamError.value = "拍照失败：" + ((e && e.message) || "未知原因");
   }
@@ -1961,7 +1986,13 @@ function pickPhotoFile(capture) {
       return;
     }
     const ext = (f.name.split(".").pop() || "jpg").toLowerCase();
-    await attachImageBlob(f, /^(jpg|jpeg|png|webp)$/.test(ext) ? ext : "jpg");
+    const safeExt = /^(jpg|jpeg|png|webp)$/.test(ext) ? ext : "jpg";
+    try {
+      const out = await compressImage(f);
+      showShot(out.blob, out.ext || safeExt);
+    } catch (e) {
+      voiceError.value = "这张图片读不出来，换一张试试";
+    }
   };
   input.click();
 }
@@ -1977,63 +2008,158 @@ function useSystemCamera() {
   pickPhotoFile(true);
 }
 
-/* ── 随问附图：先上传拿 image_id，再随语音轮提交 ──────────── */
+/* ── 预览：拍完/选完先给用户看一眼，确认后才上传 ──────────── */
 
-function releaseAttach() {
-  const a = voiceAttach.value;
-  if (a && a.url) {
-    try {
-      URL.revokeObjectURL(a.url);
-    } catch (e) {}
-  }
-  voiceAttach.value = null;
+let attachRaw = null; // { blob, ext } 保留原始文件，上传失败重试不用重新拍
+
+function showShot(blob, ext) {
+  disposeShot();
+  camShot.value = {
+    url: URL.createObjectURL(blob),
+    blob,
+    ext: ext || "jpg",
+    bytes: blob.size,
+  };
 }
 
-function removeAttach() {
-  releaseAttach();
+function disposeShot() {
+  const s = camShot.value;
+  if (s && s.url) {
+    try {
+      URL.revokeObjectURL(s.url);
+    } catch (e) {}
+  }
+  camShot.value = null;
+}
+
+/** 重拍：丢掉预览，重新打开取景 */
+function retakeShot() {
+  disposeShot();
+  openInPageCamera();
+}
+
+/** 取消选图：什么都不上传，正常文字/语音交流不受影响 */
+function cancelShot() {
+  disposeShot();
   voiceError.value = "";
 }
 
-async function attachImageBlob(blob, ext) {
-  releaseAttach();
-  const seq = ++voiceImageSeq;
-  voiceAttach.value = {
-    id: "",
+/** 确认用这张：进入「已选中 → 上传中」 */
+async function confirmShot() {
+  const s = camShot.value;
+  if (!s) return;
+  const blob = s.blob,
+    ext = s.ext;
+  disposeShot();
+  await pickBlob(blob, ext);
+}
+
+/**
+ * 选图/拍照后的压缩：长边限 1600px，JPEG 0.86。
+ * 叶片病斑、虫体这些诊断细节靠像素，所以不做激进压缩，也不改长宽比。
+ * 解码失败（非图片/损坏文件）会抛错，由调用方提示换一张。
+ */
+async function compressImage(file) {
+  const type = file.type || "";
+  const extFromType = /png/.test(type) ? "png" : /webp/.test(type) ? "webp" : "jpg";
+  // 小图直接原样用，避免二次编码损失细节
+  if (file.size <= 900 * 1024 && /^image\/(jpeg|png|webp)$/.test(type))
+    return { blob: file, ext: extFromType };
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch (e) {
+    throw new Error("图片解码失败");
+  }
+  const w = bitmap.width,
+    h = bitmap.height;
+  const scale = Math.min(1, IMG_MAX_EDGE / Math.max(w, h));
+  const tw = Math.max(1, Math.round(w * scale)),
+    th = Math.max(1, Math.round(h * scale));
+  const cv = document.createElement("canvas");
+  cv.width = tw;
+  cv.height = th;
+  cv.getContext("2d").drawImage(bitmap, 0, 0, tw, th);
+  if (bitmap.close) bitmap.close();
+  const blob = await new Promise((resolve) =>
+    cv.toBlob(resolve, "image/jpeg", IMG_QUALITY),
+  );
+  if (!blob) throw new Error("图片处理失败");
+  return { blob, ext: "jpg" };
+}
+
+/* ── 随问附图：先上传拿 image_id，再随语音轮提交 ──────────── */
+
+/** 选中一张图 → 立即开始上传（状态机负责区分「已选中」和「服务器已接收」） */
+async function pickBlob(blob, ext) {
+  if (!/^image\//.test(blob.type || "image/jpeg")) {
+    voiceError.value = "这不是图片文件";
+    return;
+  }
+  if (blob.size > VOICE_IMAGE_MAX) {
+    voiceError.value = "图片太大，单张不能超过 8 MB";
+    return;
+  }
+  if (attach.value.url) dropAttach();
+  attachRaw = { blob, ext };
+  attach.value = Attach.pick(attach.value, {
     url: URL.createObjectURL(blob),
-    status: "uploading",
-    error: "",
-  };
-  voiceError.value = "正在看这张图…";
+    mime: blob.type || "image/jpeg",
+    bytes: blob.size,
+    at: Date.now(),
+  });
+  turnRefId.value = "";
+  voiceError.value = "";
+  await uploadAttach();
+}
+
+/**
+ * 上传。同一个 dedupKey 贯穿所有重试：
+ * 网络抖动导致重复提交时，服务端复用原图，不会重复落盘。
+ * 接口一次请求就完成「落盘 + 记录」，所以这里不显示百分比——不编造进度。
+ */
+async function uploadAttach() {
+  const raw = attachRaw;
+  const cur = attach.value;
+  if (!cur.url || !raw) {
+    voiceError.value = "这张图已失效，请重新拍照";
+    return;
+  }
+  attach.value = Attach.startUpload(attach.value);
+  if (attach.value.status !== Attach.ATTACH.UPLOADING) return;
+  const key = attach.value.dedupKey;
   const ac = new AbortController();
   const timer = window.setTimeout(() => ac.abort(), VOICE_UPLOAD_MS);
   try {
     const r = await fetch(
       "/api/v2/voice/image?ext=" +
-        encodeURIComponent(ext || "jpg") +
+        encodeURIComponent(raw.ext || "jpg") +
+        "&dedup_key=" +
+        encodeURIComponent(key) +
         (voiceConversationId
           ? "&conversation_id=" + encodeURIComponent(voiceConversationId)
           : ""),
       {
         method: "POST",
         headers: {
-          "Content-Type": blob.type || "image/jpeg",
+          "Content-Type": raw.blob.type || "image/jpeg",
           "X-Workbench": "1",
         },
-        body: blob,
+        body: raw.blob,
         signal: ac.signal,
       },
     );
     const j = await r.json().catch(() => ({}));
-    if (seq !== voiceImageSeq) return; // 已被更新的图取代
+    // 上传期间用户已经换了一张图 → 这次结果作废，不能盖到新图上
+    if (attach.value.dedupKey !== key) return;
     if (!r.ok) throw new Error(j.error || "上传失败");
-    voiceAttach.value = {
-      ...voiceAttach.value,
-      id: j.image_id || j.id || "",
-      status: "ready",
-    };
+    attach.value = Attach.uploadOk(attach.value, {
+      imageId: j.image_id || j.id || "",
+      duplicate: j.duplicate === true,
+    });
     voiceError.value = "";
   } catch (e) {
-    if (seq !== voiceImageSeq) return;
+    if (attach.value.dedupKey !== key) return;
     const aborted = e && (e.name === "AbortError" || /abort/i.test(e.message || ""));
     const offline = e && e.name === "TypeError";
     const msg = aborted
@@ -2041,17 +2167,79 @@ async function attachImageBlob(blob, ext) {
       : offline
         ? "网络中断，图片没传上去"
         : (e && e.message) || "上传失败";
-    if (voiceAttach.value) {
-      voiceAttach.value = { ...voiceAttach.value, status: "failed", error: msg };
-    }
+    attach.value = Attach.uploadFail(attach.value, msg);
     voiceError.value = msg;
+    // 失败保留待发送内容：图还在、问题还在，重试不会重复建轮次
   } finally {
     window.clearTimeout(timer);
   }
 }
 
-async function askStreaming(text, epoch = voiceEpoch) {
+function retryUploadAttach() {
+  voiceError.value = "";
+  uploadAttach();
+}
+
+/** 删除这张图：本地和状态一起清掉 */
+function dropAttach() {
+  const a = attach.value;
+  if (a && a.url) {
+    try {
+      URL.revokeObjectURL(a.url);
+    } catch (e) {}
+  }
+  attach.value = Attach.clear();
+  attachRaw = null;
+  turnRefId.value = "";
+}
+
+function removeAttach() {
+  dropAttach();
+  voiceError.value = "";
+}
+
+/** 等上传结束（最多 ms）：拿到 image_id 返回它，超时返回空串 */
+async function waitAttachUploaded(ms = 4000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (attach.value.id) return attach.value.id;
+    if (attach.value.status !== Attach.ATTACH.UPLOADING && attach.value.status !== Attach.ATTACH.PICKED)
+      return attach.value.id || "";
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  return attach.value.id || "";
+}
+
+/**
+ * 分析失败重试：复用同一 requestId + 同一张图，服务端按同一轮重跑。
+ * 这样历史里不会出现同一个问题两条记录。
+ */
+async function analyzeAgain() {
+  const a = attach.value;
+  if (!Attach.canRetryAnalysis(a)) return;
+  const text = voiceText.value || lastQuestionText;
+  if (!text) return;
+  voiceError.value = "";
+  voiceRequestId = a.requestId || newVoiceRequestId();
+  await askStreaming(text, voiceEpoch, { retry: true });
+}
+
+async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
   const rid = voiceRequestId || newVoiceRequestId();
+  voiceRequestId = rid; // 记下这一轮的编号：失败重试要复用它才不会多建一轮
+  // 本轮带不带图：只有拿到服务端 image_id 才能带。
+  // 还在上传就等一下；等不到就明说这一句先不带图，不假装图已经跟着发了。
+  let imageId = "";
+  if (attachCanSend.value) {
+    imageId = attach.value.id;
+  } else if (attach.value.status === Attach.ATTACH.UPLOADING) {
+    imageId = await waitAttachUploaded(4000);
+    if (!imageId)
+      voiceError.value = "图片还没传完，这一句先不带图；传好后可以再问一次";
+  }
+  const retry = opts.retry === true;
+  let finalStatus = "";
+  lastQuestionText = text;
   voiceState.value = "thinking";
   voicePhase.value = "queued";
   voiceAnswerText.value = "";
@@ -2077,8 +2265,9 @@ async function askStreaming(text, epoch = voiceEpoch) {
         conversation_id: voiceConversationId || undefined,
         domain: chosenDomain,
         // 附了照片：只带 image_id，图片本身已在 /voice/image 落盘
-        image_id:
-          voiceAttach.value && voiceAttach.value.id ? voiceAttach.value.id : undefined,
+        image_id: imageId || undefined,
+        // 失败重试：服务端按同一 request_id 重跑同一轮，不新建问题
+        retry: retry || undefined,
       }),
       signal: ac.signal,
     });
@@ -2086,7 +2275,12 @@ async function askStreaming(text, epoch = voiceEpoch) {
       const j = await res.json().catch(() => ({}));
       throw new Error(j.error || "服务返回 " + res.status);
     }
-    releaseAttach(); // 图已随本轮提交，不能跟着下一轮重复发送
+    // 图已随本轮提交 → 分析中。id 保留在状态里，追问时还能继续用同一张
+    if (imageId)
+      attach.value = Attach.beginAnalysis(attach.value, {
+        requestId: rid,
+        conversationId: voiceConversationId,
+      });
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -2109,11 +2303,24 @@ async function askStreaming(text, epoch = voiceEpoch) {
         }
         if (obj.type === "meta") {
           if (obj.conversation_id) voiceConversationId = obj.conversation_id;
-          if (obj.turn_id) voiceTurnId = obj.turn_id;
+          if (obj.turn_id) {
+            voiceTurnId = obj.turn_id;
+            if (attach.value.status === Attach.ATTACH.ANALYZING)
+              attach.value = Attach.beginAnalysis(attach.value, {
+                requestId: rid,
+                turnId: obj.turn_id,
+                conversationId: voiceConversationId,
+              });
+          }
+          // 服务端确认这一轮绑了哪张附件：界面显示"本轮引用"只用这个来源
+          if (obj.image_attachment_id !== undefined)
+            turnRefId.value = obj.image_attachment_id || "";
           continue;
         }
         if (obj.type === "phase") {
           voicePhase.value = obj.phase;
+          if (obj.image_attachment_id !== undefined)
+            turnRefId.value = obj.image_attachment_id || "";
           continue;
         }
         if (obj.error) throw new Error(obj.error);
@@ -2130,19 +2337,41 @@ async function askStreaming(text, epoch = voiceEpoch) {
             if (sentence) enqueueSpeech(sentence);
           }
         }
-        if (obj.done) voicePhase.value = obj.status || "completed";
+        if (obj.done) {
+          finalStatus = obj.status || "completed";
+          voicePhase.value = finalStatus;
+        }
       }
     }
     if (voiceInterrupted || epoch !== voiceEpoch) return;
     if (pending.trim()) enqueueSpeech(pending.trim());
+    // 这一轮收尾：只有正常结束才算「这张图分析完成」
+    if (imageId) {
+      if (finalStatus === "failed") {
+        attach.value = Attach.analysisFail(attach.value, "模型没有返回内容");
+        lastTurnFailed = true;
+      } else {
+        attach.value = Attach.analysisOk(attach.value);
+        lastTurnFailed = false;
+      }
+    } else {
+      lastTurnFailed = finalStatus === "failed";
+    }
     voiceHistory.push({ role: "user", content: text }, { role: "assistant", content: full });
     voiceHistory = voiceHistory.slice(-8);
     voiceStreamDone = true;
     refresh().catch(() => {});
     if (!voiceSpeaking && voiceQueue.length === 0) resumeListening();
   } catch (e) {
-    if (voiceInterrupted || ac.signal.aborted) return; // 主动打断不算失败
+    if (voiceInterrupted || ac.signal.aborted) {
+      // 用户主动打断/取消：不是失败，图还是好的，退回「服务器已收到」
+      attach.value = Attach.analysisCanceled(attach.value);
+      lastTurnFailed = false;
+      return;
+    }
     voiceError.value = e.message || "生成失败";
+    if (imageId) attach.value = Attach.analysisFail(attach.value, e.message || "生成失败");
+    lastTurnFailed = true;
     voiceState.value = "idle";
     voiceStreamDone = true;
   } finally {
@@ -2213,8 +2442,11 @@ function interruptVoice() {
 function retryAnswer() {
   if (!voiceText.value) return;
   voiceError.value = "";
-  voiceRequestId = newVoiceRequestId();
-  askStreaming(voiceText.value);
+  // 上一轮失败就复用同一 request_id（服务端按同一轮重跑，不新建问题）；
+  // 只有确实要换一轮时才申请新编号
+  const sameTurn = lastTurnFailed && Boolean(voiceRequestId);
+  if (!sameTurn) voiceRequestId = newVoiceRequestId();
+  askStreaming(voiceText.value, voiceEpoch, { retry: sameTurn });
 }
 
 function enqueueSpeech(text) {
@@ -2421,7 +2653,8 @@ function endCall() {
   voiceSpeaking = false;
   cleanupCapture();
   closeCamera();
-  releaseAttach();
+  disposeShot();
+  dropAttach();
   voiceSheetOpen.value = false;
   voicePaused.value = false;
   if (voiceHfRestart) {
@@ -4460,22 +4693,37 @@ onUnmounted(() => {
           <Radio :size="16" />{{ voiceHandsFree ? '免按键' : '按住' }}
         </button>
         <button
-          v-if="voiceAttach"
+          v-if="attach.url"
           type="button"
           class="voice-tool"
           @click="removeAttach"
-          title="移除这张图"
+          title="删除这张图"
         >
-          <X :size="16" />移除图片
+          <X :size="16" />删除图片
         </button>
       </div>
-      <div v-if="voiceAttach" class="voice-attach">
-        <img :src="voiceAttach.url" alt="这一轮的照片" />
-        <span v-if="voiceAttach.status === 'uploading'">正在上传，稍等一下…</span>
-        <span v-else-if="voiceAttach.status === 'failed'" class="err">
-          {{ voiceAttach.error || '上传失败' }}
-        </span>
-        <span v-else>图片已附上，提问时一起上传</span>
+      <!-- 附图：六态显式区分。缩略图只代表「本地有这张图」，不代表服务器收到了 -->
+      <div v-if="attach.url" class="voice-attach" :class="'tone-' + attachInfo.tone">
+        <img :src="attach.url" alt="这一轮的照片" />
+        <div class="voice-attach-meta">
+          <span class="voice-attach-state">{{ attachInfo.text }}</span>
+          <button
+            v-if="attachRetryUpload"
+            type="button"
+            class="voice-attach-retry"
+            @click="retryUploadAttach"
+          >
+            重试上传
+          </button>
+          <button
+            v-else-if="attachRetryAnalyze"
+            type="button"
+            class="voice-attach-retry"
+            @click="analyzeAgain"
+          >
+            重试分析
+          </button>
+        </div>
       </div>
       <button
         type="button"
@@ -4514,6 +4762,16 @@ onUnmounted(() => {
       </div>
       <div v-if="voiceAnswerText" class="voice-transcript answer">
         <span class="voice-role">回答</span>{{ voiceAnswerText }}
+      </div>
+      <!-- 本轮实际引用的是哪张图：以服务端回的附件编号为准 -->
+      <div v-if="voiceAnswerText && turnRefId" class="voice-ref">
+        <img
+          v-if="attach.id === turnRefId && attach.url"
+          :src="attach.url"
+          alt="本轮引用的照片"
+        />
+        <span v-if="attach.id === turnRefId">本轮引用了上面这张照片</span>
+        <span v-else>本轮引用了附件 {{ turnRefId.slice(0, 8) }}（当前夹带的是另一张）</span>
       </div>
       <p v-if="voiceError" class="voice-error">{{ voiceError }}</p>
       <button
@@ -4573,6 +4831,19 @@ onUnmounted(() => {
         </button>
       </div>
       <p v-if="voiceCamError" class="voice-cam-error">{{ voiceCamError }}</p>
+    </div>
+
+    <!-- 拍照/选图后的预览：先看清楚，再决定用这张、重拍还是取消 -->
+    <div v-if="camShot && !voiceCamOpen" class="voice-cam vc-preview">
+      <img :src="camShot.url" alt="待上传的照片预览" />
+      <div class="vc-preview-tip">看清楚了吗？确认后才会传到服务器</div>
+      <div class="voice-cam-bottom vc-preview-bar">
+        <button type="button" class="vc-preview-btn" @click="cancelShot">取消</button>
+        <button type="button" class="vc-preview-btn primary" @click="confirmShot">
+          用这张
+        </button>
+        <button type="button" class="vc-preview-btn" @click="retakeShot">重拍</button>
+      </div>
     </div>
 
     <!-- 图片来源选择 -->
@@ -5579,6 +5850,99 @@ a.text-button {
 }
 .voice-attach .err {
   color: #c0392b;
+}
+.voice-attach-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  max-width: 210px;
+  text-align: left;
+}
+.voice-attach-state {
+  line-height: 1.35;
+}
+.voice-attach.tone-warn .voice-attach-state {
+  color: #a06a00;
+}
+.voice-attach.tone-ok .voice-attach-state {
+  color: #1f7a5a;
+}
+.voice-attach.tone-busy .voice-attach-state {
+  color: #2c6fa6;
+}
+.voice-attach.tone-err .voice-attach-state {
+  color: #c0392b;
+}
+.voice-attach-retry {
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid #c8d5cf;
+  background: #fff;
+  color: #153e34;
+  font-size: 11px;
+}
+/* 本轮引用：服务端确认的附件 */
+.voice-ref {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: center;
+  margin: 2px auto 8px;
+  font-size: 11px;
+  color: #7a8a83;
+}
+.voice-ref img {
+  width: 26px;
+  height: 26px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid #d7e0db;
+}
+/* 拍照/选图预览 */
+.vc-preview img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+.vc-preview-tip {
+  position: absolute;
+  top: 64px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  color: #fff;
+  font-size: 13px;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+.vc-preview-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 26px;
+  display: flex;
+  justify-content: space-around;
+  align-items: center;
+  gap: 10px;
+  padding: 0 18px;
+}
+.vc-preview-btn {
+  flex: 1;
+  padding: 12px 6px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 15px;
+}
+.vc-preview-btn.primary {
+  background: #fff;
+  color: #153e34;
+  font-weight: 600;
+  border-color: #fff;
 }
 
 /* 页面内相机 */

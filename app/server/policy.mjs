@@ -123,9 +123,16 @@ export function createPolicy(filename) {
 
     const imageDefaultOk = enabled(r.image_default) && seesImage(r.image_default);
     const imageDeepOk = enabled(r.image_deep) && seesImage(r.image_deep);
-    // 默认走轻量视觉模型；只有深度问题 + 强模型真能看图时才升级
-    const imageRole =
-      deep && imageDeepOk ? r.image_deep : imageDefaultOk ? r.image_default : r.text_strong;
+    // 默认走轻量视觉模型；只有深度问题 + 强模型真能看图时才升级。
+    // 两个首选都不可用时，退回候选池里第一个「真能看图」的角色；
+    // 绝不退回纯文本角色 —— 那会把图片送进看不见它的模型，上游直接 500。
+    const imageRole = deep && imageDeepOk
+      ? r.image_deep
+      : imageDefaultOk
+        ? r.image_default
+        : imageRoles[0] || "";
+    // 有图但池子里一个能看图的都没有：调用方据此明确报错，不允许静默降级
+    const imageUnavailable = hasImage && imageRoles.length === 0;
 
     const fastOn = enabled(r.text_fast);
     const useFast = !hasImage && !deep && fastOn;
@@ -147,6 +154,7 @@ export function createPolicy(filename) {
       tier,
       imageRole,
       imageRoles,
+      imageUnavailable,
       useFast,
       planRole,
       pickedModel,

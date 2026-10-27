@@ -340,6 +340,8 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
           // 语音带图：先上传拿 image_id（推荐），也兼容内联 base64 的旧调用
           image: body.image,
           image_id: body.image_id,
+          // 失败重试：同一 request_id 重跑同一轮，不新建轮次
+          retry: body.retry === true,
         });
       } catch (e) {
         json(res, e.status || 400, { error: e.message || "创建失败" });
@@ -369,6 +371,10 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
         turn_id: turnId,
         status: "queued",
         source: "voice",
+        // 服务端确认这一轮绑了哪张附件：前端据此显示"本轮引用"，不靠本地残留
+        image_attachment_id:
+          (created.turn && created.turn.image && created.turn.image.attachment_id) || "",
+        duplicate: created.duplicate === true,
       });
 
       // 不再在这里直连 3B：统一编排在后台队列里生成，这里只追读并转发增量。
@@ -395,7 +401,15 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
             : v.status;
         if (phase !== lastPhase) {
           lastPhase = phase;
-          send({ type: "phase", phase, refs: v.refs });
+          send({
+            type: "phase",
+            phase,
+            refs: v.refs,
+            // 每一阶段都带上"这轮看的是哪张图"，前端不会把上一轮的图错认成本轮
+            image_attachment_id: v.image_attachment_id || "",
+            has_image: v.has_image === true,
+            role: v.role || "",
+          });
         }
         if (TERMINAL.includes(v.status)) {
           // 终态再读一次：候选文本与状态可能相差一个落盘周期，尾部不能丢
