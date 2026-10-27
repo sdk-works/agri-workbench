@@ -1,5 +1,7 @@
 import http from "node:http";
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /**
  * 语音增强路由（挂在 /api/v2/voice/*）
  *  - GET  /status  语音服务健康
@@ -179,6 +181,33 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
       return true;
     }
 
+    // 读取本轮引用的图片：只允许上传者本人访问（跨用户一律 404，不暴露是否存在）
+    if (
+      req.method === "GET" &&
+      url.pathname.startsWith("/api/v2/voice/image/")
+    ) {
+      const id = url.pathname.slice("/api/v2/voice/image/".length).split("/")[0];
+      const user = await currentUser(req);
+      if (!user) {
+        json(res, 401, { error: "请先登录" });
+        return true;
+      }
+      try {
+        const img = await workspace.loadVoiceImage(user, id);
+        const buf = Buffer.from(img.data, "base64");
+        res.writeHead(200, {
+          "Content-Type": img.mime,
+          "Content-Length": buf.length,
+          "Cache-Control": "private, max-age=600",
+          "X-Content-Type-Options": "nosniff",
+        });
+        res.end(buf);
+      } catch (e) {
+        json(res, e.status || 404, { error: e.message || "图片不存在" });
+      }
+      return true;
+    }
+
     if (req.method !== "POST") {
       json(res, 405, { error: "方法不支持" });
       return true;
@@ -189,6 +218,38 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
         json(res, 401, { error: "请先登录" });
         return true;
       }
+    }
+
+    // 图片先上传：返回 image_id（真实落盘 + 归属记录），随后 /turn 只带这个 id
+    if (url.pathname === "/api/v2/voice/image") {
+      const user = await currentUser(req);
+      if (!user) {
+        json(res, 401, { error: "请先登录" });
+        return true;
+      }
+      const image = await readRaw(req);
+      if (!image.length) {
+        json(res, 400, { error: "没有收到图片" });
+        return true;
+      }
+      const ext =
+        String(url.searchParams.get("ext") || "jpg")
+          .toLowerCase()
+          .replace(/[^a-z]/g, "") || "jpg";
+      try {
+        const out = await workspace.saveVoiceImage(user, {
+          buffer: image,
+          mime: String(req.headers["content-type"] || "").split(";")[0].trim(),
+          ext,
+          conversation_id: String(url.searchParams.get("conversation_id") || ""),
+          // 重试/抖动去重：同一键同一用户且该图尚未被引用时复用原图，避免重复落盘
+          dedup_key: url.searchParams.get("dedup_key"),
+        });
+        json(res, 201, out);
+      } catch (e) {
+        json(res, e.status || 400, { error: e.message || "上传失败" });
+      }
+      return true;
     }
 
     if (url.pathname === "/api/v2/voice/asr") {
@@ -276,6 +337,9 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
           question,
           conversation_id: body.conversation_id || undefined,
           domain: body.domain,
+          // 语音带图：先上传拿 image_id（推荐），也兼容内联 base64 的旧调用
+          image: body.image,
+          image_id: body.image_id,
         });
       } catch (e) {
         json(res, e.status || 400, { error: e.message || "创建失败" });
@@ -298,62 +362,61 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
         ac.abort();
       });
 
-      const turn = created.turn;
+      const turnId = created.turn_id || created.turn.id;
       send({
         type: "meta",
         conversation_id: created.conversation_id,
-        turn_id: turn.id,
-        status: turn.status,
+        turn_id: turnId,
+        status: "queued",
+        source: "voice",
       });
 
-      // 幂等：同一请求编号重试时回放已有结果，不重复生成
-      if (created.duplicate) {
-        const text =
-          (turn.candidates && turn.candidates[0] && turn.candidates[0].text) ||
-          "";
-        if (turn.status === "generating") {
-          send({ error: "上一轮仍在生成，请稍后", code: "generating" });
-        } else {
-          if (text) send({ delta: text });
-          send({ done: true, status: turn.status });
+      // 不再在这里直连 3B：统一编排在后台队列里生成，这里只追读并转发增量。
+      // 好处：知识检索、权限、上下文、模型路由、取消语义与文字问答完全一致。
+      let sent = 0;
+      let lastPhase = "";
+      let finalStatus = "";
+      const TERMINAL = ["completed", "partial", "failed", "canceled"];
+      while (open && !ac.signal.aborted) {
+        const v = await workspace.voiceTurnView(user, turnId);
+        if (!v) {
+          send({ error: "问答不存在" });
+          break;
         }
-        open = false;
-        res.end();
-        return true;
-      }
-
-      let text = "";
-      try {
-        // 语音只走 3B 单答案，不回退 27B，避免共享模型时反复切换
-        await streamOllama(
-          created.messages,
-          (delta) => {
-            text += delta;
-            send({ delta });
-          },
-          ac.signal,
-        );
-        await workspace.finishVoiceTurn(user, turn.id, {
-          status: "completed",
-          text,
-        });
-        send({ done: true, status: "completed" });
-      } catch (e) {
-        if (ac.signal.aborted) {
-          await workspace.finishVoiceTurn(user, turn.id, {
-            status: "canceled",
-            text,
-            reason: "client_aborted",
-          });
-        } else {
-          await workspace.finishVoiceTurn(user, turn.id, {
-            status: "failed",
-            text,
-            error: e.message || "生成失败",
-          });
-          send({ error: e.message || "生成失败", code: e.code });
+        if (v.text.length > sent) {
+          send({ delta: v.text.slice(sent) });
+          sent = v.text.length;
         }
+        const phase =
+          v.status === "generating"
+            ? v.candidate_status === "generating"
+              ? "generating"
+              : "queued"
+            : v.status;
+        if (phase !== lastPhase) {
+          lastPhase = phase;
+          send({ type: "phase", phase, refs: v.refs });
+        }
+        if (TERMINAL.includes(v.status)) {
+          // 终态再读一次：候选文本与状态可能相差一个落盘周期，尾部不能丢
+          const fin = await workspace.voiceTurnView(user, turnId);
+          if (fin && fin.text.length > sent) {
+            send({ delta: fin.text.slice(sent) });
+            sent = fin.text.length;
+          }
+          finalStatus = v.status;
+          if (v.status === "failed" && fin && fin.error) send({ error: fin.error });
+          break;
+        }
+        await sleep(120);
       }
+      // 客户端先断开时不在这里取消：生成继续落库，避免误杀（与图片取消同一教训）
+      send({
+        done: true,
+        status: finalStatus || "aborted",
+        turn_id: turnId,
+        aborted: ac.signal.aborted,
+      });
       open = false;
       res.end();
       return true;

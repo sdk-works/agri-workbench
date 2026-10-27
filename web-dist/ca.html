@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="robots" content="noindex,nofollow" />
+    <title>安装京阳本地根证书</title>
+    <style>
+      :root { color-scheme: light; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; padding: 20px 16px 48px;
+        font: 15px/1.7 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+        background: #f5f7f5; color: #1e2a24;
+      }
+      main { max-width: 560px; margin: 0 auto; }
+      h1 { font-size: 19px; margin: 0 0 6px; }
+      p.lead { margin: 0 0 18px; color: #5b6b62; font-size: 13.5px; }
+      .card {
+        background: #fff; border: 1px solid #dfe6e1; border-radius: 14px;
+        padding: 16px 16px 14px; margin-bottom: 14px;
+      }
+      h2 { font-size: 15px; margin: 0 0 8px; color: #12603e; }
+      ol { margin: 0; padding-left: 20px; }
+      li { margin: 4px 0; }
+      a.btn {
+        display: block; text-align: center; text-decoration: none;
+        background: #12603e; color: #fff; font-weight: 600;
+        padding: 13px; border-radius: 12px; margin: 4px 0 10px;
+      }
+      code { background: #eef3f0; padding: 1px 5px; border-radius: 5px; font-size: 13px; }
+      pre.fp {
+        margin: 6px 0 0; padding: 10px 12px; background: #f2f5f3;
+        border: 1px solid #dfe6e1; border-radius: 10px;
+        font: 12.5px/1.6 ui-monospace, Menlo, Consolas, monospace;
+        word-break: break-all; color: #26403a;
+      }
+      .warn { color: #8a5a00; background: #fff8e6; border-color: #f0e0b8; }
+      .stop { color: #8a1f1f; background: #fdf0f0; border-color: #f2d0d0; }
+      .muted { color: #6b7b71; font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>安装京阳本地根证书</h1>
+      <p class="lead">
+        装一次即可。装好后手机浏览器才认 <code>https://42.193.104.148</code>
+        （备用端口 <code>:8443</code> 与局域网 <code>https://192.168.0.141:8543</code>），
+        麦克风和相机才被允许使用。
+      </p>
+
+      <a class="btn" href="./jingyang-ca.crt" download="jingyang-ca.crt">下载证书 jingyang-ca.crt</a>
+
+      <div class="card">
+        <h2>先核对指纹（重要）</h2>
+        <p class="muted" style="margin:0 0 6px">
+          本页走的是明文 HTTP，下载过程本身没有加密保护。请通过另一条渠道（当面或管理人员口头/书面告知）
+          核对此证书的 SHA-256 指纹，一致再安装。
+        </p>
+        <pre class="fp">F1:05:94:66:61:24:FB:92:17:6C:9B:69:BF:06:19:A8:24:73:E8:24:C1:E3:B3:44:52:32:1F:9E:45:9A:97:CE</pre>
+        <p class="muted" style="margin:8px 0 0">
+          安卓：设置 → 安全 → 加密与凭据 → 信任的凭据 → 查看，可对照指纹。<br />
+          iOS：安装后到「证书信任设置」页，底部可查看证书详情。
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>安卓（Chrome / Edge）</h2>
+        <ol>
+          <li>先点上面的按钮下载证书。</li>
+          <li>打开「设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书」。</li>
+          <li>提示风险时选「仍然安装」，选中刚下载的 <code>jingyang-ca.crt</code>。</li>
+          <li>回浏览器刷新页面，地址栏不再报证书错误即可。</li>
+        </ol>
+      </div>
+
+      <div class="card">
+        <h2>iPhone / iPad（Safari）</h2>
+        <ol>
+          <li>点上面的按钮，选「允许」下载描述文件。</li>
+          <li>「设置 → 已下载描述文件 → 安装」。</li>
+          <li>再到「设置 → 通用 → 关于本机 → 证书信任设置」，把
+            <code>Jingyang Local Root CA</code> 的开关打开。</li>
+        </ol>
+      </div>
+
+      <div class="card warn">
+        <h2>装完后还进不去？</h2>
+        <ol>
+          <li>确认地址是 <code>https://</code> 开头。业务只走 <code>443</code> 和 <code>8443</code>。</li>
+          <li><code>18099</code> 只是这个证书下载页，打不开业务功能，别在那里登录。</li>
+          <li>确认手输的是 <code>42.193.104.148</code>，不要带 <code>www</code>。</li>
+          <li>还是不行就把报错截图发我，我在服务器侧看隧道日志。</li>
+        </ol>
+      </div>
+
+      <div class="card stop">
+        <h2>这套方案的可信边界</h2>
+        <p class="muted" style="margin:0">
+          只有「手动安装了本页根证书」的设备，才会把我们的 HTTPS 入口视为可信。
+          没装证书的手机仍然会报「证书不受信任」——这不是故障，是设计如此：
+          我们用的是自建私有 CA，不是公网受认可的 CA。
+        </p>
+      </div>
+
+      <p class="muted">
+        这张证书只对京阳自己的服务器起作用，别拿它去装别的用途；浏览器仍会对其它网站正常校验证书。
+      </p>
+    </main>
+  </body>
+</html>

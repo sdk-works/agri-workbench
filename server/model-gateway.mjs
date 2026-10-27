@@ -18,6 +18,9 @@ export function createGateway(
   } = {},
 ) {
   const limiter = createResourceLimiter();
+  // 429 冷却：同一上游资源在 Retry-After 期间直接拒绝，不再打上游（避免重试风暴）
+  const cooldowns = new Map();
+  const MAX_RETRY_AFTER_MS = 10 * 60 * 1000;
   const initial = {
     local: {
       adapter: "ollama",
@@ -164,6 +167,12 @@ export function createGateway(
     // 按实际上游资源归组限流（同一 Ollama/API 实例共享额度，含裁判/回退/候选生成）
     const resKey = local ? "local" : c.base_url;
     const resLimit = local ? limits.localConcurrency : limits.cloudConcurrency;
+    const cd = cooldowns.get(resKey) || 0;
+    if (cd > Date.now())
+      throw Object.assign(Error("模型服务限流冷却中"), {
+        code: "rate_limited",
+        retry_after_ms: cd - Date.now(),
+      });
     let release, execSignal;
     try {
       // 排队等待只监听外部取消（用户可取消排队）；执行时限在取得额度后再启动，
@@ -181,6 +190,12 @@ export function createGateway(
       if (execSignal?.aborted)
         throw Object.assign(Error("模型请求超时"), { code: "timeout" });
       if (e.code && e.code !== "network") throw e;
+      // 网络类错误保留原因码（ECONNRESET 等），便于定位而不是统一"连接失败"
+      if (e.code === "network" && e.cause_code)
+        throw Object.assign(Error(e.message), {
+          code: "network",
+          cause_code: e.cause_code,
+        });
       if (/timeout/i.test(e.name) || e.name === "TimeoutError")
         throw Object.assign(Error("模型请求超时"), { code: "timeout" });
       throw Object.assign(Error("模型连接失败"), { code: "network" });
@@ -206,34 +221,72 @@ export function createGateway(
           stream,
           ...(effort ? { reasoning_effort: effort } : {}),
         };
+    const url =
+      c.base_url.replace(/\/$/, "") + (local ? "/api/chat" : "/chat/completions");
+    const init = {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(c.api_key ? { Authorization: `Bearer ${c.api_key}` } : {}),
+      },
+      body: JSON.stringify(payload),
+      signal: execSignal,
+      redirect: "error",
+    };
+    // 传输分类：只有"连接根本没建立"（UND_ERR_CONNECT_TIMEOUT）可以安全重试一次；
+    // ECONNRESET / 读中断属于语义不确定，绝不重放，避免重复计费或重复回答。
     let res;
     try {
-      res = await fetcher(
-        c.base_url.replace(/\/$/, "") +
-          (local ? "/api/chat" : "/chat/completions"),
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(c.api_key ? { Authorization: `Bearer ${c.api_key}` } : {}),
-          },
-          body: JSON.stringify(payload),
-          signal: execSignal,
-          redirect: "error",
-        },
-      );
+      res = await fetcher(url, init);
     } catch (e) {
-      throw e; // 取消/超时/网络分类统一在外层进行
+      const cc = e?.cause?.code || e?.code || "";
+      // 已取消 / 已超时：不得重试（用户已经放弃这一轮，重发只会白烧算力）
+      const aborted = Boolean(opts.signal?.aborted || execSignal?.aborted);
+      if (cc === "UND_ERR_CONNECT_TIMEOUT" && !aborted) {
+        res = await fetcher(url, init);
+      } else {
+        throw Object.assign(Error(`模型连接失败（${cc || e.message}）`), {
+          code: "network",
+          cause_code: cc,
+        });
+      }
     }
-    if (!res.ok)
-      throw Object.assign(Error(`模型服务 HTTP ${res.status}`), {
-        code:
-          res.status === 429
-            ? "rate_limited"
-            : res.status >= 500
-              ? "upstream_error"
-              : "configuration",
+    if (!res.ok) {
+      const status = res.status;
+      if (status === 429) {
+        let providerCode = null;
+        try {
+          if (typeof res.json === "function") {
+            const body = await res.json();
+            providerCode = body?.error?.code ?? null;
+          }
+        } catch {}
+        // 未消费的响应体必须释放（只 cancel 一次），否则连接不回收
+        try {
+          await res.body?.cancel?.();
+        } catch {}
+        const raSec = Number(res.headers?.get?.("retry-after") ?? 0);
+        const waitMs = Math.min(Math.max(raSec * 1000, 1000), MAX_RETRY_AFTER_MS);
+        cooldowns.set(resKey, Date.now() + waitMs);
+        // 厂商码区分：1305 是并发/频率限流；1113、insufficient_quota 是额度或配置问题
+        if (providerCode === "1113" || providerCode === "insufficient_quota")
+          throw Object.assign(Error(`模型额度或配置不可用（${providerCode}）`), {
+            code: "configuration",
+            provider_code: providerCode,
+          });
+        throw Object.assign(
+          Error(
+            `模型服务限流（${providerCode ? providerCode + "，" : ""}${Math.round(
+              waitMs / 1000,
+            )}s 后重试）`,
+          ),
+          { code: "rate_limited", retry_after_ms: waitMs, provider_code: providerCode },
+        );
+      }
+      throw Object.assign(Error(`模型服务 HTTP ${status}`), {
+        code: status >= 500 ? "upstream_error" : "configuration",
       });
+    }
     if (stream) {
       const reader = res.body && typeof res.body.getReader === "function" ? res.body.getReader() : null;
       if (!reader)
@@ -304,7 +357,13 @@ export function createGateway(
         if (buf.trim()) handleLine(buf);
         buf = "";
       } catch (e) {
-        throw e; // 分类统一在外层
+        // 用户取消 / 整体超时交给外层；其余读中断必须标记为 stream_interrupted，
+        // 且保留已经 onToken 出去的内容，不允许自动重放整轮
+        if (opts.signal?.aborted || execSignal?.aborted) throw e;
+        throw Object.assign(Error("模型流式响应中断"), {
+          code: "stream_interrupted",
+          partial: text,
+        });
       }
       if (sawError)
         throw Object.assign(Error(`模型返回错误：${sawError}`), { code: "upstream_error" });
@@ -448,5 +507,8 @@ export function createGateway(
       Boolean(config[role].base_url) &&
       Boolean(config[role].model) &&
       (config[role].adapter === "ollama" || Boolean(config[role].api_key)),
+    // 视觉能力必须由配置显式声明：带图请求只允许进这些角色，避免静默退回纯文本模型
+    roleSupportsImage: (role) =>
+      Boolean(config[role]) && config[role].supports_image === true,
   };
 }

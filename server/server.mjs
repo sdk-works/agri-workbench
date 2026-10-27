@@ -89,6 +89,7 @@ const server = http.createServer(async (req, res) => {
     if (
       req.method === "POST" &&
       !url.pathname.startsWith("/api/v2/voice/asr") &&
+      !url.pathname.startsWith("/api/v2/voice/image") &&
       !String(req.headers["content-type"] || "").startsWith("application/json")
     )
       return json(res, 415, { error: "需要 application/json" });

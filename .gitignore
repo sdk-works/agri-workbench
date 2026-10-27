@@ -33,3 +33,8 @@ models/
 android/**/build/
 android/**/.gradle/
 android/local.properties
+
+# 手工备份文件（含内网路径与历史副本，禁止入库）
+*.bak
+*.bak.*
+.bak/

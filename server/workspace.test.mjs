@@ -213,10 +213,13 @@ test("failed cloud judge is visible to admin, never auto-approves or blocks next
   const turn = await f.turn(a.cookie);
   await f.ws.tick("judge");
   const stored = await f.repo.get("turns", turn.id);
-  assert.equal(stored.judge.status, "failed");
+  assert.equal(stored.judge.status, "queued");
   assert.equal((await f.repo.list("reviews")).length, 0);
   const j = (await f.repo.list("jobs")).find((j) => j.type === "judge");
-  assert.equal(j.status, "failed");
+  assert.equal(j.status, "queued");
+  assert(j.next_at > Date.now());
+  j.status = "failed";
+  await f.repo.put("jobs", j);
   assert.equal(
     (await f.request(`/jobs/${j.id}/retry`, {}, a.cookie)).status,
     403,
@@ -372,7 +375,7 @@ test("gateway routes independent cloud judge, masks keys, validates structure an
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agri-gateway-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const calls = [];
-  const parsed = { ...result() };
+  const parsed = { difference_level: "none", reason: "结论相同", differences: [] };
   for (const side of ["a", "b"])
     for (const dim of ["accuracy", "completeness", "actionable", "concise"])
       parsed[`${side}_${dim}`] = 4;
@@ -657,7 +660,9 @@ test("image question passes image to the gateway and hides base64 from clients",
   );
   assert.equal(out.status, 202);
   await f.ws.tick("generate");
-  assert.equal(captured.length, 2);
+  // 带图只走一个视觉候选：不并发 27B+7B，也不经 cloud 静默退成纯文本
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].role, "vision");
   for (const c of captured) {
     assert.equal(c.images.length, 1);
     assert.equal(c.images[0].mime, "image/png");

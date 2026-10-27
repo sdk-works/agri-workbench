@@ -29,6 +29,8 @@ export const kinds = [
   "image_jobs",
   "departments",
   "entries",
+  // 会话图片：先上传拿 image_id，再随语音轮提交；按 tenant/owner 隔离
+  "voice_images",
 ];
 export async function openRepository({ filename, databaseUrl }) {
   const pool = databaseUrl

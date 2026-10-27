@@ -27,7 +27,7 @@ export const result = () => ({
 });
 export async function fixture(
   t,
-  { judge = async () => result(), call: generate, disabled = [] } = {},
+  { judge = async () => result(), call: generate, disabled = [], visionRoles = ["vision", "local"] } = {},
 ) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agri-v3-")),
     repo = await openRepository({
@@ -42,6 +42,8 @@ export async function fixture(
     fallbackEnabled: () => false,
     judge,
     roleEnabled: (role) => !disabled.includes(role),
+    // 测试里把 vision / local 当作「声明支持看图」，用来验证带图不会静默退纯文本
+    roleSupportsImage: (role) => visionRoles.includes(role),
     modelFor: (role) =>
       role === "fast" ? "qwen3:30b-a3b-bench" : role + "-model",
     call:

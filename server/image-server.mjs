@@ -5,6 +5,13 @@ import { digest } from "./documents.mjs";
 
 // 尺寸白名单：固定预设，不向员工暴露任意分辨率
 const SIZES = new Set([768, 1024]);
+// 出图任务最长存活：超过即判失败，避免 ComfyUI 丢失任务时永久"排队中"
+const STALE_TASK_MS = 15 * 60 * 1000;
+// 对账与调用的边界：列表接口必须"快且不放大"，否则前端每 3s 轮询会把压力传给 ComfyUI
+const COMFY_TIMEOUT_MS = 30_000; // 创建任务（POST /prompt）单次上限
+const SYNC_QUERY_TIMEOUT_MS = 1_200; // 列表对账单次查询上限
+const SYNC_MAX_PER_REQ = 5; // 单次列表最多对账几个任务
+const CREATE_DEDUPE_MS = 10_000; // 同 prompt+尺寸 10s 内复用（防双击/连点产生多个任务）
 const now = () => new Date().toISOString();
 const fail = (message, status = 400) => {
   throw Object.assign(Error(message), { status });
@@ -35,12 +42,22 @@ export function createImageServer({ repo, env, json, readBody }) {
     return u;
   }
 
-  async function comfy(method, p, body) {
-    const res = await fetch(comfyUrl + p, {
-      method,
-      headers: { "Content-Type": "application/json" },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    });
+  async function comfy(method, p, body, opts = {}) {
+    const timeoutMs = Number(opts.timeoutMs) || COMFY_TIMEOUT_MS;
+    let res;
+    try {
+      res = await fetch(comfyUrl + p, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (e) {
+      const timedOut = e?.name === "TimeoutError" || e?.name === "AbortError";
+      throw Object.assign(Error(timedOut ? "出图服务超时" : "出图服务不可达"), {
+        code: timedOut ? "timeout" : "network",
+      });
+    }
     const raw = await res.text();
     let data = null;
     try {
@@ -68,12 +85,35 @@ export function createImageServer({ repo, env, json, readBody }) {
     };
   }
 
-  // 用 ComfyUI history 同步单个任务状态，并回写数据库
-  async function syncTask(t) {
+  // 对账轮转游标：跨请求推进，避免活跃任务多时只有前几个被反复对账
+  let syncCursor = 0;
+
+  // 终态不可被旧结果覆盖：并发/迟到的对账结果不得回滚已完成或已失败的任务
+  async function putIfNotTerminal(rec) {
+    const cur = await repo.get("image_jobs", rec.id);
+    if (cur && ["completed", "failed", "cancelled"].includes(cur.status)) return cur;
+    await repo.put("image_jobs", rec);
+    return rec;
+  }
+
+  // 并发幂等：同一任务在多个请求里同时需要同步时，只查一次 ComfyUI、只写一次库
+  const syncInflight = new Map();
+  function syncTask(t) {
     if (!t.comfy_prompt_id || ["completed", "failed", "cancelled"].includes(t.status))
-      return t;
+      return Promise.resolve(t);
+    const inflight = syncInflight.get(t.id);
+    if (inflight) return inflight;
+    const task = syncTaskOnce(t).finally(() => syncInflight.delete(t.id));
+    syncInflight.set(t.id, task);
+    return task;
+  }
+
+  // 用 ComfyUI history 同步单个任务状态，并回写数据库
+  async function syncTaskOnce(t) {
     try {
-      const d = await comfy("GET", "/history/" + t.comfy_prompt_id);
+      const d = await comfy("GET", "/history/" + t.comfy_prompt_id, undefined, {
+        timeoutMs: SYNC_QUERY_TIMEOUT_MS,
+      });
       const h = d?.[t.comfy_prompt_id];
       if (!h) return t; // 仍在排队或未知
       const st = h.status || {};
@@ -89,18 +129,15 @@ export function createImageServer({ repo, env, json, readBody }) {
           }
         }
         const rec = { ...t, status: "completed", filename, completed_at: now(), error: "" };
-        await repo.put("image_jobs", rec);
-        return rec;
+        return putIfNotTerminal(rec);
       }
       if (st.status_str && st.status_str !== "success") {
         const rec = { ...t, status: "failed", error: st.status_str || "failed", completed_at: now() };
-        await repo.put("image_jobs", rec);
-        return rec;
+        return putIfNotTerminal(rec);
       }
       if (t.status === "queued") {
         const rec = { ...t, status: "running" };
-        await repo.put("image_jobs", rec);
-        return rec;
+        return putIfNotTerminal(rec);
       }
       return t;
     } catch {
@@ -134,6 +171,19 @@ export function createImageServer({ repo, env, json, readBody }) {
       error: "",
       completed_at: "",
     };
+    // 幂等：同一用户、同 prompt、同尺寸，10s 内已有进行中的任务 → 直接复用（防双击）
+    const recent = (await repo.list("image_jobs", { owner: u.id }))
+      .filter(
+        (t) =>
+          t.prompt === p &&
+          t.width === size &&
+          t.height === size &&
+          ["queued", "running"].includes(t.status) &&
+          Date.now() - Date.parse(t.created_at || "") < CREATE_DEDUPE_MS,
+      )
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+    if (recent) return { ...recent, deduped: true };
+
     await repo.put("image_jobs", task); // 先落库，任务不丢
     try {
       const r = await comfy("POST", "/prompt", buildWorkflow(p, size, seed));
@@ -170,6 +220,56 @@ export function createImageServer({ repo, env, json, readBody }) {
     if (routePath === "/images/tasks" && method === "GET") {
       const u = await requireUser(req);
       const items = await repo.list("image_jobs", { owner: u.id });
+      // 前端只轮询列表接口；此处若不与 ComfyUI 对账，任务会永远停在上次写入的状态。
+      // 实测：ComfyUI 6.08s 出图完成、队列已空，平台任务仍为 queued，页面一直"排队中"。
+      // 限流：单次请求最多对账 SYNC_MAX_PER_REQ 个；每个查询 SYNC_QUERY_TIMEOUT_MS 超时；
+      // 整体用 allSettled，任何一个失败都不影响列表返回（前端 3s 一轮，不能放大成风暴）
+      // 公平性：不能用固定切片（否则永远只对账前 N 个，后面的任务被饿死——已实测 5 轮只覆盖 5/12）。
+      // 用轮转游标，保证多轮轮询覆盖到全部活跃任务。
+      const activeAll = items.filter(
+        (t) => t.comfy_prompt_id && ["queued", "running"].includes(t.status),
+      );
+      const take = Math.min(SYNC_MAX_PER_REQ, activeAll.length);
+      const active = activeAll.length
+        ? Array.from({ length: take }, (_, k) => activeAll[(syncCursor + k) % activeAll.length])
+        : [];
+      if (activeAll.length) syncCursor = (syncCursor + take) % activeAll.length;
+      if (active.length) {
+        const settled = await Promise.allSettled(active.map((t) => syncTask(t)));
+        const byId = new Map();
+        for (const r of settled) if (r.status === "fulfilled" && r.value) byId.set(r.value.id, r.value);
+        for (let i = 0; i < items.length; i += 1)
+          items[i] = byId.get(items[i].id) || items[i];
+      }
+      // 兜底：ComfyUI 重启/清库导致任务号丢失时，不能永久 queued
+      for (let i = 0; i < items.length; i += 1) {
+        const t = items[i];
+        if (!["queued", "running"].includes(t.status)) continue;
+        const created = Date.parse(t.created_at || "");
+        if (Number.isFinite(created) && Date.now() - created > STALE_TASK_MS) {
+          // 后台任务处置：先尝试把 ComfyUI 里可能还在跑的任务删掉，避免白占显存；
+          // 取消失败不影响判定（可能已经跑完或已被清理）
+          let cancelAttempted = false;
+          let cancelOk = false;
+          if (t.comfy_prompt_id) {
+            cancelAttempted = true;
+            try {
+              await comfy("POST", "/queue", { delete: [t.comfy_prompt_id] });
+              cancelOk = true;
+            } catch {}
+          }
+          const rec = {
+            ...t,
+            status: "failed",
+            error: "出图超时（服务端未返回结果），请重试",
+            completed_at: now(),
+            cancel_attempted: cancelAttempted,
+            cancel_ok: cancelOk,
+          };
+          const saved = await putIfNotTerminal(rec);
+          items[i] = saved;
+        }
+      }
       return send({ items });
     }
 
@@ -188,21 +288,66 @@ export function createImageServer({ repo, env, json, readBody }) {
       const t = await repo.get("image_jobs", mc[1]);
       if (!t) fail("任务不存在", 404);
       if (t.user_id !== u.id) fail("无权操作", 403);
-      let cancelled = false;
-      if (t.comfy_prompt_id && ["queued", "running"].includes(t.status)) {
+
+      // 1) 已是终态：绝不"假取消"。已完成的任务被打成 cancelled 会让用户以为图没了。
+      if (["completed", "failed", "cancelled"].includes(t.status))
+        return send({ task: t, cancelled: false, reason: "already_finished" });
+
+      // 2) 只按单个 prompt 删除排队项，绝不使用全局 /interrupt（会打断别人的任务）
+      let removed = false;
+      let cancelError = "";
+      if (!t.comfy_prompt_id) {
+        cancelError = "任务尚未提交到出图服务";
+      } else {
         try {
-          await comfy("POST", "/api/jobs/" + t.comfy_prompt_id + "/cancel", {});
-          cancelled = true;
-        } catch {}
+          await comfy("POST", "/queue", { delete: [t.comfy_prompt_id] });
+          removed = true;
+        } catch (e) {
+          cancelError = e.message || "取消失败";
+        }
       }
+
+      // 3) 删除请求成功不代表真的停了：正在采样中的任务不会被 delete 影响，
+      //    必须回查队列，确认真实状态，避免"显示已取消、其实还在跑"。
+      if (removed) {
+        let stillRunning = false;
+        try {
+          const q = await comfy("GET", "/queue");
+          const ids = [
+            ...(q?.queue_running || []).map((x) => x?.[1]),
+            ...(q?.queue_pending || []).map((x) => x?.[1]),
+          ].filter(Boolean);
+          stillRunning = ids.includes(t.comfy_prompt_id);
+        } catch {
+          stillRunning = true; // 查不到就不敢宣称已取消
+        }
+        if (stillRunning) {
+          removed = false;
+          cancelError = "任务已开始生成，无法中断（不执行全局中断以免影响其他任务）";
+        }
+      }
+
+      if (removed) {
+        const rec = {
+          ...t,
+          status: "cancelled",
+          completed_at: now(),
+          error: "",
+          cancel_attempted: true,
+          cancel_ok: true,
+        };
+        return send({ task: await putIfNotTerminal(rec), cancelled: true });
+      }
+
+      // 4) 取消失败：保持真实状态（queued/running），只记录取消尝试，页面照实展示
       const rec = {
         ...t,
-        status: "cancelled",
-        completed_at: now(),
-        error: cancelled ? "" : "取消失败或任务已完成",
+        cancel_attempted: true,
+        cancel_ok: false,
+        cancel_error: cancelError,
       };
       await repo.put("image_jobs", rec);
-      return send({ task: rec, cancelled });
+      return send({ task: rec, cancelled: false, reason: "cancel_failed", error: cancelError });
     }
 
     const mf = routePath.match(/^\/images\/([^/]+)\/file$/);
