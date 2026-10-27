@@ -1,0 +1,35 @@
+# 大体积、可重建、含隐私的内容不进版本库
+models/
+runtime/
+uploads/
+data/
+backups/
+staging/
+
+# 历史备份副本（目录里已积累 200+ 个，靠 git 历史回滚即可）
+*.bak
+*.bak.*
+*.bak_*
+app.bak*/
+app.bak.*/
+dist.bak*/
+dist.bak_*/
+dist.bak.*/
+
+# 依赖与缓存
+node_modules/
+.cache/
+__pycache__/
+*.pyc
+.venv/
+
+# 密钥与本地配置：只保留模板
+.env
+.env.*
+!.env.example
+
+# 日志与临时文件
+*.log
+*.tmp
+tmp/
+.DS_Store
