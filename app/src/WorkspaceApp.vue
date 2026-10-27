@@ -142,16 +142,23 @@ const voiceSupported = computed(() => {
   }
   return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
 });
-const voiceStateText = computed(
-  () =>
-    ({
+const voiceStateText = computed(() => {
+  // 暂停要单独说清楚：点了暂停却还显示"直接说话"，用户会以为麦克风开着，
+  // 对着手机说半天没反应，最后归咎于"识别不准"。
+  if (voicePaused.value && voiceState.value === "idle")
+    return voiceHandsFree.value ? "已暂停收听" : "已暂停";
+  return (
+    {
       idle: voiceHandsFree.value ? "直接说话" : "按住说话",
       listening: voiceHandsFree.value ? "我在听…" : "正在录音…",
       recognizing: "正在识别…",
       thinking: "正在思考…",
       speaking: "正在播报…",
-    })[voiceState.value] || ""
-);
+      // 失败是独立一态：不能停在 idle 让人以为"没反应"
+      failed: "没成功，可以重试",
+    }[voiceState.value] || ""
+  );
+});
 const imageStatus = {
   queued: "排队中",
   running: "生成中",
@@ -1295,6 +1302,14 @@ let lastTurnFailed = false;
 // 轮次编号：每次录音/识别自增，迟到的旧识别与旧答案一律作废
 let voiceEpoch = 0;
 let voiceAsrAbort = null;
+// 连续识别失败计数：成功即清零。连续两次失败就停止自动重开麦克风，
+// 否则网络断了会"失败→自动重听→再失败"无限循环，看起来像卡死。
+let voiceAsrFails = 0;
+// 分阶段耗时：t0=提交时刻，firstCharMs=首个字到达，firstAudioMs=第一段声音真正播出来。
+// 分开记才能回答"是模型慢、还是播报慢"，不能用总耗时一概而论。
+let voiceTiming = { t0: 0, firstCharMs: 0, firstAudioMs: 0, asrMs: 0 };
+// 本轮实际用到的角色（来自服务端 phase 事件），用于把"走的哪条模型"记进耗时日志
+let voiceLastRole = "";
 const voicePhase = ref(""); // queued | generating | completed | failed | canceled
 
 // ── 按住说话（PTT）：录音结束由用户动作决定，不依赖停顿检测 ──
@@ -1302,6 +1317,13 @@ const VOICE_MAX_MS = 60000; // 单次上限：到点自动结束并提交
 const VOICE_MIN_MS = 300; // 过短视为误触，不提交
 const VOICE_WARN_MS = 50000; // 提前 10s 提示
 const VOICE_CANCEL_PX = 60; // 上滑取消阈值
+
+// ── 分段超时：每一段失败都要能说清是"哪一段卡住了"，并且都能重来 ──
+// 以前只有上传有超时，识别和生成一旦卡住就永远转圈，用户只能退出通话。
+const VOICE_ASR_MS = 20000; // 识别：20 秒没结果就放弃，提示再说一次
+const VOICE_FIRST_TOKEN_MS = 35000; // 生成：35 秒还没有第一个字就放弃
+const VOICE_TTS_MS = 30000; // 合成：30 秒没拿到音频就退回本机朗读
+const VOICE_IDLE_PAUSE_MS = 15000; // 连续模式：15 秒没人说话就自动暂停，不空转
 const voiceHolding = ref(false);
 const voiceHoldMs = ref(0);
 const voiceCancelArmed = ref(false);
@@ -1323,6 +1345,20 @@ const voicePaused = ref(false);
 let voiceSilenceSince = 0;
 let voiceVoicedMs = 0;
 let voiceHfRestart = 0;
+
+// ── 播报中开口打断（barge-in）──
+// 要在 AI 说话时听用户，就必须在播报期间开着麦克风，于是有了"自己打断自己"的风险。
+// 三道防线：① 前 700ms 是保护期，只采样不判定（把扬声器泄漏的底噪记成基线）
+// ② 阈值取 max(0.05, 基线×2.5)，跟着设备回声消除效果自动调整
+// ③ 必须连续 320ms 超阈值才算人声，咳嗽、碰麦、单帧噪声都不触发。
+const VOICE_BARGE_KEY = "voice.bargein";
+const voiceBargeIn = ref(true);
+try {
+  voiceBargeIn.value = localStorage.getItem(VOICE_BARGE_KEY) !== "0";
+} catch (e) {}
+let bargeStream = null;
+let bargeCtx = null;
+let bargeRaf = 0;
 try {
   voiceHandsFree.value = localStorage.getItem(VOICE_HF_KEY) === "1";
 } catch (e) {}
@@ -1445,11 +1481,18 @@ function startNativeRec() {
 
 async function uploadAudio(blob, ext) {
   const epoch = ++voiceEpoch; // 本轮识别
+  const asrT0 = performance.now();
   voiceState.value = "recognizing";
   voicePhase.value = "";
   voiceRequestId = newVoiceRequestId();
   const asrAbort = new AbortController();
   voiceAsrAbort = asrAbort;
+  // 识别卡住不能无限转圈：到点主动放弃
+  const asrTimer = window.setTimeout(() => {
+    try {
+      asrAbort.abort();
+    } catch (e) {}
+  }, VOICE_ASR_MS);
   try {
     const r = await fetch("/api/v2/voice/asr?ext=" + ext, {
       method: "POST",
@@ -1470,12 +1513,29 @@ async function uploadAudio(blob, ext) {
       return;
     }
     voiceText.value = text;
+    voiceTiming.asrMs = Math.round(performance.now() - asrT0);
+    voiceAsrFails = 0; // 识别通了就清零，失败熔断只针对真正连续的故障
     await askStreaming(text, epoch);
   } catch (e) {
     if (epoch !== voiceEpoch) return;
-    voiceError.value = e.message || "识别失败";
-    voiceState.value = "idle";
+    const timedOut = Boolean(e && (e.name === "AbortError" || asrAbort.signal.aborted));
+    const why = timedOut
+      ? `识别超时（${Math.round(VOICE_ASR_MS / 1000)} 秒没有结果）`
+      : e.message || "识别失败";
+    voiceAsrFails += 1;
+    if (voiceAsrFails >= 2) {
+      // 连续两次失败：停下来，别再自动重开麦克风
+      voicePaused.value = true;
+      voiceState.value = "failed";
+      voiceError.value = why + "；已暂停收听，检查网络后点麦克风继续";
+      return;
+    }
+    voiceError.value = why + "，请再说一次";
+    resumeListening();
+    // 按住模式不会自动开麦：停在「没成功可以重试」，等用户再按一次
+    if (!voiceHandsFree.value) voiceState.value = "failed";
   } finally {
+    if (asrTimer) window.clearTimeout(asrTimer);
     if (voiceAsrAbort === asrAbort) voiceAsrAbort = null;
   }
 }
@@ -1548,7 +1608,7 @@ async function beginRecording() {
       if (e.data && e.data.size) chunks.push(e.data);
     };
     rec.start();
-    const cap = { stream, ctx, rec, chunks, raf: 0, stopped: false };
+    const cap = { stream, ctx, rec, chunks, raf: 0, stopped: false, startedAt: performance.now() };
     voiceCapture = cap;
     const data = new Uint8Array(analyser.fftSize);
     const tick = () => {
@@ -1564,6 +1624,15 @@ async function beginRecording() {
       // 免按键：靠停顿时长判定说完（按住说话时不启用，避免误发半句）
       if (voiceHandsFree.value && !voiceHolding.value) {
         const now = performance.now();
+        // 一直没人说话就自动暂停：开着麦空转会让界面永远停在"我在听"，
+        // 用户以为在等他说话，其实他在忙别的，回来发现还在"听"、什么也没录。
+        if (!voiceVoicedMs && now - cap.startedAt >= VOICE_IDLE_PAUSE_MS) {
+          voicePaused.value = true;
+          cleanupCapture();
+          voiceState.value = "idle";
+          voiceError.value = "一段时间没听到说话，已暂停收听。点麦克风继续";
+          return;
+        }
         if (rms > 0.02) {
           voiceVoicedMs += 16;
           voiceSilenceSince = 0;
@@ -1824,6 +1893,97 @@ function cleanupCapture() {
 }
 
 /* ── 免按键收听：说完自动发送，回答完自动接着听 ──────────── */
+
+// 播报期间监听用户是否开口。拿不到麦克风就安静放弃，不影响正常播报。
+async function startBargeIn() {
+  if (!voiceHandsFree.value || !voiceBargeIn.value) return;
+  if (bargeStream) return;
+  if (!voiceMode.value || voiceState.value !== "speaking") return;
+  let stream = null;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    // 等权限的这些毫秒里可能已经播完/被打断/退出通话，别留半开的麦克风
+    if (!voiceMode.value || voiceState.value !== "speaking") {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    const ctx = new Ctx();
+    const src = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    const data = new Uint8Array(analyser.fftSize);
+    const startedAt = performance.now();
+    let base = 0; // 保护期采到的"播报泄漏"基线
+    let loudSince = 0;
+    bargeStream = stream;
+    bargeCtx = ctx;
+    const tick = () => {
+      if (!bargeStream || voiceState.value !== "speaking") return;
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const x = (data[i] - 128) / 128;
+        sum += x * x;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      if (performance.now() - startedAt < 700) {
+        if (rms > base) base = rms; // 保护期只观察，不判定
+      } else {
+        const threshold = Math.max(0.05, base * 2.5);
+        if (rms > threshold) {
+          if (!loudSince) loudSince = performance.now();
+          if (performance.now() - loudSince >= 320) {
+            stopBargeIn();
+            handleBargeIn();
+            return;
+          }
+        } else {
+          loudSince = 0;
+        }
+      }
+      bargeRaf = requestAnimationFrame(tick);
+    };
+    bargeRaf = requestAnimationFrame(tick);
+  } catch (e) {
+    try {
+      stream && stream.getTracks().forEach((t) => t.stop());
+    } catch (e2) {}
+    stopBargeIn();
+  }
+}
+
+function stopBargeIn() {
+  if (bargeRaf) {
+    try {
+      cancelAnimationFrame(bargeRaf);
+    } catch (e) {}
+    bargeRaf = 0;
+  }
+  try {
+    if (bargeStream) bargeStream.getTracks().forEach((t) => t.stop());
+  } catch (e) {}
+  try {
+    if (bargeCtx) bargeCtx.close();
+  } catch (e) {}
+  bargeStream = null;
+  bargeCtx = null;
+}
+
+function handleBargeIn() {
+  // 用户开口：停播 + 取消这一轮，立刻转入录音。
+  // 这是"用户主动打断"，不该显示成失败，所以清掉错误文案。
+  interruptVoice();
+  voiceError.value = "";
+  startHandsFree();
+}
 
 function startHandsFree() {
   if (!voiceMode.value) return;
@@ -2237,6 +2397,21 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
     if (!imageId)
       voiceError.value = "图片还没传完，这一句先不带图；传好后可以再问一次";
   }
+  // 用户嘴上说"发张图/拍张照"但还没选图：先让他去拍照。
+  // 这句话要是当普通问题发出去，模型会顺着"看图"的语境编内容——那就是假装看到了。
+  // 只在短句里判定，避免"我上次拍的照片怎么防治"这类正常长问题被误拦。
+  const wantsImage =
+    !imageId && !attachCanSend.value && text.length <= 20 &&
+    /(发|传|拍|看|瞧).{0,4}(图|照片|照)/.test(text);
+  if (wantsImage) {
+    voiceError.value =
+      attach.value.status === Attach.ATTACH.FAILED
+        ? "这张图没传成功，先重试上传或重新拍一张"
+        : "还没选图片。点拍照或相册选一张，选好再问一次";
+    voiceState.value = "idle";
+    lastTurnFailed = false;
+    return;
+  }
   const retry = opts.retry === true;
   let finalStatus = "";
   lastQuestionText = text;
@@ -2251,6 +2426,25 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
   voiceAbort = ac;
   let full = "";
   let pending = "";
+  // 首字超时：到点还没有任何输出就放弃。否则上游卡住时界面会一直"正在思考"，
+  // 用户分不清是慢还是死了。用独立标志区分"用户打断"和"模型没响应"。
+  let firstCharTimedOut = false;
+  const t0 = performance.now();
+  let firstCharTimer = window.setTimeout(() => {
+    if (!full) {
+      firstCharTimedOut = true;
+      try {
+        ac.abort();
+      } catch (e) {}
+    }
+  }, VOICE_FIRST_TOKEN_MS);
+  const clearFirstChar = () => {
+    if (firstCharTimer) {
+      window.clearTimeout(firstCharTimer);
+      firstCharTimer = 0;
+    }
+  };
+  voiceTiming = { t0, firstCharMs: 0, firstAudioMs: 0, asrMs: voiceTiming.asrMs || 0 };
   try {
     const chosenDomain =
       domain.value && allowedDomainOptions.value.includes(domain.value)
@@ -2319,6 +2513,7 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
         }
         if (obj.type === "phase") {
           voicePhase.value = obj.phase;
+          if (obj.role) voiceLastRole = obj.role;
           if (obj.image_attachment_id !== undefined)
             turnRefId.value = obj.image_attachment_id || "";
           continue;
@@ -2327,6 +2522,10 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
         if (obj.delta) {
           // 打断之后迟到的旧答案是"隔轮串音"的来源，一律丢弃
           if (voiceInterrupted || ac.signal.aborted || epoch !== voiceEpoch) continue;
+          if (!voiceTiming.firstCharMs) {
+            voiceTiming.firstCharMs = Math.round(performance.now() - voiceTiming.t0);
+            clearFirstChar(); // 已经有字了，不再判首字超时
+          }
           full += obj.delta;
           pending += obj.delta;
           voiceAnswerText.value = full;
@@ -2363,6 +2562,17 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
     refresh().catch(() => {});
     if (!voiceSpeaking && voiceQueue.length === 0) resumeListening();
   } catch (e) {
+    // 首字超时是"模型没响应"，和用户主动打断要分开：
+    // 前者要给可重试的失败提示，后者是正常操作、不该报错。
+    if (firstCharTimedOut) {
+      const why = `模型 ${Math.round(VOICE_FIRST_TOKEN_MS / 1000)} 秒没有响应，可以重试`;
+      voiceError.value = why;
+      if (imageId) attach.value = Attach.analysisFail(attach.value, why);
+      lastTurnFailed = true;
+      voiceState.value = "failed";
+      voiceStreamDone = true;
+      return;
+    }
     if (voiceInterrupted || ac.signal.aborted) {
       // 用户主动打断/取消：不是失败，图还是好的，退回「服务器已收到」
       attach.value = Attach.analysisCanceled(attach.value);
@@ -2372,9 +2582,10 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
     voiceError.value = e.message || "生成失败";
     if (imageId) attach.value = Attach.analysisFail(attach.value, e.message || "生成失败");
     lastTurnFailed = true;
-    voiceState.value = "idle";
+    voiceState.value = "failed";
     voiceStreamDone = true;
   } finally {
+    clearFirstChar();
     if (voiceAbort === ac) voiceAbort = null;
   }
 }
@@ -2392,6 +2603,7 @@ function newVoiceRequestId() {
 function interruptVoice() {
   voiceInterrupted = true;
   voiceEpoch++; // 作废在途的识别与生成
+  stopBargeIn(); // 先收回打断监听，再停播，避免监听器把停播当成"又开口"
   try {
     if (voiceAudio) {
       voiceAudio.onended = null;
@@ -2469,6 +2681,8 @@ async function playNext() {
   }
   voiceSpeaking = true;
   voiceState.value = "speaking";
+  // 边播边听：用户开口就打断（不需要去点按钮）
+  startBargeIn();
   let ok = false;
   if (voiceServer.tts) {
     try {
@@ -2489,19 +2703,34 @@ async function playNext() {
 
 function playServerTts(text) {
   return new Promise((resolve, reject) => {
+    // 合成超时就走本机朗读兜底：不能让一段播报把整通电话卡住
+    const ac = new AbortController();
+    const timer = window.setTimeout(() => {
+      try {
+        ac.abort();
+      } catch (e) {}
+    }, VOICE_TTS_MS);
     fetch("/api/v2/voice/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Workbench": "1" },
       body: JSON.stringify({ text }),
+      signal: ac.signal,
     })
       .then((r) => {
         if (!r.ok) throw new Error("TTS " + r.status);
         return r.blob();
       })
       .then((blob) => {
+        window.clearTimeout(timer);
         const url = URL.createObjectURL(blob);
         const audio = new Audio(url);
         voiceAudio = audio;
+        // 首段声音真正播出来的时刻：用户"听到回答"的延迟，
+        // 与首字耗时不是一回事（中间还有合成与解码）
+        audio.onplaying = () => {
+          if (!voiceTiming.firstAudioMs)
+            voiceTiming.firstAudioMs = Math.round(performance.now() - voiceTiming.t0);
+        };
         audio.onended = () => {
           URL.revokeObjectURL(url);
           voiceAudio = null;
@@ -2520,7 +2749,10 @@ function playServerTts(text) {
         };
         audio.play().catch(reject);
       })
-      .catch(reject);
+      .catch((e) => {
+        window.clearTimeout(timer);
+        reject(e);
+      });
   });
 }
 
@@ -2549,6 +2781,20 @@ function playFallbackTts(text) {
 }
 
 function resumeListening() {
+  stopBargeIn(); // 播报结束，收回打断监听，避免和接下来的录音抢麦克风
+  // 一轮真正走完（生成结束且播报结束）时落一行耗时。
+  // 真机上打开控制台就能看出卡在哪一段，不用再靠"感觉有点慢"。
+  if (voiceTiming.t0 && !voiceTiming.logged) {
+    voiceTiming.logged = true;
+    try {
+      console.info(
+        "[voice] 识别 " + voiceTiming.asrMs + "ms · 首字 " + voiceTiming.firstCharMs +
+          "ms · 首段声音 " + voiceTiming.firstAudioMs + "ms · 完整 " +
+          Math.round(performance.now() - voiceTiming.t0) + "ms · 角色 " +
+          (voiceLastRole || "?"),
+      );
+    } catch (e) {}
+  }
   // 按住说话：回答结束后只回到"待按住"，不自动开始录音
   if (!voiceMode.value) return;
   cleanupCapture();
@@ -2651,6 +2897,7 @@ function endCall() {
   voiceSetupOpen.value = false;
   voiceQueue = [];
   voiceSpeaking = false;
+  stopBargeIn(); // 退出通话必须收回打断监听，否则麦克风会一直开着
   cleanupCapture();
   closeCamera();
   disposeShot();

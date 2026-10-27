@@ -313,6 +313,9 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
     }
 
     if (url.pathname === "/api/v2/voice/turn") {
+      // 从收到请求开始计时：后面每个 SSE 事件都带 elapsed_ms，
+      // 这样"首字""完整回答"是同一把尺子量出来的，不用靠客户端猜。
+      const t0 = Date.now();
       const user = await currentUser(req);
       if (!user) {
         json(res, 401, { error: "请先登录" });
@@ -356,7 +359,12 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
       });
       let open = true;
       const send = (obj) => {
-        if (open) res.write(`data: ${JSON.stringify(obj)}\n\n`);
+        // elapsed_ms 贯穿全部事件：meta≈建轮次耗时，首个 delta=首字耗时，
+        // done=完整回答耗时。分阶段报告直接用这些数，不拿单个接口耗时冒充整条链路。
+        if (open)
+          res.write(
+            `data: ${JSON.stringify({ ...obj, elapsed_ms: Date.now() - t0 })}\n\n`,
+          );
       };
       const ac = new AbortController();
       res.on("close", () => {
@@ -382,6 +390,10 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
       let sent = 0;
       let lastPhase = "";
       let finalStatus = "";
+      // 首字耗时：第一个增量发出的时刻。与 done 的 elapsed_ms 一起，
+      // 把"模型慢"和"整条链路慢"分开，不再用一个总耗时掩盖问题。
+      let firstDeltaMs = 0;
+      let lastRole = "";
       const TERMINAL = ["completed", "partial", "failed", "canceled"];
       while (open && !ac.signal.aborted) {
         const v = await workspace.voiceTurnView(user, turnId);
@@ -390,6 +402,7 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
           break;
         }
         if (v.text.length > sent) {
+          if (!firstDeltaMs) firstDeltaMs = Date.now() - t0;
           send({ delta: v.text.slice(sent) });
           sent = v.text.length;
         }
@@ -401,6 +414,7 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
             : v.status;
         if (phase !== lastPhase) {
           lastPhase = phase;
+          if (v.role) lastRole = v.role;
           send({
             type: "phase",
             phase,
@@ -425,11 +439,28 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
         await sleep(120);
       }
       // 客户端先断开时不在这里取消：生成继续落库，避免误杀（与图片取消同一教训）
+      const totalMs = Date.now() - t0;
+      // 阶段耗时落库：事后能回答"是没收到图、没进视觉模型，还是模型本身慢"。
+      // 只写诊断字段，不改回答内容；workspace 缺这个方法时静默跳过，不影响主流程。
+      if (typeof workspace.recordVoiceTiming === "function") {
+        await workspace
+          .recordVoiceTiming(user, turnId, {
+            first_delta_ms: firstDeltaMs,
+            total_ms: totalMs,
+            role: lastRole,
+            status: finalStatus || "aborted",
+            aborted: ac.signal.aborted,
+          })
+          .catch(() => {});
+      }
       send({
         done: true,
         status: finalStatus || "aborted",
         turn_id: turnId,
         aborted: ac.signal.aborted,
+        first_delta_ms: firstDeltaMs,
+        total_ms: totalMs,
+        role: lastRole,
       });
       open = false;
       res.end();

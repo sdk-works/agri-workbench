@@ -3063,6 +3063,36 @@ export function createWorkspace({
     });
   }
 
+  // 记录一轮语音的分阶段耗时。只写诊断字段 timing，不动回答、不动状态。
+  // 用途：事后能回答"是没收到图、没进视觉模型，还是模型本身慢"，
+  // 不用再靠猜，也不用拿单个接口耗时冒充整条语音链路。
+  async function recordVoiceTiming(u, id, timing = {}) {
+    return repo.transaction(async (db) => {
+      const t = await db.get("turns", id);
+      if (!t || t.tenant !== u.tenant || t.owner !== u.id) return false;
+      const role = String(timing.role || "").slice(0, 32);
+      t.timing = {
+        first_delta_ms: Math.max(0, Number(timing.first_delta_ms) || 0),
+        total_ms: Math.max(0, Number(timing.total_ms) || 0),
+        role,
+        // 实际模型名按角色从当前配置解析，不信任前端传值
+        model: String(
+          (role && typeof gateway.modelFor === "function"
+            ? gateway.modelFor(role)
+            : "") || "",
+        ).slice(0, 128),
+        has_image: Boolean(t.image),
+        image_attachment_id:
+          (t.image_attachment && t.image_attachment.id) || "",
+        status: String(timing.status || "").slice(0, 24),
+        aborted: timing.aborted === true,
+        recorded_at: new Date().toISOString(),
+      };
+      await db.put("turns", t);
+      return true;
+    });
+  }
+
   return {
     handle,
     userFor,
@@ -3080,6 +3110,7 @@ export function createWorkspace({
     createVoiceTurn,
     voiceTurnView,
     finishVoiceTurn,
+    recordVoiceTiming,
     recoverVoiceTurns,
   };
 }
