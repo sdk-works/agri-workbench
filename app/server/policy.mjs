@@ -135,7 +135,11 @@ export function createPolicy(filename) {
     const imageUnavailable = hasImage && imageRoles.length === 0;
 
     const fastOn = enabled(r.text_fast);
-    const useFast = !hasImage && !deep && fastOn;
+    // 语音回答不套用短问快通道。
+    // 语音问题天然短（"叶子黄了""这个虫怎么处理"），按字数判 fast 等于把整类语音
+    // 全部降级到快模型。这类短问恰恰最需要完整推理，所以语音一律留在强角色。
+    // fast 只服务文字短交互（打字问一句"在吗"这类）。
+    const useFast = !hasImage && !deep && fastOn && !voice;
     const tier = useFast ? "fast" : "strong";
     const planRole = hasImage ? imageRole : useFast ? r.text_fast : r.text_strong;
     const pickedModel = modelFor(planRole);

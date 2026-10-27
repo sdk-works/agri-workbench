@@ -1,14 +1,15 @@
-// 抽层等价性验证：把抽层前的路由逻辑逐字复制成 legacyRoute，
-// 与 policy.route 在全部参数组合上逐一对比，证明行为完全一致。
+// 抽层等价性验证：把抽层前的路由逻辑复制成 legacyRoute，
+// 与 policy.route 在全部参数组合上逐一对比，证明改配置不会改变调度结果。
 //
-// 这是抽层这步的安全网：只要这个测试绿，就说明「把规则搬到配置层」
-// 没有改变任何一次实际调度结果。
+// 2026-10-27 有一处**有意的行为变更**已同步到这里：语音回答不再套用短问快通道。
+// 原因是语音问题天然短（"叶子黄了""这个虫怎么处理"），按字数判 fast 等于把整类
+// 语音降级到快模型。所以下面的 `&& !voice` 是修正后的预期，不是历史原样。
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createPolicy } from "./policy.mjs";
 
-// ── 抽层前 workspace.mjs 里的原逻辑（逐字复制，仅供对比）──
+// ── 参考实现：与当前 policy.mjs 逐条对应，用于发现"改配置导致的路由漂移"──
 const DEEP_RE =
   /诊断|病因|怎么治|防治|缺素|药害|病害|虫害|霜霉|白粉|灰霉|蓟马|红蜘蛛|详细|仔细/;
 
@@ -17,10 +18,20 @@ function legacyRoute({ hasImage, voice, question, explicitDeep }, caps) {
     explicitDeep === true || DEEP_RE.test(question) || question.length > 40;
   const visionOk = caps.enabled("vision") && caps.seesImage("vision");
   const localVisionOk = caps.enabled("local") && caps.seesImage("local");
+  // 候选池要先算出来：两个首选都不可用时，imageRole 退回池里第一个能看图的，
+  // 池子空了才退回空串（调用方据此报 503，绝不静默当纯文本处理）
+  const imageRoles = ["vision", "local"].filter(
+    (r) => caps.enabled(r) && caps.seesImage(r),
+  );
   const imageRole =
-    wantDeep && localVisionOk ? "local" : visionOk ? "vision" : "local";
+    wantDeep && localVisionOk
+      ? "local"
+      : visionOk
+        ? "vision"
+        : imageRoles[0] || "";
   const fastOn = caps.enabled("fast");
-  const useFast = !hasImage && !wantDeep && fastOn;
+  // 语音不降级：这一条是 2026-10-27 的修正，语音一律留在强角色
+  const useFast = !hasImage && !wantDeep && fastOn && !voice;
   const tier = useFast ? "fast" : "strong";
   const pickedModel = hasImage
     ? caps.modelFor(imageRole)
@@ -32,9 +43,6 @@ function legacyRoute({ hasImage, voice, question, explicitDeep }, caps) {
     : hasImage
       ? [imageRole].filter((r) => caps.enabled(r))
       : ["local", "cloud"].filter((r) => caps.enabled(r));
-  const imageRoles = ["vision", "local"].filter(
-    (r) => caps.enabled(r) && caps.seesImage(r),
-  );
   return {
     deep: wantDeep,
     tier,
@@ -108,6 +116,34 @@ test("等价性：policy.route 与原逻辑在全部分支组合下一致", () =
   }
   // 4 问 × 2 图 × 2 语音 × 2 深度 × 16 角色组合 × 4 看图组合
   assert.equal(checked, 4 * 2 * 2 * 2 * 16 * 4);
+});
+
+test("语音短问不降级：没图也不许换成快模型", () => {
+  const policy = createPolicy();
+  const caps = {
+    enabled: () => true,
+    seesImage: (r) => r === "vision",
+    // 故意把 fast 设成一个明显不同的模型名：一旦被降级，model 名会立刻暴露
+    modelFor: (r) => (r === "fast" ? "tiny-3b" : "strong-30b"),
+  };
+  // 「叶子黄了」四个字、无关键词 —— 打字时确实该走快通道
+  const text = policy.route({ question: "叶子黄了", caps });
+  assert.equal(text.useFast, true, "文字短问仍应走快通道");
+  assert.equal(text.overrideModel, "tiny-3b", "文字短问应换成快模型");
+
+  // 同一句话走语音：必须留在强角色，且不许覆盖模型名
+  const voice = policy.route({ question: "叶子黄了", voice: true, caps });
+  assert.equal(voice.useFast, false, "语音不得判为快通道");
+  assert.equal(voice.tier, "strong");
+  assert.deepEqual(voice.roles, ["local"]);
+  assert.equal(voice.overrideRole, null, "语音不得覆盖模型名");
+  assert.equal(voice.overrideModel, "");
+  assert.equal(voice.pickedModel, "strong-30b", "语音应解析到强模型");
+
+  // 带图时优先走能看图的角色，跟语音与否无关
+  const img = policy.route({ question: "叶子黄了", voice: true, hasImage: true, caps });
+  assert.equal(img.imageUnavailable, false);
+  assert.equal(img.imageRole, "vision");
 });
 
 test("采样参数：默认 0.5，结构化输出 0.1，未知模型沿用默认", () => {
