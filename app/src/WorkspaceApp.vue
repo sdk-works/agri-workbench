@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from "vue";
 import {
   Sprout,
   MessageSquare,
@@ -20,6 +20,9 @@ import {
   PhoneOff,
   Volume2,
   Sparkles,
+  Camera,
+  Radio,
+  X,
 } from "lucide-vue-next";
 import { call, download } from "./workspace-api";
 const user = ref(null),
@@ -98,7 +101,8 @@ const users = ref([]),
   jobs = ref([]),
   metrics = ref(null),
   legacy = ref([]);
-const imageTasks = ref([]),
+const imageNotice = ref(""),
+  imageTasks = ref([]),
   imageForm = ref({ prompt: "", size: 1024 }),
   imageSubmitting = ref(false);
 const departments = ref([]),
@@ -139,8 +143,9 @@ const voiceSupported = computed(() => {
 const voiceStateText = computed(
   () =>
     ({
-      idle: "点击开始说话",
-      listening: "请说话…",
+      idle: voiceHandsFree.value ? "直接说话" : "按住说话",
+      listening: voiceHandsFree.value ? "我在听…" : "正在录音…",
+      recognizing: "正在识别…",
       thinking: "正在思考…",
       speaking: "正在播报…",
     })[voiceState.value] || ""
@@ -673,8 +678,18 @@ async function submitImage() {
   }
 }
 async function cancelImage(id) {
+  imageNotice.value = "";
   await act(async () => {
-    await call("/images/tasks/" + id + "/cancel", {});
+    const r = await call("/images/tasks/" + id + "/cancel", {});
+    // 服务端不会"假取消"：已完成/无法中断时 cancelled=false，这里照实告诉用户
+    if (r && r.cancelled === false) {
+      imageNotice.value =
+        r.reason === "already_finished"
+          ? "该任务已经结束，无需取消"
+          : "取消失败：" + (r.error || "服务端未确认取消，任务可能仍在生成");
+    } else {
+      imageNotice.value = "已取消该任务";
+    }
     await refresh();
   });
 }
@@ -1267,6 +1282,57 @@ let voiceCapture = null;
 let voiceAudio = null;
 let voiceSpeakResolve = null;
 let voiceServer = { ok: false, asr: false, tts: false };
+// 打断与状态机：同一 request_id 贯穿 识别→生成→播报，卡在哪一步可以定位
+let voiceAbort = null;
+let voiceTurnId = "";
+let voiceRequestId = "";
+let voiceInterrupted = false;
+// 轮次编号：每次录音/识别自增，迟到的旧识别与旧答案一律作废
+let voiceEpoch = 0;
+let voiceAsrAbort = null;
+const voicePhase = ref(""); // queued | generating | completed | failed | canceled
+
+// ── 按住说话（PTT）：录音结束由用户动作决定，不依赖停顿检测 ──
+const VOICE_MAX_MS = 60000; // 单次上限：到点自动结束并提交
+const VOICE_MIN_MS = 300; // 过短视为误触，不提交
+const VOICE_WARN_MS = 50000; // 提前 10s 提示
+const VOICE_CANCEL_PX = 60; // 上滑取消阈值
+const voiceHolding = ref(false);
+const voiceHoldMs = ref(0);
+const voiceCancelArmed = ref(false);
+const voiceRequesting = ref(false);
+let voiceHoldStart = 0;
+let voiceHoldY = 0;
+let voiceHoldSubmitted = false;
+let voiceHoldAbort = false;
+let voiceWarned = false;
+let voiceNativeCaps = { rec: false, asr: false };
+
+// ── 免按键收听：说完停顿即发送，回答结束自动接着听 ──
+const VOICE_HF_KEY = "voice.handsfree";
+const VOICE_SILENCE_MS = 900; // 连续静音多久判定说完
+const VOICE_MIN_VOICE_MS = 420; // 有效发声下限，防环境噪音被当成一句话
+const VOICE_HF_DELAY_MS = 260; // 播报结束后稍等再开麦，避免尾音被录入
+const voiceHandsFree = ref(false);
+const voicePaused = ref(false);
+let voiceSilenceSince = 0;
+let voiceVoicedMs = 0;
+let voiceHfRestart = 0;
+try {
+  voiceHandsFree.value = localStorage.getItem(VOICE_HF_KEY) === "1";
+} catch (e) {}
+
+// ── 拍照与随问附图：先上传拿 image_id，再随语音轮提交 ──
+const VOICE_IMAGE_MAX = 8 * 1024 * 1024;
+const VOICE_UPLOAD_MS = 45000;
+const voiceCamOpen = ref(false);
+const voiceCamReady = ref(false);
+const voiceCamVideo = ref(null);
+const voiceCamError = ref("");
+const voiceSheetOpen = ref(false);
+const voiceAttach = ref(null); // { id, url, status, error }
+let voiceCamStream = null;
+let voiceImageSeq = 0;
 
 function showVoiceSetup(steps) {
   voiceSetupSteps.value = steps;
@@ -1285,6 +1351,8 @@ function startCall() {
   voiceQueue = [];
   voiceSpeaking = false;
   voiceStreamDone = true;
+  document.addEventListener("visibilitychange", onVoiceVisibility);
+  window.addEventListener("blur", onVoiceBlur);
   probeAndStart();
 }
 
@@ -1306,6 +1374,8 @@ async function probeAndStart() {
   }
 
   const nativeAsr = Boolean(diag && diag.asr);
+  const nativeRec = Boolean(diag && diag.rec);
+  voiceNativeCaps = { rec: nativeRec, asr: nativeAsr };
   const mic = diag ? diag.mic : "unknown";
 
   if (nativeAsr && mic === "denied") {
@@ -1321,16 +1391,9 @@ async function probeAndStart() {
     ]);
     return;
   }
-  if (nativeAsr) {
-    startNativeListening();
-    return;
-  }
-  if (diag && diag.rec) {
-    startNativeRec();
-    return;
-  }
-  if (voiceServer.asr) {
-    startCapture();
+  // 按住说话：进入待按住状态，绝不自动开始录音
+  if (nativeRec || nativeAsr || voiceServer.asr) {
+    voiceState.value = "idle";
     return;
   }
 
@@ -1357,26 +1420,39 @@ function startNativeRec() {
 }
 
 async function uploadAudio(blob, ext) {
-  voiceState.value = "thinking";
+  const epoch = ++voiceEpoch; // 本轮识别
+  voiceState.value = "recognizing";
+  voicePhase.value = "";
+  voiceRequestId = newVoiceRequestId();
+  const asrAbort = new AbortController();
+  voiceAsrAbort = asrAbort;
   try {
     const r = await fetch("/api/v2/voice/asr?ext=" + ext, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream", "X-Workbench": "1" },
       body: blob,
+      signal: asrAbort.signal,
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || "识别失败");
+    // 用户已经按住新一轮：这条识别结果作废，不能替用户提问
+    if (epoch !== voiceEpoch) return;
     const text = String(j.text || "").trim();
     if (!text) {
-      voiceError.value = "没有听清，请再说一次";
+      voiceError.value = voiceHandsFree.value
+        ? "没听到说话，请直接说"
+        : "没有听清，请再说一次";
       resumeListening();
       return;
     }
     voiceText.value = text;
-    await askStreaming(text);
+    await askStreaming(text, epoch);
   } catch (e) {
+    if (epoch !== voiceEpoch) return;
     voiceError.value = e.message || "识别失败";
     voiceState.value = "idle";
+  } finally {
+    if (voiceAsrAbort === asrAbort) voiceAsrAbort = null;
   }
 }
 
@@ -1400,17 +1476,8 @@ function startNativeListening() {
   }
 }
 
-async function startCapture() {
-  if (!voiceMode.value) return;
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    voiceError.value = "当前页面环境不支持录音";
-    showVoiceSetup([
-      "浏览器在 http:// 页面下禁止调用麦克风，所以不会弹授权框。",
-      "请使用「京阳智农」安卓应用进行语音通话（应用内可直接录音）。",
-      "电脑上请用 localhost 访问，或让管理员配置 HTTPS 域名。",
-    ]);
-    return;
-  }
+// ── 按住说话：开始录音（麦克风授权期间松手不算一次录音） ──
+async function beginRecording() {
   voiceState.value = "listening";
   voiceText.value = "";
   voiceError.value = "";
@@ -1418,7 +1485,25 @@ async function startCapture() {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    // 授权弹窗期间用户已经松手/取消 → 不当成一次录音，直接释放麦克风
+    // 免按键模式不依赖按住，只有主动取消/退出语音通话才作废
+    if ((!voiceHolding.value && !voiceHandsFree.value) || voiceHoldAbort || !voiceMode.value) {
+      try {
+        stream.getTracks().forEach((t) => t.stop());
+      } catch (e) {}
+      voiceState.value = "idle";
+      return;
+    }
     const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) {
+      // 老内核/受限 WebView 没有 WebAudio，录了也没法算音量，直接说清楚
+      voiceError.value = "无音频上下文，这台设备录不了音";
+      voiceState.value = "idle";
+      try {
+        stream.getTracks().forEach((t) => t.stop());
+      } catch (e) {}
+      return;
+    }
     const ctx = new Ctx();
     const src = ctx.createMediaStreamSource(stream);
     const analyser = ctx.createAnalyser();
@@ -1426,8 +1511,7 @@ async function startCapture() {
     src.connect(analyser);
     const chunks = [];
     const mime =
-      window.MediaRecorder &&
-      MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      window.MediaRecorder && MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : "audio/webm";
     let rec;
@@ -1440,7 +1524,7 @@ async function startCapture() {
       if (e.data && e.data.size) chunks.push(e.data);
     };
     rec.start();
-    const cap = { stream, ctx, rec, chunks, raf: 0, speech: false, silence: 0, stopped: false };
+    const cap = { stream, ctx, rec, chunks, raf: 0, stopped: false };
     voiceCapture = cap;
     const data = new Uint8Array(analyser.fftSize);
     const tick = () => {
@@ -1453,14 +1537,33 @@ async function startCapture() {
       }
       const rms = Math.sqrt(sum / data.length);
       voiceLevel.value = Math.min(1, rms * 14);
-      const now = performance.now();
-      if (rms > 0.02) {
-        cap.speech = true;
-        cap.silence = 0;
-      } else if (cap.speech) {
-        if (!cap.silence) cap.silence = now;
-        else if (now - cap.silence > 900) {
-          finishCapture();
+      // 免按键：靠停顿时长判定说完（按住说话时不启用，避免误发半句）
+      if (voiceHandsFree.value && !voiceHolding.value) {
+        const now = performance.now();
+        if (rms > 0.02) {
+          voiceVoicedMs += 16;
+          voiceSilenceSince = 0;
+        } else {
+          if (!voiceSilenceSince) voiceSilenceSince = now;
+          if (
+            voiceVoicedMs >= VOICE_MIN_VOICE_MS &&
+            now - voiceSilenceSince >= VOICE_SILENCE_MS
+          ) {
+            finishCapture();
+            return;
+          }
+        }
+      }
+      if (voiceHolding.value) {
+        const held = performance.now() - voiceHoldStart;
+        voiceHoldMs.value = held;
+        if (!voiceWarned && held >= VOICE_WARN_MS) {
+          voiceWarned = true;
+          voiceError.value = "还有 10 秒到达单次上限，将自动发送";
+        }
+        if (held >= VOICE_MAX_MS) {
+          // 上限：自动结束并提交（不依赖静音检测）
+          holdVoiceEnd("max");
           return;
         }
       }
@@ -1468,8 +1571,14 @@ async function startCapture() {
     };
     cap.raf = requestAnimationFrame(tick);
   } catch (e) {
-    voiceError.value =
-      e && e.name === "NotAllowedError" ? "麦克风权限被拒绝" : e.message || "无法打开麦克风";
+    const why =
+      e && e.name === "NotAllowedError"
+        ? "麦克风权限被拒绝"
+        : e.message || "无法打开麦克风";
+    // 免按键是自动开麦：失败必须说清楚，否则用户以为在听、其实没开
+    voiceError.value = voiceHandsFree.value ? "自动收听启动失败：" + why : why;
+    voiceState.value = "idle";
+    if (voiceHandsFree.value) voicePaused.value = true;
     showVoiceSetup([
       "浏览器没有拿到麦克风权限。",
       "安卓应用内：设置 → 应用 → 京阳智农 → 权限 → 麦克风 → 允许。",
@@ -1478,6 +1587,163 @@ async function startCapture() {
   }
 }
 
+// 指针捕获 + window 兜底：手指/鼠标移出按钮后松开也必须结束，不能只在按钮上监听
+function bindHoldPointer() {
+  try {
+    window.addEventListener("pointerup", holdVoiceEnd, true);
+    window.addEventListener("pointercancel", holdVoiceCancel, true);
+    window.addEventListener("pointermove", holdVoiceMove, true);
+  } catch (e) {}
+}
+function unbindHoldPointer() {
+  try {
+    window.removeEventListener("pointerup", holdVoiceEnd, true);
+    window.removeEventListener("pointercancel", holdVoiceCancel, true);
+    window.removeEventListener("pointermove", holdVoiceMove, true);
+  } catch (e) {}
+}
+
+// 按下
+function holdVoiceStart(ev) {
+  if (!voiceMode.value) return;
+  // 免按键模式：点一下开始/暂停，不需要按住
+  if (voiceHandsFree.value) {
+    toggleListen();
+    return;
+  }
+  if (voiceHolding.value) return;
+  // 再按一次 = 打断：立即停播、清待播、取消上一轮生成，然后开始新录音
+  if (voiceState.value === "thinking" || voiceState.value === "speaking") interruptVoice();
+  voiceInterrupted = false; // 新一轮开始：旧轮次的隔离由 voiceEpoch 负责
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    if (!voiceNativeCaps.rec && !voiceNativeCaps.asr) {
+      voiceError.value = "当前页面环境不支持录音";
+      showVoiceSetup([
+        "浏览器在 http:// 页面下禁止调用麦克风，所以不会弹授权框。",
+        "请使用「京阳智农」安卓应用进行语音通话（应用内可直接录音）。",
+        "电脑上请用 localhost 访问，或让管理员配置 HTTPS 域名。",
+      ]);
+      return;
+    }
+  }
+  voiceHolding.value = true;
+  try {
+    if (ev && ev.currentTarget && ev.currentTarget.setPointerCapture && ev.pointerId != null)
+      ev.currentTarget.setPointerCapture(ev.pointerId);
+  } catch (e) {}
+  bindHoldPointer();
+  voiceHoldAbort = false;
+  voiceHoldSubmitted = false;
+  voiceWarned = false;
+  voiceCancelArmed.value = false;
+  voiceHoldStart = performance.now();
+  voiceHoldMs.value = 0;
+  voiceHoldY = ev && typeof ev.clientY === "number" ? ev.clientY : 0;
+  voiceError.value = "";
+
+  const n = voiceNative();
+  if (voiceNativeCaps.rec && n && n.recStart) {
+    try {
+      n.recStart();
+      voiceState.value = "listening";
+      return;
+    } catch (e) {}
+  }
+  if (voiceNativeCaps.asr && n && n.startListening) {
+    try {
+      n.startListening();
+      voiceState.value = "listening";
+      return;
+    } catch (e) {}
+  }
+  // Web：先请求麦克风（voiceRequesting.value 用于提示"正在请求"）
+  voiceRequesting.value = true;
+  beginRecording().finally(() => {
+    voiceRequesting.value = false;
+  });
+}
+
+// 移动：上滑取消
+function holdVoiceMove(ev) {
+  if (!voiceHolding.value) return;
+  const y = ev && typeof ev.clientY === "number" ? ev.clientY : voiceHoldY;
+  const up = voiceHoldY - y;
+  voiceCancelArmed.value = up >= VOICE_CANCEL_PX;
+}
+
+// 松手：发送（或取消/过短）
+function holdVoiceEnd(reason) {
+  unbindHoldPointer();
+  if (!voiceHolding.value) return;
+  const held = performance.now() - voiceHoldStart;
+  const cancel = voiceCancelArmed.value && reason !== "max";
+  voiceHolding.value = false;
+  voiceHoldMs.value = 0;
+  voiceCancelArmed.value = false;
+
+  const n = voiceNative();
+  const nativeOn = voiceNativeCaps.rec || voiceNativeCaps.asr;
+
+  if (cancel) {
+    voiceHoldAbort = true;
+    try {
+      if (voiceNativeCaps.rec && n && n.recCancel) n.recCancel();
+      else if (voiceNativeCaps.asr && n && n.stopListening) n.stopListening();
+    } catch (e) {}
+    cleanupCapture();
+    voiceState.value = "idle";
+    voiceError.value = "已取消，未发送";
+    return;
+  }
+  if (held < VOICE_MIN_MS && reason !== "max") {
+    voiceHoldAbort = true;
+    try {
+      if (voiceNativeCaps.rec && n && n.recCancel) n.recCancel();
+      else if (voiceNativeCaps.asr && n && n.stopListening) n.stopListening();
+    } catch (e) {}
+    cleanupCapture();
+    voiceState.value = "idle";
+    voiceError.value = "说话时间太短，请按住多说一会儿";
+    return;
+  }
+  if (voiceHoldSubmitted) return; // 同一次按压只提交一次
+  voiceHoldSubmitted = true;
+
+  if (voiceNativeCaps.rec && n && n.recStop) {
+    try {
+      n.recStop(); // 原生录音结束 → 触发 audio 事件 → 上传识别
+      voiceState.value = "recognizing";
+      return;
+    } catch (e) {}
+  }
+  if (voiceNativeCaps.asr && n && n.stopListening) {
+    try {
+      n.stopListening(); // 原生识别结束 → result 事件 → 提交
+      return;
+    } catch (e) {}
+  }
+  finishCapture(); // Web：停录 → 上传识别
+}
+
+// 意外中断（切后台/来电/pointercancel）：结束并丢弃，不提交
+function holdVoiceCancel() {
+  unbindHoldPointer();
+  if (!voiceHolding.value) return;
+  const n = voiceNative();
+  voiceHolding.value = false;
+  voiceHoldAbort = true;
+  voiceHoldMs.value = 0;
+  voiceCancelArmed.value = false;
+  try {
+    if (voiceNativeCaps.rec && n && n.recCancel) n.recCancel();
+    else if (voiceNativeCaps.asr && n && n.stopListening) n.stopListening();
+  } catch (e) {}
+  cleanupCapture();
+  voiceState.value = "idle";
+  voiceError.value = "录音已中断，未发送";
+}
+
+// 停录并提交（Web 路径）
 function finishCapture() {
   const cap = voiceCapture;
   if (!cap || cap.stopped) return;
@@ -1488,8 +1754,13 @@ function finishCapture() {
   const done = async () => {
     const blob = new Blob(cap.chunks, { type: "audio/webm" });
     cleanupCapture();
+    if (voiceHoldAbort) {
+      voiceState.value = "idle";
+      return;
+    }
     if (blob.size < 2500) {
-      if (voiceMode.value) startCapture();
+      voiceState.value = "idle";
+      voiceError.value = "没有录到声音，请按住再说一次";
       return;
     }
     await uploadAudio(blob, "webm");
@@ -1500,6 +1771,16 @@ function finishCapture() {
   } catch (e) {
     done();
   }
+}
+
+function onVoiceBlur() {
+  onVoiceVisibility("blur");
+}
+
+// 页面不可见 / 失焦：按中断处理，绝不发半段
+function onVoiceVisibility(kind) {
+  const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+  if ((kind === "blur" || hidden) && voiceHolding.value) holdVoiceCancel();
 }
 
 function cleanupCapture() {
@@ -1518,12 +1799,268 @@ function cleanupCapture() {
   } catch (e) {}
 }
 
-async function askStreaming(text) {
+/* ── 免按键收听：说完自动发送，回答完自动接着听 ──────────── */
+
+function startHandsFree() {
+  if (!voiceMode.value) return;
+  voicePaused.value = false;
+  voiceHolding.value = false;
+  voiceCancelArmed.value = false;
+  voiceSilenceSince = 0;
+  voiceVoicedMs = 0;
+  voiceRequesting.value = true;
+  beginRecording().finally(() => {
+    voiceRequesting.value = false;
+  });
+}
+
+function toggleHandsFree() {
+  voiceHandsFree.value = !voiceHandsFree.value;
+  try {
+    localStorage.setItem(VOICE_HF_KEY, voiceHandsFree.value ? "1" : "0");
+  } catch (e) {}
+  if (voiceHandsFree.value) {
+    voiceError.value = "已切换为免按键：说完停顿一下自动发送";
+    if (voiceMode.value && voiceState.value === "idle") startHandsFree();
+    return;
+  }
+  cleanupCapture();
+  voiceHolding.value = false;
+  if (voiceState.value === "listening") voiceState.value = "idle";
+  voiceError.value = "已切换为按住说话";
+}
+
+// 麦克风按钮：收听中点击=暂停；播报/思考中点击=先打断再听
+function toggleListen() {
+  if (voiceState.value === "listening") {
+    cleanupCapture();
+    voiceState.value = "idle";
+    voicePaused.value = true;
+    voiceError.value = "已暂停收听，点麦克风继续";
+    return;
+  }
+  if (voiceState.value === "speaking" || voiceState.value === "thinking") interruptVoice();
+  voicePaused.value = false;
+  voiceError.value = "";
+  startHandsFree();
+}
+
+/* ── 拍照 / 相册 ────────────────────────────────────────── */
+
+function openCamSheet() {
+  if (!voiceMode.value) {
+    voiceError.value = "还没有对话，先开始语音通话再拍照";
+    return;
+  }
+  // http 页面下浏览器直接拒绝 getUserMedia，提前说明，别让用户点了没反应
+  const secure =
+    window.isSecureContext ||
+    location.hostname === "localhost" ||
+    location.hostname === "127.0.0.1";
+  voiceCamError.value = secure
+    ? ""
+    : "当前不是安全连接，页面内相机不可用，请改用系统相机";
+  voiceSheetOpen.value = true;
+}
+
+async function openInPageCamera() {
+  voiceSheetOpen.value = false;
+  voiceCamError.value = "";
+  voiceCamReady.value = false;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    voiceError.value = "打不开相机：当前页面环境不支持";
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 960 },
+      },
+      audio: false,
+    });
+    voiceCamStream = stream;
+    voiceCamOpen.value = true;
+    await nextTick();
+    const v = voiceCamVideo.value;
+    if (v) {
+      v.srcObject = stream;
+      try {
+        await v.play();
+      } catch (e) {}
+    }
+    voiceCamReady.value = true;
+  } catch (e) {
+    const name = e && e.name;
+    voiceError.value =
+      name === "NotAllowedError"
+        ? "相机权限被拒绝，请到系统设置里允许"
+        : name === "NotFoundError" || name === "OverconstrainedError"
+          ? "相机还没准备好：这台设备没有可用摄像头"
+          : "打不开相机：" + ((e && e.message) || "未知原因");
+  }
+}
+
+function closeCamera() {
+  voiceCamOpen.value = false;
+  voiceCamReady.value = false;
+  if (voiceCamStream) {
+    try {
+      voiceCamStream.getTracks().forEach((t) => t.stop());
+    } catch (e) {}
+  }
+  voiceCamStream = null;
+  const v = voiceCamVideo.value;
+  if (v) v.srcObject = null;
+}
+
+async function shootPhoto() {
+  if (!voiceCamReady.value) {
+    voiceCamError.value = "相机还没准备好，稍等一下再按";
+    return;
+  }
+  const v = voiceCamVideo.value;
+  const w = v ? v.videoWidth : 0;
+  const h = v ? v.videoHeight : 0;
+  if (!w || !h) {
+    voiceCamError.value = "没有取到图片内容，请重试";
+    return;
+  }
+  try {
+    const cv = document.createElement("canvas");
+    cv.width = w;
+    cv.height = h;
+    cv.getContext("2d").drawImage(v, 0, 0, w, h);
+    const blob = await new Promise((resolve) => cv.toBlob(resolve, "image/jpeg", 0.85));
+    if (!blob) {
+      voiceCamError.value = "图片处理失败，请重试";
+      return;
+    }
+    closeCamera();
+    await attachImageBlob(blob, "jpg");
+  } catch (e) {
+    voiceCamError.value = "拍照失败：" + ((e && e.message) || "未知原因");
+  }
+}
+
+function pickPhotoFile(capture) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/*";
+  if (capture) input.capture = "environment";
+  input.onchange = async () => {
+    const f = input.files && input.files[0];
+    if (!f) return;
+    if (!/^image\//.test(f.type || "")) {
+      voiceError.value = "这不是图片文件";
+      return;
+    }
+    if (f.size > VOICE_IMAGE_MAX) {
+      voiceError.value = "图片太大，单张不能超过 8 MB";
+      return;
+    }
+    const ext = (f.name.split(".").pop() || "jpg").toLowerCase();
+    await attachImageBlob(f, /^(jpg|jpeg|png|webp)$/.test(ext) ? ext : "jpg");
+  };
+  input.click();
+}
+
+function fromAlbum() {
+  voiceSheetOpen.value = false;
+  pickPhotoFile(false);
+}
+
+function useSystemCamera() {
+  voiceSheetOpen.value = false;
+  voiceError.value = "已改用系统相机";
+  pickPhotoFile(true);
+}
+
+/* ── 随问附图：先上传拿 image_id，再随语音轮提交 ──────────── */
+
+function releaseAttach() {
+  const a = voiceAttach.value;
+  if (a && a.url) {
+    try {
+      URL.revokeObjectURL(a.url);
+    } catch (e) {}
+  }
+  voiceAttach.value = null;
+}
+
+function removeAttach() {
+  releaseAttach();
+  voiceError.value = "";
+}
+
+async function attachImageBlob(blob, ext) {
+  releaseAttach();
+  const seq = ++voiceImageSeq;
+  voiceAttach.value = {
+    id: "",
+    url: URL.createObjectURL(blob),
+    status: "uploading",
+    error: "",
+  };
+  voiceError.value = "正在看这张图…";
+  const ac = new AbortController();
+  const timer = window.setTimeout(() => ac.abort(), VOICE_UPLOAD_MS);
+  try {
+    const r = await fetch(
+      "/api/v2/voice/image?ext=" +
+        encodeURIComponent(ext || "jpg") +
+        (voiceConversationId
+          ? "&conversation_id=" + encodeURIComponent(voiceConversationId)
+          : ""),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": blob.type || "image/jpeg",
+          "X-Workbench": "1",
+        },
+        body: blob,
+        signal: ac.signal,
+      },
+    );
+    const j = await r.json().catch(() => ({}));
+    if (seq !== voiceImageSeq) return; // 已被更新的图取代
+    if (!r.ok) throw new Error(j.error || "上传失败");
+    voiceAttach.value = {
+      ...voiceAttach.value,
+      id: j.image_id || j.id || "",
+      status: "ready",
+    };
+    voiceError.value = "";
+  } catch (e) {
+    if (seq !== voiceImageSeq) return;
+    const aborted = e && (e.name === "AbortError" || /abort/i.test(e.message || ""));
+    const offline = e && e.name === "TypeError";
+    const msg = aborted
+      ? "上传超时，请检查网络后重试"
+      : offline
+        ? "网络中断，图片没传上去"
+        : (e && e.message) || "上传失败";
+    if (voiceAttach.value) {
+      voiceAttach.value = { ...voiceAttach.value, status: "failed", error: msg };
+    }
+    voiceError.value = msg;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+async function askStreaming(text, epoch = voiceEpoch) {
+  const rid = voiceRequestId || newVoiceRequestId();
   voiceState.value = "thinking";
+  voicePhase.value = "queued";
   voiceAnswerText.value = "";
   voiceQueue = [];
   voiceSpeaking = false;
   voiceStreamDone = false;
+  voiceInterrupted = false;
+  const ac = new AbortController();
+  voiceAbort = ac;
   let full = "";
   let pending = "";
   try {
@@ -1535,20 +2072,21 @@ async function askStreaming(text) {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Workbench": "1" },
       body: JSON.stringify({
-        request_id:
-          (window.crypto &&
-            typeof window.crypto.randomUUID === "function" &&
-            window.crypto.randomUUID()) ||
-          "voice-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        request_id: rid,
         question: text,
         conversation_id: voiceConversationId || undefined,
         domain: chosenDomain,
+        // 附了照片：只带 image_id，图片本身已在 /voice/image 落盘
+        image_id:
+          voiceAttach.value && voiceAttach.value.id ? voiceAttach.value.id : undefined,
       }),
+      signal: ac.signal,
     });
     if (!res.ok || !res.body) {
       const j = await res.json().catch(() => ({}));
       throw new Error(j.error || "服务返回 " + res.status);
     }
+    releaseAttach(); // 图已随本轮提交，不能跟着下一轮重复发送
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -1571,10 +2109,17 @@ async function askStreaming(text) {
         }
         if (obj.type === "meta") {
           if (obj.conversation_id) voiceConversationId = obj.conversation_id;
+          if (obj.turn_id) voiceTurnId = obj.turn_id;
+          continue;
+        }
+        if (obj.type === "phase") {
+          voicePhase.value = obj.phase;
           continue;
         }
         if (obj.error) throw new Error(obj.error);
         if (obj.delta) {
+          // 打断之后迟到的旧答案是"隔轮串音"的来源，一律丢弃
+          if (voiceInterrupted || ac.signal.aborted || epoch !== voiceEpoch) continue;
           full += obj.delta;
           pending += obj.delta;
           voiceAnswerText.value = full;
@@ -1585,8 +2130,10 @@ async function askStreaming(text) {
             if (sentence) enqueueSpeech(sentence);
           }
         }
+        if (obj.done) voicePhase.value = obj.status || "completed";
       }
     }
+    if (voiceInterrupted || epoch !== voiceEpoch) return;
     if (pending.trim()) enqueueSpeech(pending.trim());
     voiceHistory.push({ role: "user", content: text }, { role: "assistant", content: full });
     voiceHistory = voiceHistory.slice(-8);
@@ -1594,10 +2141,80 @@ async function askStreaming(text) {
     refresh().catch(() => {});
     if (!voiceSpeaking && voiceQueue.length === 0) resumeListening();
   } catch (e) {
+    if (voiceInterrupted || ac.signal.aborted) return; // 主动打断不算失败
     voiceError.value = e.message || "生成失败";
     voiceState.value = "idle";
     voiceStreamDone = true;
+  } finally {
+    if (voiceAbort === ac) voiceAbort = null;
   }
+}
+
+function newVoiceRequestId() {
+  return (
+    (window.crypto &&
+      typeof window.crypto.randomUUID === "function" &&
+      window.crypto.randomUUID()) ||
+    "voice-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8)
+  );
+}
+
+// 打断：停播 → 清待播 → 取消服务端这一轮 → 丢弃迟到增量/音频
+function interruptVoice() {
+  voiceInterrupted = true;
+  voiceEpoch++; // 作废在途的识别与生成
+  try {
+    if (voiceAudio) {
+      voiceAudio.onended = null;
+      voiceAudio.onpause = null;
+      voiceAudio.pause();
+      voiceAudio.src = "";
+      voiceAudio = null;
+    }
+  } catch (e) {}
+  try {
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+  } catch (e) {}
+  try {
+    const n = voiceNative();
+    if (n && typeof n.stopSpeaking === "function") n.stopSpeaking();
+    if (n && typeof n.stopListening === "function") n.stopListening();
+  } catch (e) {}
+  voiceQueue = [];
+  voiceSpeaking = false;
+  voiceStreamDone = true;
+  const asr = voiceAsrAbort;
+  voiceAsrAbort = null;
+  if (asr) {
+    try {
+      asr.abort();
+    } catch (e) {}
+  }
+  const ac = voiceAbort;
+  voiceAbort = null;
+  if (ac) {
+    try {
+      ac.abort();
+    } catch (e) {}
+  }
+  const turnId = voiceTurnId;
+  voiceTurnId = "";
+  if (turnId) {
+    fetch("/api/v2/turns/" + encodeURIComponent(turnId) + "/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Workbench": "1" },
+    }).catch(() => {});
+  }
+  voicePhase.value = "";
+  if (voiceState.value !== "listening") voiceState.value = "idle";
+}
+
+// 重试回答：换新请求编号重开一轮（失败轮次留在历史里，便于定位）
+function retryAnswer() {
+  if (!voiceText.value) return;
+  voiceError.value = "";
+  voiceRequestId = newVoiceRequestId();
+  askStreaming(voiceText.value);
 }
 
 function enqueueSpeech(text) {
@@ -1608,6 +2225,10 @@ function enqueueSpeech(text) {
 }
 
 async function playNext() {
+  if (voiceInterrupted) {
+    voiceSpeaking = false;
+    return;
+  }
   const text = voiceQueue.shift();
   if (!text) {
     voiceSpeaking = false;
@@ -1659,6 +2280,12 @@ function playServerTts(text) {
           voiceAudio = null;
           reject(Error("播放失败"));
         };
+        // 打断时 pause() 不会触发 onended，这里兜底结束当前句
+        audio.onpause = () => {
+          URL.revokeObjectURL(url);
+          voiceAudio = null;
+          resolve();
+        };
         audio.play().catch(reject);
       })
       .catch(reject);
@@ -1690,26 +2317,27 @@ function playFallbackTts(text) {
 }
 
 function resumeListening() {
-  if (!voiceMode.value || voiceCapture) return;
-  window.setTimeout(() => {
-    if (!voiceMode.value || voiceCapture) return;
-    const n = voiceNative();
-    if (n && typeof n.diagnose === "function") {
-      let d = null;
-      try {
-        d = JSON.parse(n.diagnose());
-      } catch (e) {}
-      if (d && d.asr) {
-        startNativeListening();
-        return;
-      }
-      if (d && d.rec) {
-        startNativeRec();
-        return;
-      }
+  // 按住说话：回答结束后只回到"待按住"，不自动开始录音
+  if (!voiceMode.value) return;
+  cleanupCapture();
+  voiceHolding.value = false;
+  voiceHoldMs.value = 0;
+  voiceCancelArmed.value = false;
+  voiceState.value = "idle";
+  // 免按键：回答播完后自动继续听，用户不用每轮都点一次
+  if (!voiceHandsFree.value || voicePaused.value) return;
+  if (voiceHfRestart) window.clearTimeout(voiceHfRestart);
+  voiceHfRestart = window.setTimeout(() => {
+    voiceHfRestart = 0;
+    if (
+      voiceMode.value &&
+      voiceHandsFree.value &&
+      !voicePaused.value &&
+      voiceState.value === "idle"
+    ) {
+      startHandsFree();
     }
-    if (voiceServer.asr) startCapture();
-  }, 250);
+  }, VOICE_HF_DELAY_MS);
 }
 
 function handleVoiceEvent(ev) {
@@ -1781,12 +2409,25 @@ function stopSpeaking() {
 }
 
 function endCall() {
+  unbindHoldPointer();
+  document.removeEventListener("visibilitychange", onVoiceVisibility);
+  window.removeEventListener("blur", onVoiceBlur);
+  voiceHolding.value = false;
+  voiceHoldMs.value = 0;
   voiceMode.value = false;
   voiceState.value = "idle";
   voiceSetupOpen.value = false;
   voiceQueue = [];
   voiceSpeaking = false;
   cleanupCapture();
+  closeCamera();
+  releaseAttach();
+  voiceSheetOpen.value = false;
+  voicePaused.value = false;
+  if (voiceHfRestart) {
+    window.clearTimeout(voiceHfRestart);
+    voiceHfRestart = 0;
+  }
   if (voiceAudio) {
     try {
       voiceAudio.pause();
@@ -1865,9 +2506,15 @@ watch(
   { immediate: true }
 );
 
+// 点击页面空白处关闭部门「⋯」菜单（触发按钮与菜单项均 @click.stop，不会误关）
+const closeDeptMenu = () => {
+  if (deptMenu.value) deptMenu.value = "";
+};
+
 onMounted(async () => {
   // 接收安卓壳的语音事件
   window.__qingheVoice = handleVoiceEvent;
+  document.addEventListener("click", closeDeptMenu);
   try {
     const status = await call("/auth/status");
     setup.value = status.setup_required;
@@ -1889,6 +2536,7 @@ onUnmounted(() => {
   clearInterval(timer);
   clearInterval(clock);
   if (window.__qingheVoice === handleVoiceEvent) delete window.__qingheVoice;
+  document.removeEventListener("click", closeDeptMenu);
   endCall();
 });
 </script>
@@ -2593,6 +3241,7 @@ onUnmounted(() => {
           </section>
           <section class="panel block">
             <h2>我的任务</h2>
+            <p v-if="imageNotice" class="badge neutral" style="margin: 6px 0">{{ imageNotice }}</p>
             <p v-if="!imageTasks.length" class="empty">还没有图片任务。</p>
             <div v-for="t in imageTasks" :key="t.id" class="list-row">
               <div style="flex: 0 0 128px">
@@ -2617,10 +3266,18 @@ onUnmounted(() => {
                 <strong>{{ t.prompt }}</strong>
                 <small>
                   {{ t.width }}×{{ t.height }}
+                  <span>· {{ imageStatus[t.status] || t.status }}</span>
+                  <span v-if="t.status === 'queued'"> · 等待出图服务接单</span>
+                  <span v-if="t.status === 'running'"> · 正在生成（通常 10–20 秒）</span>
                   <span v-if="t.status === 'completed'">
                     · {{ new Date(t.completed_at).toLocaleString() }}
                   </span>
                   <span v-if="t.error" class="badge danger">{{ t.error }}</span>
+                  <span
+                    v-if="t.cancel_error && ['queued', 'running'].includes(t.status)"
+                    class="badge danger"
+                    >取消失败：{{ t.cancel_error }}</span
+                  >
                 </small>
               </div>
               <div style="flex: 0 0 auto">
@@ -3767,14 +4424,91 @@ onUnmounted(() => {
       <div class="voice-orb" :class="'is-' + voiceState"><Mic :size="30" /></div>
       <h2 class="voice-title">{{ voiceStateText }}</h2>
       <p class="voice-sub">
-        <template v-if="voiceState === 'listening'">说完停顿一下，我会自动提交</template>
-        <template v-else-if="voiceState === 'thinking'">正在生成回答，听到第一句就会开念</template>
+        <template v-if="voiceState === 'listening'">
+          {{ voiceCancelArmed ? '松开取消，不发送' : (voiceHandsFree ? '我在听，说完停顿一下就会发送' : '松开发送 · 上滑取消') }}
+        </template>
+        <template v-else-if="voiceState === 'recognizing'">正在把你说的转成文字…</template>
+        <template v-else-if="voiceState === 'thinking'">
+          {{ voicePhase === 'queued' ? '排队中，马上开始…' : '正在查资料、生成回答，听到第一句就会开念' }}
+        </template>
         <template v-else-if="voiceState === 'speaking'">正在朗读，可随时停止</template>
-        <template v-else>点击「再说一次」继续</template>
+        <template v-else-if="voiceHandsFree">
+          {{ voicePaused ? '已暂停收听，点麦克风继续' : (voiceText ? '回答完了，或点下方麦克风可以接着问' : '可以开口问，说一句就开始') }}
+        </template>
+        <template v-else>按住下方按钮说话，松开发送</template>
       </p>
       <div v-if="voiceState === 'listening'" class="voice-level">
         <i :style="{ width: Math.round(voiceLevel * 100) + '%' }"></i>
       </div>
+      <div class="voice-tools">
+        <button
+          type="button"
+          class="voice-tool"
+          :disabled="voiceState === 'recognizing'"
+          @click="openCamSheet"
+          title="拍照提问"
+        >
+          <Camera :size="16" />拍照
+        </button>
+        <button
+          type="button"
+          class="voice-tool"
+          :class="{ on: voiceHandsFree }"
+          @click="toggleHandsFree"
+          :title="voiceHandsFree ? '已切换为按住说话' : '已切换为免按键'"
+        >
+          <Radio :size="16" />{{ voiceHandsFree ? '免按键' : '按住' }}
+        </button>
+        <button
+          v-if="voiceAttach"
+          type="button"
+          class="voice-tool"
+          @click="removeAttach"
+          title="移除这张图"
+        >
+          <X :size="16" />移除图片
+        </button>
+      </div>
+      <div v-if="voiceAttach" class="voice-attach">
+        <img :src="voiceAttach.url" alt="这一轮的照片" />
+        <span v-if="voiceAttach.status === 'uploading'">正在上传，稍等一下…</span>
+        <span v-else-if="voiceAttach.status === 'failed'" class="err">
+          {{ voiceAttach.error || '上传失败' }}
+        </span>
+        <span v-else>图片已附上，提问时一起上传</span>
+      </div>
+      <button
+        type="button"
+        :style="{
+          margin: '10px auto 4px',
+          padding: '16px 28px',
+          minWidth: '220px',
+          borderRadius: '999px',
+          border: voiceCancelArmed ? '2px solid #d9534f' : '2px solid #153e34',
+          background: (voiceHolding || (voiceHandsFree && voiceState === 'listening')) ? (voiceCancelArmed ? '#fdecea' : '#e8f3ef') : '#fff',
+          color: voiceCancelArmed ? '#d9534f' : '#153e34',
+          fontWeight: 600,
+          fontSize: '16px',
+          touchAction: 'none',
+          userSelect: 'none',
+          webkitUserSelect: 'none'
+        }"
+        @pointerdown.prevent="holdVoiceStart"
+        @pointerup.prevent="holdVoiceEnd"
+        @pointercancel.prevent="holdVoiceCancel"
+        @pointermove="holdVoiceMove"
+        @contextmenu.prevent
+      >
+        <template v-if="voiceRequesting">正在请求麦克风…</template>
+        <template v-else-if="voiceHandsFree">
+          {{ voiceState === 'listening' ? '暂停收听' : (voicePaused ? '点一下继续听' : '点一下开始说') }}
+        </template>
+        <template v-else-if="voiceHolding">
+          {{ voiceCancelArmed ? '松开取消' : (voiceHoldMs / 1000).toFixed(1) + 's · 松开发送' }}
+        </template>
+        <template v-else-if="voiceState === 'thinking' || voiceState === 'speaking'">按住打断并提问</template>
+        <template v-else>按住说话</template>
+      </button>
       <div v-if="voiceText" class="voice-transcript">
         <span class="voice-role">你说</span>{{ voiceText }}
       </div>
@@ -3782,6 +4516,15 @@ onUnmounted(() => {
         <span class="voice-role">回答</span>{{ voiceAnswerText }}
       </div>
       <p v-if="voiceError" class="voice-error">{{ voiceError }}</p>
+      <button
+        v-if="voiceError && voiceText && voiceState === 'idle'"
+        type="button"
+        class="outline"
+        style="margin: 6px auto"
+        @click="retryAnswer"
+      >
+        重试回答
+      </button>
       <div class="voice-actions">
         <button
           type="button"
@@ -3803,8 +4546,55 @@ onUnmounted(() => {
           <PhoneOff :size="16" />挂断
         </button>
       </div>
-      <p class="voice-tip">说完停顿一下自动提交；回答边生成边朗读</p>
+      <p class="voice-tip">
+        {{ voiceHandsFree
+          ? '免按键：直接说话，停顿一下自动发送；回答播完自动继续听；单次最长 60 秒'
+          : '按住说话、松开发送；上滑取消；单次最长 60 秒；回答边生成边朗读' }}
+      </p>
     </template>
+
+    <!-- 页面内相机：实时取景 + 快门 -->
+    <div v-if="voiceCamOpen" class="voice-cam">
+      <video ref="voiceCamVideo" playsinline muted autoplay></video>
+      <div class="voice-cam-top">
+        <button type="button" class="vc-icon" @click="closeCamera" title="关闭相机">
+          <X :size="20" />
+        </button>
+        <span>对准叶片，按中间白色快门</span>
+      </div>
+      <div class="voice-cam-bottom">
+        <button
+          type="button"
+          class="vc-shutter"
+          :disabled="!voiceCamReady"
+          @click="shootPhoto"
+        >
+          <i></i>
+        </button>
+      </div>
+      <p v-if="voiceCamError" class="voice-cam-error">{{ voiceCamError }}</p>
+    </div>
+
+    <!-- 图片来源选择 -->
+    <div
+      v-if="voiceSheetOpen"
+      class="vc-sheet-mask"
+      @click.self="voiceSheetOpen = false"
+    >
+      <div class="vc-sheet">
+        <button type="button" @click="openInPageCamera">
+          <Camera :size="18" /><span>打开相机（页面内）</span>
+        </button>
+        <button type="button" @click="fromAlbum">
+          <ImagePlus :size="18" /><span>从相册选择</span>
+        </button>
+        <button type="button" @click="useSystemCamera">
+          <Camera :size="18" /><span>系统相机</span>
+        </button>
+        <p v-if="voiceCamError" class="err">{{ voiceCamError }}</p>
+        <button type="button" class="cancel" @click="voiceSheetOpen = false">取消</button>
+      </div>
+    </div>
   </div>
 </div>
 </template>
@@ -4740,6 +5530,177 @@ a.text-button {
   font-size: 11px;
   color: #a2ada7;
   margin-top: 16px;
+}
+
+.voice-tools {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin: 2px auto 6px;
+}
+.voice-tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid #d7e0db;
+  background: #fff;
+  color: #4a5a53;
+  font-size: 12px;
+  cursor: pointer;
+}
+.voice-tool.on {
+  border-color: #153e34;
+  background: #e8f3ef;
+  color: #153e34;
+  font-weight: 600;
+}
+.voice-tool:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.voice-attach {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: center;
+  margin: 0 auto 8px;
+  font-size: 12px;
+  color: #4a5a53;
+}
+.voice-attach img {
+  width: 54px;
+  height: 54px;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid #d7e0db;
+}
+.voice-attach .err {
+  color: #c0392b;
+}
+
+/* 页面内相机 */
+.voice-cam {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: #000;
+  display: flex;
+  flex-direction: column;
+}
+.voice-cam video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.voice-cam-top {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  color: #fff;
+  font-size: 13px;
+  background: linear-gradient(#000000aa, #00000000);
+}
+.vc-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 0;
+  background: #ffffff26;
+  color: #fff;
+  cursor: pointer;
+}
+.voice-cam-bottom {
+  position: relative;
+  z-index: 2;
+  margin-top: auto;
+  padding: 24px 0 40px;
+  display: flex;
+  justify-content: center;
+  background: linear-gradient(#00000000, #000000aa);
+}
+.vc-shutter {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  border: 4px solid #ffffffcc;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+.vc-shutter i {
+  display: block;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: #fff;
+}
+.vc-shutter:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.voice-cam-error {
+  position: relative;
+  z-index: 2;
+  margin: 0;
+  padding: 8px 16px 16px;
+  color: #ffd7d0;
+  font-size: 13px;
+  text-align: center;
+}
+
+/* 图片来源选择 */
+.vc-sheet-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 61;
+  background: #00000066;
+  display: flex;
+  align-items: flex-end;
+}
+.vc-sheet {
+  width: 100%;
+  background: #fff;
+  border-radius: 16px 16px 0 0;
+  padding: 10px 12px 22px;
+  display: grid;
+  gap: 6px;
+}
+.vc-sheet button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: #f5f8f6;
+  color: #153e34;
+  font-size: 15px;
+  cursor: pointer;
+}
+.vc-sheet button.cancel {
+  justify-content: center;
+  background: transparent;
+  color: #7b8a83;
+  font-size: 14px;
+}
+.vc-sheet .err {
+  margin: 0;
+  padding: 6px 12px;
+  color: #c0392b;
+  font-size: 12px;
 }
 .voice-card {
   max-height: 86vh;
