@@ -6026,6 +6026,9 @@ onUnmounted(() => {
             </p>
 
             <!-- 本轮附图：按选择顺序排列，每张独立状态；缩略图不等于已上传 -->
+            <p v-if="attaches.length > 1 && attachCanSend" class="vc-shot-tip">
+              本轮带 {{ attaches.length }} 张图，按你选的顺序交给模型；追问会继续用这几张
+            </p>
             <div v-if="attaches.length" class="vc-shot-row">
               <div
                 v-for="(a, ai) in attaches"
@@ -8011,6 +8014,7 @@ a.text-button {
 .vc-more{display:flex;align-items:center;gap:14px;font-size:12px;color:#9fc4b5;flex-wrap:wrap;justify-content:center}
 .vc-more select{background:#ffffff1a;color:#eaf6f0;border:0;border-radius:8px;padding:5px 8px;font-size:12px}
 .vc-tip{opacity:.7}
+.vc-shot-tip{margin:6px 0 0;font-size:12px;color:#9fd8bd}
 .vc-shot-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;max-height:34vh;overflow:auto}
 .vc-shot{display:flex;align-items:center;gap:10px;width:auto;flex:1 1 240px;margin-top:0;padding:8px 10px;border-radius:14px;background:#ffffff12;border:1px solid rgba(255,255,255,.12);text-align:left}
 .turn-shots{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
