@@ -252,6 +252,29 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
       return true;
     }
 
+    // 前端上报的语音链路耗时。手机上没有控制台，只能靠这里落日志：
+    //   识别 = 上传录音到出文字；首字 = 发问到第一个字；
+    //   首音 = 发问到真正听到声音（含合成与下载）
+    if (req.method === "POST" && url.pathname === "/api/v2/voice/timing") {
+      const body = await readBody(req);
+      // 鉴权在 server.mjs 入口已做过；这里再查一次只会让打点因为内部请求失败而丢数据
+      const n = (v) => Math.max(0, Math.round(Number(v) || 0));
+      console.log(
+        "[voice-timing] 识别 " +
+          n(body.asrMs) +
+          "ms · 首字 " +
+          n(body.firstCharMs) +
+          "ms · 首音 " +
+          n(body.firstAudioMs) +
+          "ms · 完整 " +
+          n(body.totalMs) +
+          "ms · 角色 " +
+          String(body.role || "?").slice(0, 16),
+      );
+      json(res, 200, { ok: true });
+      return true;
+    }
+
     if (url.pathname === "/api/v2/voice/asr") {
       const audio = await readRaw(req);
       if (!audio.length) {

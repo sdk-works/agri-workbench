@@ -1462,7 +1462,7 @@ const TTS_PREFETCH_AHEAD = 3; // 多备一句，切换时不用等合成
 // 中文回答标点密，一句二三十字就断一次会让停顿叠加；攒够一整句再送合成
 const VOICE_MIN_SENTENCE = 32;
 // 但首句不能等：先把声音放出来，后续才靠长句压停顿
-const VOICE_FIRST_SENTENCE = 12;
+const VOICE_FIRST_SENTENCE = 8;
 const VOICE_SENT_RE = /[。！？!?；;\n]/g;
 let voiceStreamDone = true;
 let voiceCapture = null;
@@ -3526,13 +3526,29 @@ function resumeListening() {
   // 真机上打开控制台就能看出卡在哪一段，不用再靠"感觉有点慢"。
   if (voiceTiming.t0 && !voiceTiming.logged) {
     voiceTiming.logged = true;
+    const totalMs = Math.round(performance.now() - voiceTiming.t0);
     try {
       console.info(
         "[voice] 识别 " + voiceTiming.asrMs + "ms · 首字 " + voiceTiming.firstCharMs +
           "ms · 首段声音 " + voiceTiming.firstAudioMs + "ms · 完整 " +
-          Math.round(performance.now() - voiceTiming.t0) + "ms · 角色 " +
-          (voiceLastRole || "?"),
+          totalMs + "ms · 角色 " + (voiceLastRole || "?"),
       );
+    } catch (e) {}
+    // 手机上看不到 console，同一份打点再发一份到服务端日志，
+    // 这样"感觉慢了"能变成"哪一段慢"
+    try {
+      fetch("/api/v2/voice/timing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Workbench": "1" },
+        body: JSON.stringify({
+          asrMs: voiceTiming.asrMs,
+          firstCharMs: voiceTiming.firstCharMs,
+          firstAudioMs: voiceTiming.firstAudioMs,
+          totalMs: totalMs,
+          role: voiceLastRole || "",
+        }),
+        keepalive: true,
+      }).catch(() => {});
     } catch (e) {}
   }
   // 按住说话：回答结束后只回到"待按住"，不自动开始录音

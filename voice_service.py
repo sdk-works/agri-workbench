@@ -449,7 +449,7 @@ _TTS_LOCAL_DIR = os.getenv(
 )
 # 换模型必须换缓存命名空间：缓存 key 只算 (音色+文本)，
 # 不带上模型标识的话，用户会听到上一版模型留下的 wav，以为"改了没生效"。
-_TTS_MODEL_TAG = os.getenv("TTS_MODEL_TAG", "melo-zh-en@24k")
+_TTS_MODEL_TAG = os.getenv("TTS_MODEL_TAG", "melo-zh-en@24k-mp3")
 # 输出采样率。MeloTTS 原生 44100，改 24000 省掉近一半传输体积；
 # 设 0 则保持模型原生采样率（想对比音质时用）。
 _TTS_SR_OUT = int(os.getenv("TTS_LOCAL_SR", "24000"))
@@ -562,6 +562,34 @@ def _resample(samples, src_sr, dst_sr):
     return y, dst_sr  # 直接给 ndarray，_wav 里省掉一次 tolist 拷贝
 
 
+def _mp3(samples, sr, bitrate=64):
+    """PCM -> MP3。
+
+    一句 4 秒的 24kHz 16bit 单声道 wav 有 192KB，手机在田间弱网下
+    光下载就要两三秒，比合成本身还慢；64kbps 的 mp3 只有 32KB。
+    编码器缺失或抛错时返回空字节，调用方回退到 wav，不能让这句话没声音。
+    """
+    try:
+        import lameenc
+        import numpy as np
+    except Exception as exc:  # noqa: BLE001
+        print(f"[voice] mp3 编码不可用，回退 wav: {exc}", flush=True)
+        return b""
+    pcm = np.clip(
+        np.asarray(samples, dtype=np.float32) * 32767.0, -32768.0, 32767.0
+    ).astype("<i2")
+    try:
+        enc = lameenc.Encoder()
+        enc.set_bit_rate(bitrate)
+        enc.set_in_sample_rate(sr)
+        enc.set_channels(1)
+        enc.set_quality(3)  # 3 已接近最高质量，再往上编码时间翻倍而听感无差
+        return bytes(enc.encode(pcm.tobytes()) + enc.flush())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[voice] mp3 编码失败，回退 wav: {exc}", flush=True)
+        return b""
+
+
 def synth_local(text: str) -> bytes:
     tts = local_engine()
     if tts is None:
@@ -570,6 +598,9 @@ def synth_local(text: str) -> bytes:
     if not audio.samples:
         raise RuntimeError("本地 TTS 无输出")
     samples, sr = _resample(audio.samples, audio.sample_rate, _TTS_SR_OUT)
+    packed = _mp3(samples, sr)
+    if packed:
+        return packed
     return _wav(samples, sr)
 
 
@@ -622,7 +653,7 @@ def synth(text: str, voice: str):
         (_TTS_MODEL_TAG + "\n" + tts_voice + "\n" + text).encode("utf-8")
     ).hexdigest()
     edge_path = os.path.join(CACHE_DIR, key + ".mp3")
-    local_path = os.path.join(CACHE_DIR, key + ".local.wav")
+    local_path = os.path.join(CACHE_DIR, key + ".local.mp3")
 
     def read(p):
         with open(p, "rb") as fh:
@@ -638,10 +669,10 @@ def synth(text: str, voice: str):
         # 本地模式只认本地缓存：否则会捡到之前云端留下的 mp3，
         # 同一轮对话里一半云端音色一半本地音色，听着像两个人
         if os.path.exists(local_path):
-            return read(local_path), "audio/wav"
+            return read(local_path), "audio/mpeg"
         data = synth_local(text)
         save(local_path, data)
-        return data, "audio/wav"
+        return data, "audio/mpeg"
 
     if os.path.exists(edge_path):
         return read(edge_path), "audio/mpeg"
@@ -654,14 +685,14 @@ def synth(text: str, voice: str):
             print(f"[voice] 云端合成失败，改用本地: {exc}", flush=True)
             data = synth_local(text)
             save(local_path, data)
-            return data, "audio/wav"
+            return data, "audio/mpeg"
         save(edge_path, data)
         return data, "audio/mpeg"
 
     # auto：先把云端请求丢到后台，等一小会儿；等不及就让本地先出声。
     # 云端线程继续跑，成功了会写进缓存，下次同一句仍是云端音色。
     if os.path.exists(local_path):
-        return read(local_path), "audio/wav"
+        return read(local_path), "audio/mpeg"
 
     box = {}
 
@@ -682,7 +713,7 @@ def synth(text: str, voice: str):
     try:
         data = synth_local(text)
         save(local_path, data)
-        return data, "audio/wav"
+        return data, "audio/mpeg"
     except Exception as exc:
         print(f"[voice] 本地 TTS 也失败: {exc}", flush=True)
 
