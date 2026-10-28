@@ -6085,7 +6085,12 @@ onUnmounted(() => {
                 class="vc-shot"
                 :class="attachToneOf(a)"
               >
-                <img :src="a.url" alt="本轮附图" />
+                <img
+                  :src="a.url"
+                  alt="本轮附图"
+                  title="点一下放大看"
+                  @click="shotZoom = a.url"
+                />
                 <div class="vc-shot-side">
                   <b class="vc-shot-label"
                     >第 {{ ai + 1 }} 张 · {{ attachInfoOf(a).text }}</b
