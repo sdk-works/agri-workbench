@@ -106,15 +106,17 @@
         }
       }
 
+      // 安全地址清单：**同源优先**。同源的 /cf-url.txt 由所在服务器直接提供，
+      // 不受 CORS 限制；跨域的绝对地址只是兜底（不同源时要对方带 CORS 头）。
       function pick(text) {
         var m = (text || '').match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
         return m ? m[0] : null;
       }
 
       var cands = [
-        'http://42.193.104.148/cf-url.txt',
         '/cf-url.txt',
-        'http://42.193.104.148:8080/cf-url.txt'
+        'http://42.193.104.148:8080/cf-url.txt',
+        'http://42.193.104.148/cf-url.txt'
       ];
 
       (function tryOne(i) {
