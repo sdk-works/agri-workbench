@@ -10,6 +10,7 @@ import { createWorkspace } from "./workspace.mjs";
 import { createImageServer } from "./image-server.mjs";
 import { createVoice } from "./voice.mjs";
 import { loadEnv } from "./env.mjs";
+import { buildOriginMatcher } from "./origin-guard.mjs";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url))),
   env = loadEnv();
@@ -79,17 +80,14 @@ const workspace = createWorkspace({
 });
 await workspace.start();
 const voice = createVoice({ env, json, readBody, gateway, workspace });
-const allowedOrigins = new Set(
-  (
-    env.ALLOWED_ORIGINS ||
-    "http://127.0.0.1:5174,http://localhost:5174,http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:8787,http://localhost:8787"
-  )
-    .split(",")
-    .map((s) => s.trim()),
+// 页面来源校验见 origin-guard.mjs（独立成模块是为了能单独测它）。
+const originAllowed = buildOriginMatcher(
+  env.ALLOWED_ORIGINS ||
+    "http://127.0.0.1:5174,http://localhost:5174,http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:8787,http://localhost:8787",
 );
 const server = http.createServer(async (req, res) => {
   try {
-    if (req.headers.origin && !allowedOrigins.has(req.headers.origin))
+    if (req.headers.origin && !originAllowed(req.headers.origin))
       return json(res, 403, { error: "页面来源未授权" });
     const url = new URL(req.url, "http://127.0.0.1");
     if (

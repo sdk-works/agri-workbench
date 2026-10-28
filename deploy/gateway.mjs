@@ -10,6 +10,19 @@ const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript','.css':'t
 '.txt':'text/plain; charset=utf-8'};
 http.createServer((req,res)=>{
  let pathname;try{pathname=decodeURIComponent(new URL(req.url,'http://localhost').pathname);}catch{res.writeHead(400).end();return;}
+ if(pathname==='/cf-url.txt'){
+  // 当前 Cloudflare 隧道地址（云端 nginx 实时维护，隧道重启后会变）。
+  // 入口页 entry.html 读它来给出「一键用安全连接进入」的按钮。
+  const up=http.request({hostname:'42.193.104.148',port:80,path:'/cf-url.txt',method:'GET',headers:{Host:'42.193.104.148'}},r=>{
+   const chunks=[];r.on('data',c=>chunks.push(c));r.on('end',()=>{
+    const body=Buffer.concat(chunks).toString('utf8').trim();
+    res.writeHead(200,{'Content-Type':'text/plain; charset=utf-8','Cache-Control':'no-store','Access-Control-Allow-Origin':'*','X-Content-Type-Options':'nosniff'});
+    res.end(body);
+   });
+  });
+  up.on('error',()=>{if(!res.headersSent)res.writeHead(502);res.end('');});
+  up.setTimeout(8000,()=>up.destroy());up.end();return;
+ }
  if(pathname.startsWith('/api/')){
   const proxy=http.request({hostname:'127.0.0.1',port:Number(process.env.API_PORT||8787),path:req.url,method:req.method,headers:req.headers},up=>{res.writeHead(up.statusCode,up.headers);up.pipe(res);});
   proxy.on('error',()=>{if(!res.headersSent)res.writeHead(502);res.end('Backend unavailable');});
