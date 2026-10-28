@@ -76,7 +76,6 @@ const conversations = ref([]),
   nowTick = ref(Date.now()),
   domain = ref(domains[0]),
   draft = ref(null),
-  pendingImage = ref(null),
   comments = ref({}),
   confirmingDelete = ref("");
 const reviews = ref([]),
@@ -247,7 +246,7 @@ function attachToneOf(a) {
 function attachSubTextOf(a) {
   switch (a && a.status) {
     case "picked":
-      return "还没上传，说完问题会自动带上";
+      return "还没上传，发送时会一起带上";
     case "uploading":
       return "正在传到服务器…";
     case "received":
@@ -796,11 +795,13 @@ function newConversation() {
   turns.value = [];
   question.value = "";
   draft.value = null;
+  dropAttach(); // 图跟会话绑定，换会话不能把旧图带过去
   convDrawer.value = false;
 }
 async function selectConversation(c) {
   conversationId.value = c.id;
   domain.value = c.domain;
+  dropAttach();
   convDrawer.value = false;
   await act(refresh);
 }
@@ -879,31 +880,7 @@ function imageTitle(t) {
   const at = t.completed_at ? " · " + new Date(t.completed_at).toLocaleString() : "";
   return `${t.prompt}（${size}${at}）`;
 }
-async function pickImage(e) {
-  const f = e.target.files?.[0];
-  e.target.value = "";
-  if (!f) return;
-  if (f.size > 8 * 1024 * 1024) {
-    error.value = "图片不能超过 8 MB";
-    return;
-  }
-  if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(f.type)) {
-    error.value = "仅支持 PNG / JPG / WEBP / GIF 图片";
-    return;
-  }
-  const base64 = await new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result.split(",")[1]);
-    reader.onerror = () => reject(Error("读取图片失败"));
-    reader.readAsDataURL(f);
-  });
-  pendingImage.value = { data: base64, mime: f.type, name: f.name };
-  draft.value = null;
-}
-function clearImage() {
-  pendingImage.value = null;
-  draft.value = null;
-}
+let askInflight = false;
 async function ask() {
   if (busy.value) {
     notice.value = "上一条还在回答，等它结束后再发";
@@ -913,31 +890,61 @@ async function ask() {
     notice.value = "还没有分配部门，请联系管理员分配后再提问。";
     return;
   }
-  await act(async () => {
-    if (
-      !draft.value ||
-      draft.value.question !== question.value ||
-      draft.value.conversation_id !== conversationId.value ||
-      Boolean(draft.value.deep) !== Boolean(deep.value) ||
-      Boolean(draft.value.image) !== Boolean(pendingImage.value)
-    )
-      draft.value = {
-        request_id: crypto.randomUUID(),
-        question: question.value,
-        domain: domain.value,
-        deep: deep.value,
-        conversation_id: conversationId.value || undefined,
-        image: pendingImage.value
-          ? { data: pendingImage.value.data, mime: pendingImage.value.mime }
-          : undefined,
-      };
-    const t = await call("/turns", draft.value);
-    conversationId.value = t.conversation_id;
-    question.value = "";
-    pendingImage.value = null;
-    draft.value = null;
-    await refresh();
-  });
+  if (askInflight) return; // 连点两次不能发两轮
+  askInflight = true;
+  try {
+    // 带图就先等图：全部拿到服务端编号才发。
+    // 以前只读 files[0]，第二张悄悄丢掉；现在只要有一张没传上去就停住，
+    // 让用户重试或删掉——绝不让模型对着残缺的图编内容。
+    let imageIds = [];
+    if (attaches.value.length) {
+      error.value = "";
+      const needWait = attaches.value.some(
+        (a) =>
+          a.status === Attach.ATTACH.UPLOADING ||
+          a.status === Attach.ATTACH.PICKED,
+      );
+      if (needWait) notice.value = "图片上传中，传完就发送…";
+      imageIds = await waitAttachSettled();
+      if (imageIds.length < attaches.value.length) {
+        const missing = attaches.value.filter((a) => !a.id);
+        error.value = missing.some((a) => a.status === Attach.ATTACH.FAILED)
+          ? `${missing.length} 张图没传上去：点缩略图上的「重试」，或者删掉这几张只发文字`
+          : "图片还在上传，稍等一下再发；也可以删掉只发文字";
+        return; // 关键：不发残缺的图
+      }
+    }
+    await act(async () => {
+      const ids = imageIds;
+      const sameIds =
+        (draft.value?.image_ids || []).join(",") === ids.join(",");
+      if (
+        !draft.value ||
+        draft.value.question !== question.value ||
+        draft.value.conversation_id !== conversationId.value ||
+        Boolean(draft.value.deep) !== Boolean(deep.value) ||
+        !sameIds
+      )
+        draft.value = {
+          request_id: crypto.randomUUID(),
+          question: question.value,
+          domain: domain.value,
+          deep: deep.value,
+          conversation_id: conversationId.value || undefined,
+          // 只带服务端编号：图已由 /voice/image 落盘，顺序就是用户选图的顺序
+          image_id: ids[0] || undefined,
+          image_ids: ids.length ? ids : undefined,
+        };
+      const t = await call("/turns", draft.value);
+      conversationId.value = t.conversation_id;
+      question.value = "";
+      draft.value = null;
+      dropAttach(); // 图已随本轮提交，收进历史记录
+      await refresh();
+    });
+  } finally {
+    askInflight = false;
+  }
 }
 function onComposerKeydown(e) {
   if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
@@ -945,26 +952,26 @@ function onComposerKeydown(e) {
   if (!question.value.trim()) return;
   ask();
 }
-function onComposerPaste(e) {
+async function onComposerPaste(e) {
   const items = e.clipboardData || window.clipboardData;
   if (!items) return;
-  let file = null;
+  // 剪贴板里可能一次有多张（截图工具常见），全部收下，别只取第一张
+  const files = [];
   for (const it of items.items || []) {
     if (it.type && it.type.indexOf("image/") === 0) {
-      file = it.getAsFile();
-      break;
+      const f = it.getAsFile ? it.getAsFile() : null;
+      if (f) files.push(f);
     }
   }
-  if (!file) return;
+  if (!files.length) return;
   e.preventDefault();
-  const input = e.currentTarget
-    ?.closest(".composer-v3")
-    ?.querySelector(".image-pick input[type=file]");
-  if (input) {
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    input.files = dt.files;
-    input.dispatchEvent(new Event("change", { bubbles: true }));
+  for (const f of files) {
+    try {
+      const out = await compressImage(f);
+      await pickBlob(out.blob, out.ext || "jpg");
+    } catch (err) {
+      error.value = "有一张图片读不出来，已跳过";
+    }
   }
 }
 async function feedback(t, choice) {
@@ -2640,8 +2647,10 @@ function pickPhotoFile(capture) {
       const safeExt = /^(jpg|jpeg|png|webp)$/.test(ext) ? ext : "jpg";
       try {
         const out = await compressImage(f);
-        // 单张仍进预览（可重拍/确认）；多选直接排队上传，逐张可删可重试
-        if (take.length === 1) showShot(out.blob, out.ext || safeExt);
+        // 语音面板里单张仍走预览（可重拍/确认）；文字输入区没有那块预览，
+        // 单张也直接排队上传，否则用户拍完会卡在"看不到预览"的空白里
+        if (take.length === 1 && voiceMode.value)
+          showShot(out.blob, out.ext || safeExt);
         else await pickBlob(out.blob, out.ext || safeExt);
         done += 1;
       } catch (e) {
@@ -2844,9 +2853,14 @@ async function uploadAttach(key) {
         encodeURIComponent(raw.ext || "jpg") +
         "&dedup_key=" +
         encodeURIComponent(key) +
-        (voiceConversationId
-          ? "&conversation_id=" + encodeURIComponent(voiceConversationId)
-          : ""),
+        (() => {
+          // 语音轮走 voiceConversationId，文字轮走 conversationId：
+          // 带错会话号，服务端会以「该图片属于其他会话」把图挡掉
+          const cid = voiceMode.value
+            ? voiceConversationId
+            : conversationId.value;
+          return cid ? "&conversation_id=" + encodeURIComponent(cid) : "";
+        })(),
       {
         method: "POST",
         headers: {
@@ -2899,6 +2913,7 @@ function retryUploadAttachAt(index) {
 function removeAttachAt(index) {
   const a = attaches.value[index];
   if (!a) return;
+  if (shotZoom.value === a.url) shotZoom.value = "";
   if (a.url) {
     try {
       URL.revokeObjectURL(a.url);
@@ -2914,6 +2929,7 @@ function removeAttachAt(index) {
 
 /** 清空本轮全部附图（切会话、挂断、改为只发文字） */
 function dropAttach() {
+  shotZoom.value = "";
   for (const a of attaches.value) {
     if (a && a.url) {
       try {
@@ -4427,38 +4443,71 @@ onUnmounted(() => {
                     placeholder="例如：大棚湿度持续偏高，调整通风前需要检查哪些数据？"
                   />
                 </label>
-                <div v-if="pendingImage" class="composer-image">
-                  <img
-                    :src="`data:${pendingImage.mime};base64,${pendingImage.data}`"
-                    alt="提问图片"
-                  />
-                  <span>{{ pendingImage.name }}</span>
-                  <button
-                    type="button"
-                    class="text-button"
-                    @click="clearImage"
+                <p v-if="shotBusy" class="composer-shot-tip">
+                  {{ shotBusyText || "正在处理照片…" }}
+                </p>
+                <!-- 本轮附图：按选择顺序排列，每张独立状态，可逐张删除/重试 -->
+                <p v-if="attaches.length > 1 && attachCanSend" class="composer-shot-tip">
+                  本轮带 {{ attaches.length }} 张图，会按你选的顺序一起发给模型
+                </p>
+                <div v-if="attaches.length" class="composer-shots">
+                  <div
+                    v-for="(a, ai) in attaches"
+                    :key="a.dedupKey || ai"
+                    class="composer-shot"
+                    :class="attachToneOf(a)"
                   >
-                    移除图片
-                  </button>
+                    <img
+                      :src="a.url"
+                      alt="本轮附图"
+                      title="点一下放大看"
+                      @click="shotZoom = a.url"
+                    />
+                    <div class="composer-shot-side">
+                      <b>第 {{ ai + 1 }} 张 · {{ attachInfoOf(a).text }}</b>
+                      <span v-if="attachSubTextOf(a)">{{ attachSubTextOf(a) }}</span>
+                      <p v-if="a.error" class="composer-shot-err">{{ a.error }}</p>
+                      <div class="composer-shot-acts">
+                        <button
+                          v-if="a.status === 'failed'"
+                          type="button"
+                          class="composer-shot-act"
+                          @click="retryAttachAt(ai)"
+                        >
+                          重试
+                        </button>
+                        <button
+                          type="button"
+                          class="composer-shot-x"
+                          title="删除这张图"
+                          @click="removeAttachAt(ai)"
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                  </div>
                 </div>
+                <p v-if="voiceError" class="composer-shot-alert">{{ voiceError }}</p>
                 <div class="form-bottom">
                   <div class="composer-tools">
                     <span class="image-pick">
-                      <label class="inline-check" title="调用系统相机拍照，随问题发给模型（≤8MB）">
-                        <input
-                          type="file"
-                          accept="image/*"
-                          capture="environment"
-                          @change="pickImage"
-                        /><Camera :size="16" />拍照
-                      </label>
-                      <label class="inline-check" title="从相册选图（PNG/JPG/WEBP/GIF，≤8MB）">
-                        <input
-                          type="file"
-                          accept="image/png,image/jpeg,image/webp,image/gif"
-                          @change="pickImage"
-                        /><ImagePlus :size="16" />相册
-                      </label>
+                      <button
+                        type="button"
+                        class="inline-check"
+                        title="调用系统相机拍照，拍完可继续追加，最多 6 张"
+                        @click="pickPhotoFile(true)"
+                      >
+                        <Camera :size="16" />拍照
+                      </button>
+                      <button
+                        type="button"
+                        class="inline-check"
+                        title="从相册选图，可一次多选，最多 6 张"
+                        @click="pickPhotoFile(false)"
+                      >
+                        <ImagePlus :size="16" />相册
+                      </button>
                     </span>
                   <button
                     type="button"
@@ -6753,6 +6802,100 @@ select {
   font-size: 12px;
   color: #718260;
   overflow-wrap: anywhere;
+}
+.composer-shot-tip {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #4f6b57;
+}
+.composer-shots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 0;
+  max-height: 34vh;
+  overflow: auto;
+}
+.composer-shot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 220px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #f6f9f3;
+  border: 1px solid #e4ecd9;
+  text-align: left;
+}
+.composer-shot.ok {
+  border-color: #78c9a4;
+}
+.composer-shot.bad {
+  border-color: #f0a49c;
+  background: #fdf3f1;
+}
+.composer-shot img {
+  width: 56px;
+  height: 56px;
+  flex: none;
+  border-radius: 8px;
+  object-fit: cover;
+  background: #e9efe6;
+  border: 1px solid #dfe7e3;
+}
+.composer-shot-side {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.composer-shot-side b {
+  font-size: 12px;
+  font-weight: 600;
+  color: #2c4a3a;
+}
+.composer-shot-side span {
+  font-size: 11px;
+  color: #718260;
+}
+.composer-shot-err {
+  margin: 0;
+  font-size: 11px;
+  color: #b3453a;
+  overflow-wrap: anywhere;
+}
+.composer-shot-acts {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.composer-shot-act {
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid #2f7d5f;
+  background: #e6f2ec;
+  color: #1b5e45;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.composer-shot-x {
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid #d8e2d6;
+  background: #fff;
+  color: #66735f;
+  font-size: 12px;
+  cursor: pointer;
+}
+.composer-shot-alert {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: #b3453a;
+}
+.image-pick button.inline-check {
+  font-family: inherit;
 }
 .image-pick {
   display: inline-flex;
