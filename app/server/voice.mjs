@@ -300,8 +300,12 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
           res.end(r.body);
           return true;
         }
+        // 合成引擎可能给 mp3（云端）也可能给 wav（本地），按文件头判断，
+        // 别一律标成 audio/mpeg：WebView 对错标的格式有时直接不出声
+        const isWav =
+          r.body.length > 12 && r.body.slice(0, 4).toString("ascii") === "RIFF";
         res.writeHead(200, {
-          "Content-Type": "audio/mpeg",
+          "Content-Type": isWav ? "audio/wav" : "audio/mpeg",
           "Content-Length": r.body.length,
           "Cache-Control": "public, max-age=3600",
         });

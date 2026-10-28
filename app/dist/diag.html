@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>京阳智农 · 麦克风自检</title>
+<style>
+ body{font:16px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;padding:18px;background:#0f1419;color:#e6edf3}
+ h1{font-size:19px;margin:0 0 6px}
+ p.tip{margin:0 0 14px;color:#8b98a5;font-size:13px}
+ .row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #263039}
+ .k{color:#8b98a5;flex:0 0 auto}
+ .v{text-align:right;word-break:break-all}
+ .ok{color:#3fb950}.bad{color:#f85149}
+ button{width:100%;margin-top:14px;padding:15px;font-size:17px;border:0;border-radius:12px;background:#238636;color:#fff}
+ button.alt{background:#30363d}
+ #out{margin-top:16px;padding:12px;border-radius:10px;background:#161b22;white-space:pre-wrap;font-size:14px;min-height:60px}
+</style>
+</head>
+<body>
+<h1>麦克风 / 相机 自检</h1>
+<p class="tip">点下面的按钮，把灰框里的文字发给我，就能定位到底卡在哪一层。</p>
+<div class="row"><span class="k">地址</span><span class="v" id="url"></span></div>
+<div class="row"><span class="k">安全上下文</span><span class="v" id="sec"></span></div>
+<div class="row"><span class="k">麦克风接口</span><span class="v" id="api"></span></div>
+<div class="row"><span class="k">运行环境</span><span class="v" id="env"></span></div>
+<button id="m">请求麦克风</button>
+<button class="alt" id="c">请求相机</button>
+<div id="out">点上面的按钮，把这里的文字发给我。</div>
+<script>
+var $=function(id){return document.getElementById(id)};
+$("url").textContent=location.href;
+var sec=!!window.isSecureContext;
+$("sec").textContent=sec?"是（https 正常）":"否（这就是根源）";
+$("sec").className="v "+(sec?"ok":"bad");
+var api=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);
+$("api").textContent=api?"存在":"不存在";
+$("api").className="v "+(api?"ok":"bad");
+var ua=navigator.userAgent||"";
+var wv=/;\s*wv[\s)]/.test(ua)||/wv\)/.test(ua);
+$("env").textContent=wv?"WebView（APP 内）":"浏览器";
+async function ask(kind){
+  var out=$("out");
+  out.textContent="正在请求…";
+  try{
+    if(!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia)) throw new Error("mediaDevices.getUserMedia 不存在");
+    var c=kind==="mic"?{audio:true}:{video:{facingMode:"environment"}};
+    var s=await navigator.mediaDevices.getUserMedia(c);
+    out.textContent="成功：拿到"+(kind==="mic"?"麦克风":"相机")+"，轨道 "+s.getTracks().length+" 条";
+    s.getTracks().forEach(function(t){t.stop()});
+  }catch(e){
+    out.textContent="失败\nname: "+(e.name||"?")+"\nmessage: "+(e.message||e);
+  }
+}
+$("m").onclick=function(){ask("mic")};
+$("c").onclick=function(){ask("cam")};
+</script>
+</body>
+</html>

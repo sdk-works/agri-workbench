@@ -28,31 +28,57 @@ const VOICE_SPOKEN_RULES = `【语音播报要求｜覆盖上面所有关于输�
 这一轮会被逐句朗读成声音，所以：
 · 不用 Markdown、列表、标题、表格、表情符号、括号补充，不写“第一层”“首先”这类书面结构词。
 · 用口语短句，每句不超过 30 字。
-· 要分点时最多说到第三点（“第一”“第二”“第三”），说到第三就收尾。
-  ｜绝不许继续往下数，也绝不许罗列一连串“没有……”“不……”“不存在……”的排除项来凑数。
-  ｜宁可只说两点讲清楚，也不要为了显得全面把清单铺满。
 · 数字、型号、单位用口语说出来，不写符号。
 · 结论先行：先说怎么办，再说依据（先看什么、据此判断什么、下一步做什么）。
-· 整段回答控制在 200 字以内。说满三点就停，剩下的等用户问再说。
 · 用户问"怎么做""怎么接""用什么"时，即使型号或现场条件不明，也必须先给做法框架：
   需要哪些部件、信号或动力怎么走、按什么顺序做、做完怎么验证能不能用。最后一句再说
   具体端子、线径、型号要按设备手册和现场确认。只回一句"请提供型号"不算回答。
-· 一次只问一个问题，问完就停。
 · 简洁不等于省略：不为了短给出没有依据的断言。
 
 `;
+
+// 播报预算分两档。之前只有一档，而且是写死的"200 字 + 最多三点"：
+// 用户在语音里说"具体怎么做""详细讲讲"也只拿到三句话，看起来像敷衍——
+// 这不是模型能力问题，是规则把长度钉死了。所以按"用户有没有明确要详细"分档。
+const VOICE_BRIEF_BUDGET = `【本轮播报预算｜简洁档】
+· 整段回答控制在 200 字以内。
+· 要分点时最多说到第三点（"第一""第二""第三"），说到第三就收尾，剩下的等用户问再说。
+  ｜绝不许继续往下数，也绝不许罗列一连串"没有……""不……""不存在……"的排除项来凑数。
+  ｜宁可只说两点讲清楚，也不要为了显得全面把清单铺满。
+· 一次只问一个问题，问完就停。
+`;
+
+const VOICE_DETAIL_BUDGET = `【本轮播报预算｜详述档｜覆盖上面关于字数和点数的全部限制】
+用户这一轮明确要求讲详细，所以：
+· 可以讲到六点，整段最多 800 字；讲完就停，不要为了凑数继续铺清单。
+· 每一点仍然是口语化的一两句话，不要退化成书面报告或分条编号。
+· 先说结论和先后顺序，再逐条展开。用户随时可能打断，所以最重要的内容放最前面。
+· 允许说"这里要分两种情况"这种结构，但不要反复总结同一件事。
+`;
+
+// 判据要"强信号"：像"具体"这种词在"具体多少毫升"里也出现，
+// 全算成详细请求会让日常问答都变长。所以只认明确的详述要求。
+const WANT_DETAIL =
+  /(详细|展开讲|展开说|说详细|讲详细|完整地讲|完整说|一步一步|一步步|逐步|逐条|一条一条|具体步骤|具体怎么做|具体怎么操作|具体怎么弄|多说点|多说一些|说全|讲全|深入讲|仔细讲|慢慢说)/;
+function wantsDetail(text) {
+  return WANT_DETAIL.test(String(text || ""));
+}
+
+
 export const domains = ["种植管理", "农业物联网", "农业销售", "设计"];
 // 语音播报的条数兜底。VOICE_SPOKEN_RULES 里写了"最多说到第三点"，但模型偶尔完全无视：
 // 实测出现过追问"苗子长得均匀吗"，回答从"第一"一路数到"第一百"，1622 字全是
 // "没有…失衡"的排除项。这种内容 TTS 要念十几分钟，信息量却是零。
 // 所以落盘前按"第X、"标记数点，超过三点就在第三点末尾截断——只在语音轮、只在
 // 明显超长且确实数到第 4 点以上时才动手，正常回答一个字都不改。
-function trimSpokenPoints(text) {
+function trimSpokenPoints(text, budget = {}) {
+  const maxLen = Number(budget.len) > 0 ? Number(budget.len) : 220;
+  const maxPoints = Number(budget.points) > 0 ? Number(budget.points) : 4;
   const s = String(text || "");
-  if (s.length <= 220) return s;
+  if (s.length <= maxLen) return s;
   const marks = [...s.matchAll(/第[一二三四五六七八九十百]+[、，,：:．.]/g)];
-  if (marks.length < 4) return s;
-  const head = s.slice(0, marks[3].index).trim().replace(/[、，,;；\s]+$/, "");
+  if (marks.length < maxPoints) return s;
+  const head = s.slice(0, marks[maxPoints - 1].index).trim().replace(/[、，,;；\s]+$/, "");
   // 截断点太靠前说明标记是别的语义（不是逐条列举），宁可不截。
   // 阈值不能定高：模型跑飞时每条往往很短（"第一、没有虫。第二、没有病。"），
   // 三点加起来才三十来字，按 40 字判会把真正要截的漏掉（已踩过一次）。
@@ -183,6 +209,10 @@ const BASE_RULES = `你是农业园区助手，服务温室种植与农业物联
 【不确定时的标准说法】
 先说“这个我无法确认”，再说明缺什么，最后给出用户自己能核对的方法。不确定就说不确定，不要用“一般来说”“可能是”掩饰没有依据。
 但“无法确认”只能用来说明某一个具体数值或判断，不能拿来代替整个回答：做法、流程、需要注意的地方，该给的先给（部件、顺序、怎么验证），只把必须按现场和手册确认的那一点留成问题。用户问“怎么做”时，只回一句“请提供型号”等于没回答。
+
+【招呼与听不清时怎么说】
+用户只是打招呼、试麦（“喂”“在吗”“听得到吗”），或这句话明显听不清、只有零碎字词时，用一句自然的话回应（例如“我在，您说”），并请对方直接讲问题。
+这类输入不要套用上面的“无法确认”三段式，也不要输出原因分析清单——那会让用户误以为系统判断不出问题。
 
 【不替代执业判断】
 结构安全、用药安全、电气改造涉及专业责任，说明需由相应专业人员现场确认。
@@ -1110,7 +1140,11 @@ export function createWorkspace({
           (image ? IMAGE_RULES : "") +
           // 语音口径必须排最后：BASE_RULES 的【输出】要求 Markdown 列表，
           // 只有放在它后面才能覆盖掉（规则越靠后越管用，同 IMAGE_RULES 的处理）。
-          (voice ? VOICE_SPOKEN_RULES : "") +
+          // 预算再排在口径之后：详述档要能盖掉简洁档的 200 字/三点。
+          (voice
+            ? VOICE_SPOKEN_RULES +
+              (wantsDetail(question) ? VOICE_DETAIL_BUDGET : VOICE_BRIEF_BUDGET)
+            : "") +
           JSON.stringify(references),
         status: "generating",
         image_hint,
@@ -1358,8 +1392,14 @@ export function createWorkspace({
           );
         }
         let finalText = guarded.text;
-        if (t.source === "voice")
-          finalText = stripQuestionEcho(trimSpokenPoints(finalText), t.question);
+        if (t.source === "voice") {
+          // 详述档放宽兜底阈值：否则用户要的详细回答会被当成"跑飞"截在第三点
+          const detail = wantsDetail(t.question);
+          finalText = stripQuestionEcho(
+            trimSpokenPoints(finalText, detail ? { len: 900, points: 7 } : { len: 220, points: 4 }),
+            t.question,
+          );
+        }
         if (t.image_followup === true) {
           finalText = stripRepeatedOpening(finalText, true);
           finalText = stripRepeatedOpeningSentence(finalText, prevAnswer);

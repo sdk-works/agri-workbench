@@ -38,3 +38,6 @@ toolchain/
 # TLS 私钥不入库：证书私钥只放服务器磁盘，仓库里只留证书
 deploy/tls/*.key
 deploy/tls/**/*.key
+
+# 构建指纹：每次构建都变，属于产物元数据，不进版本库
+app/dist/build.json

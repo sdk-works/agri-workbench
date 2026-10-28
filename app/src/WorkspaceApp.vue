@@ -18,14 +18,17 @@ import {
   Menu,
   Mic,
   PhoneOff,
-  Volume2,
   Sparkles,
   Camera,
   Radio,
   X,
   ChevronLeft,
   Square,
-  FileText,
+  Captions,
+  CaptionsOff,
+  SlidersHorizontal,
+  ChevronUp,
+  History,
 } from "lucide-vue-next";
 import { call, download } from "./workspace-api";
 // 附图状态机：六态与「什么才算上传成功」都在这份纯逻辑里，便于单测
@@ -40,6 +43,8 @@ const user = ref(null),
 const login = ref({ username: "", name: "", password: "" }),
   domains = ["种植管理", "农业物联网", "农业销售", "设计"];
 const conversations = ref([]),
+  convDrawer = ref(false),
+  convQuery = ref(""),
   teamConvs = ref([]),
   teamTurns = ref([]),
   teamConv = ref(null),
@@ -126,9 +131,17 @@ const menuOpen = ref(false);
 // ── 语音通话 ─────────────────────────────────────────
 // 安卓壳通过 window.QingHeVoice 暴露原生识别/朗读；桌面浏览器回退 Web Speech API。
 const voiceMode = ref(false);
+// 通话中的对话文字：点「文字」按钮切换显示/隐藏（不是退出通话）
+const voiceCaptionOn = ref(true);
+// 拍照链路（拉起相机 → 回传 → 压缩 → 出预览）全程要有反馈，否则像没拍上
+const shotBusy = ref(false);
+const shotBusyText = ref("");
 const voiceState = ref("idle"); // idle | listening | thinking | speaking
 const voiceText = ref("");
 const voiceError = ref("");
+// 合成彻底失败（服务端没出音频、本机也没有朗读引擎）时的可见状态。
+// 以前这种情况是静默的：文字在往上滚，却一点声音都没有，用户不知道是坏了还是没话。
+const voiceTtsWarn = ref(false);
 let voiceRec = null;
 let voiceAwaiting = false;
 let voiceSpokenTurn = "";
@@ -201,13 +214,17 @@ const voiceHintText = computed(() => {
         : "松开发送 · 上滑取消";
   if (voiceState.value === "recognizing") return "正在把你说的转成文字…";
   if (voiceState.value === "thinking")
-    return voicePhase.value === "queued" ? "排队中，马上开始…" : "正在查资料，听到第一句就开念";
+    return voicePhase.value === "uploading"
+      ? "图片还在上传，传完就开始回答…"
+      : voicePhase.value === "queued"
+        ? "排队中，马上开始…"
+        : "正在查资料，听到第一句就开念";
   if (voiceState.value === "speaking") return "正在朗读，可以随时打断";
   if (voiceState.value === "failed") return "这一句没成功，点重试就好";
   if (voicePaused.value) return "已暂停收听，点麦克风继续";
   if (voiceHandsFree.value)
     return voiceText.value ? "回答完了，直接说下一句" : "可以开口问，说一句就开始";
-  return "直接说话，或点下方麦克风";
+  return "按住下方按钮说话，说完松开";
 });
 // 大圆按钮上的字：随模式与状态变，不能一直写"按住说话"
 const holdLabel = computed(() => {
@@ -516,6 +533,7 @@ async function logout() {
 async function go(id) {
   page.value = id;
   menuOpen.value = false;
+  convDrawer.value = false;
   error.value = "";
   notice.value = "";
   detail.value = null;
@@ -549,6 +567,41 @@ function formatTime(v) {
     minute: "2-digit",
   });
 }
+
+// 会话按「今天 / 昨天 / 近 7 天 / 更早」分组：会话一多，平铺列表很难找。
+// 参考的是 ChatGPT / Claude 侧栏的分组方式，只保留最必要的时间桶。
+function convBucket(v) {
+  const d = new Date(v || 0);
+  if (Number.isNaN(d.getTime())) return "更早";
+  const now = new Date();
+  const startOf = (x) =>
+    new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((startOf(now) - startOf(d)) / 86400000);
+  if (days <= 0) return "今天";
+  if (days === 1) return "昨天";
+  if (days <= 7) return "近 7 天";
+  return "更早";
+}
+const convGroups = computed(() => {
+  const q = convQuery.value.trim().toLowerCase();
+  const rows = conversations.value
+    .filter((c) => !q || String(c.title || "").toLowerCase().includes(q))
+    .slice()
+    .sort((a, b) =>
+      String(b.created_at || "").localeCompare(String(a.created_at || "")),
+    );
+  const out = [];
+  for (const c of rows) {
+    const label = convBucket(c.created_at);
+    let g = out.find((x) => x.label === label);
+    if (!g) {
+      g = { label, items: [] };
+      out.push(g);
+    }
+    g.items.push(c);
+  }
+  return out;
+});
 
 function relativeTime(v) {
   const d = new Date(v || 0);
@@ -738,10 +791,12 @@ function newConversation() {
   turns.value = [];
   question.value = "";
   draft.value = null;
+  convDrawer.value = false;
 }
 async function selectConversation(c) {
   conversationId.value = c.id;
   domain.value = c.domain;
+  convDrawer.value = false;
   await act(refresh);
 }
 async function deleteConversation(c) {
@@ -845,6 +900,10 @@ function clearImage() {
   draft.value = null;
 }
 async function ask() {
+  if (busy.value) {
+    notice.value = "上一条还在回答，等它结束后再发";
+    return;
+  }
   if (!allowedDomainOptions.value.length) {
     notice.value = "还没有分配部门，请联系管理员分配后再提问。";
     return;
@@ -878,9 +937,7 @@ async function ask() {
 function onComposerKeydown(e) {
   if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
   e.preventDefault();
-  if (busy.value) return;
   if (!question.value.trim()) return;
-  if (turns.value.some((t) => t.status === "generating")) return;
   ask();
 }
 function onComposerPaste(e) {
@@ -1395,10 +1452,29 @@ let voiceHistory = [];
 let voiceConversationId = "";
 let voiceQueue = [];
 let voiceSpeaking = false;
+// 句间停顿的根因：上一句播完才去请求下一句的合成，句与句之间白等一整次往返。
+// 改成「当前句还在播的时候就把后面的句子送合成」，播完直接接上，停顿只剩解码时间。
+let ttsPrefetch = new Map(); // 句子文本 -> { promise: Promise<Blob>, ac: AbortController }
+// 正在"边播边取"的即时合成请求。预取有表可以统一作废，即时请求以前是匿名的：
+// 用户一打断，它还在后台跑，占着合成服务还可能被下一句复用成串音。
+const ttsInflight = new Set();
+const TTS_PREFETCH_AHEAD = 3; // 多备一句，切换时不用等合成
+// 中文回答标点密，一句二三十字就断一次会让停顿叠加；攒够一整句再送合成
+const VOICE_MIN_SENTENCE = 32;
+// 但首句不能等：先把声音放出来，后续才靠长句压停顿
+const VOICE_FIRST_SENTENCE = 12;
+const VOICE_SENT_RE = /[。！？!?；;\n]/g;
 let voiceStreamDone = true;
 let voiceCapture = null;
 let voiceAudio = null;
 let voiceSpeakResolve = null;
+// 所有还在响的音频。只记 voiceAudio 不够：上一轮被顶掉的那条链可能还留着一个
+// <audio> 在出声，新一轮再播就成了"两条回答叠在一起"。
+const liveAudios = new Map();
+// 播放链轮次号：换轮就 +1，旧的链认出自己被顶掉，立刻退出，不再往下播。
+let playbackEpoch = 0;
+// 本轮是否已经送出过句子：首句要快，之后才用长句合并
+let voiceSpoken = false;
 let voiceServer = { ok: false, asr: false, tts: false };
 // 打断与状态机：同一 request_id 贯穿 识别→生成→播报，卡在哪一步可以定位
 let voiceAbort = null;
@@ -1460,17 +1536,16 @@ let voiceHfRestart = 0;
 // 三道防线：① 前 700ms 是保护期，只采样不判定（把扬声器泄漏的底噪记成基线）
 // ② 阈值取 max(0.05, 基线×2.5)，跟着设备回声消除效果自动调整
 // ③ 必须连续 320ms 超阈值才算人声，咳嗽、碰麦、单帧噪声都不触发。
-const VOICE_BARGE_KEY = "voice.bargein";
-const voiceBargeIn = ref(true);
-try {
-  voiceBargeIn.value = localStorage.getItem(VOICE_BARGE_KEY) !== "0";
-} catch (e) {}
+// 播报中"开口就打断"已停用：手机外放时它经常把 AI 自己念的话当成用户开口，
+// 表现就是答到一半突然断掉、接着莫名开始录音。改为一律"按住说话"。
+// 变量保留，值为 false，startBargeIn 会直接返回。
+const voiceBargeIn = ref(false);
 let bargeStream = null;
 let bargeCtx = null;
 let bargeRaf = 0;
-try {
-  voiceHandsFree.value = localStorage.getItem(VOICE_HF_KEY) === "1";
-} catch (e) {}
+// 免提（免按键连续对话）已停用：它会在播报结束后自动开麦，
+// 用户根本没准备说话时麦克风就亮着，现场很困惑。一律按住说话。
+// 不再读 localStorage，避免老用户本地存着 "1" 又把它打开。
 
 // ── 拍照与随问附图：先上传拿 image_id，再随语音轮提交 ──
 const VOICE_IMAGE_MAX = 8 * 1024 * 1024;
@@ -1483,8 +1558,99 @@ const voiceCamReady = ref(false);
 const voiceCamVideo = ref(null);
 const voiceCamError = ref("");
 const voiceSheetOpen = ref(false);
+const voiceSetOpen = ref(false);
+const voicePreviewing = ref(false);
+let voicePreviewAudio = null;
+
+const VOICE_PRESETS = [
+  { value: "", label: "晓晓", note: "女 · 默认", tag: "自然" },
+  { value: "zh-CN-XiaoxiaoNeural", label: "晓晓", note: "女 · 标准", tag: "自然" },
+  { value: "zh-CN-XiaoyiNeural", label: "晓伊", note: "女 · 偏年轻", tag: "轻快" },
+  { value: "zh-CN-YunxiNeural", label: "云希", note: "男 · 偏年轻", tag: "平和" },
+  { value: "zh-CN-YunjianNeural", label: "云健", note: "男 · 偏沉稳", tag: "有力" },
+  { value: "zh-CN-YunyangNeural", label: "云扬", note: "男 · 播音腔", tag: "正式" },
+];
+// 本地合成（sherpa-onnx + MeloTTS）只有一个女声。以前这里摆着 6 个云端音色，
+// 点了根本没反应——用户点完再听，声音没变，只会觉得"设置是坏的"。
+// 所以本地模式下只列真实存在的那一个，把"换音色"交给切换引擎。
+const LOCAL_VOICE_PRESETS = [
+  { value: "", label: "自然女声", note: "女 · 本地", tag: "自然" },
+];
+function isLocalTts() {
+  return voiceServer.ttsEngine === "local";
+}
+const VOICE_RATES = [
+  { value: 0.85, label: "慢" },
+  { value: 1, label: "正常" },
+  { value: 1.15, label: "稍快" },
+  { value: 1.3, label: "快" },
+];
+
+function fmtRate(v) {
+  return (v === 1 ? "1.0" : String(v)) + "×";
+}
+const voiceNameLabel = computed(() => {
+  const local = voiceServer.ttsEngine === "local";
+  const list = local ? LOCAL_VOICE_PRESETS : VOICE_PRESETS;
+  const hit = list.find((x) => x.value === (voiceName.value || ""));
+  if (!hit) return local ? "自然女声·女" : "晓晓·女";
+  const gender = (hit.note.split(" · ")[0] || "").trim();
+  return gender ? hit.label + "·" + gender : hit.label;
+});
+const voiceRateLabel = computed(() => fmtRate(voiceRate.value));
+
+function pickVoice(v) {
+  voiceName.value = v;
+}
+
+function pickRate(v) {
+  voiceRate.value = v;
+}
+
+// 试听：和正式播报走同一个合成接口，听到的就是将要用到的声音
+async function previewVoice() {
+  if (voicePreviewing.value) return;
+  if (voiceState.value !== "idle") {
+    voiceError.value = "等这一轮说完再试听";
+    return;
+  }
+  voicePreviewing.value = true;
+  try {
+    const ac = new AbortController();
+    const blob = await ttsFetch(
+      "您好，我是京阳智农的语音助手，现在用这个声音和快慢和您说话。",
+      ac,
+    );
+    const url = URL.createObjectURL(blob);
+    const a = new Audio(url);
+    try {
+      a.playbackRate = voiceRate.value || 1;
+      a.preservesPitch = true;
+      if ("webkitPreservesPitch" in a) a.webkitPreservesPitch = true;
+    } catch (e) {}
+    voicePreviewAudio = a;
+    const done = () => {
+      if (voicePreviewAudio === a) voicePreviewAudio = null;
+      try {
+        URL.revokeObjectURL(url);
+      } catch (e) {}
+    };
+    a.onended = done;
+    a.onerror = done;
+    await a.play();
+  } catch (e) {
+    voiceError.value = "试听失败，检查网络后再试";
+  } finally {
+    voicePreviewing.value = false;
+  }
+}
 // 附图状态机（picked/uploading/received/analyzing/done/failed），含 id/dedupKey/requestId
 const attach = ref(Attach.emptyAttach());
+// 历史附图点开看原图（手机上不跳浏览器）
+const shotZoom = ref("");
+function zoomShot(id) {
+  if (id) shotZoom.value = "/api/v2/voice/image/" + id;
+}
 // 拍完/选完先进预览，用户确认才上传：这一步是「预览、重拍、删除」的落点
 const camShot = ref(null); // { url, blob, mime, ext }
 // 服务端确认本轮引用的附件编号（来自 SSE meta/phase），不是页面上的残留
@@ -1550,8 +1716,9 @@ function startCall() {
   voiceAnswerText.value = "";
   voiceSetupOpen.value = false;
   voiceHistory = [];
-  voiceConversationId = "";
-  // 新会话：上一通电话的图不能跟过来
+  // 接着当前文字会话继续：否则文字里刚说过的，一进语音就全丢，前后明显不搭
+  voiceConversationId = conversationId.value || "";
+  // 图不跟过来：上一通电话的图容易和本轮问的东西对不上
   dropAttach();
   disposeShot();
   voiceRequestId = "";
@@ -1715,8 +1882,19 @@ async function beginRecording() {
   voiceText.value = "";
   voiceError.value = "";
   try {
+    // 识别用的录音必须关掉 AEC 和降噪：
+    // 这两个是给"打电话听感"调的，会把辅音（s/sh/x/f）削掉、把气声压平，
+    // 人耳听着干净，ASR 反而听不清——实测「蛭石」「湿度」这类音最容易糊。
+    // autoGainControl 保留：大棚里说话声小，增益帮忙。
+    // 注意：播报期间的"打断检测"（startBargeIn）仍要开 AEC，
+    // 否则它会把自己的播报声当成用户在说话。
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: true,
+        channelCount: 1,
+      },
     });
     // 授权弹窗期间用户已经松手/取消 → 不当成一次录音，直接释放麦克风
     // 免按键模式不依赖按住，只有主动取消/退出语音通话才作废
@@ -1861,6 +2039,9 @@ function holdVoiceStart(ev) {
     return;
   }
   if (voiceHolding.value) return;
+  // 只要还有声音就先把声音全停掉，不依赖 state 判断：
+  // 状态一旦不同步（比如播完没回 idle），就会出现"A 还在念、用户在说、接着 B 又开始念"。
+  stopPlaybackNow();
   // 再按一次 = 打断：立即停播、清待播、取消上一轮生成，然后开始新录音
   if (voiceState.value === "thinking" || voiceState.value === "speaking") interruptVoice();
   voiceInterrupted = false; // 新一轮开始：旧轮次的隔离由 voiceEpoch 负责
@@ -2190,12 +2371,10 @@ function openCamSheet() {
     voiceError.value = "还没有对话，先开始语音通话再拍照";
     return;
   }
-  // http 页面下浏览器直接拒绝 getUserMedia，提前说明，别让用户点了没反应。
-  // 但要说清"系统相机仍可用"——走 file input，不依赖安全上下文。
-  const secure = isSecurePage();
-  voiceCamError.value = secure
-    ? ""
-    : "当前不是安全连接，页面内相机不可用；请用「系统相机」拍照，它不受此限制。";
+  // 一律先给选择面板：拍照和相册两条路都得留着。
+  // 之前为了省一次点击，http 下直接拉相机，结果相册入口消失，用户只能拍照。
+  voiceCamError.value = "";
+  voiceError.value = "";
   voiceSheetOpen.value = true;
 }
 
@@ -2204,7 +2383,9 @@ async function openInPageCamera() {
   voiceCamError.value = "";
   voiceCamReady.value = false;
   if (!hasMediaApi()) {
-    voiceError.value = "当前页面不是安全连接，浏览器不提供相机接口，请用「系统相机」拍照";
+    // 兜底：即使被调到，也直接转系统相机，而不是只弹一句错误
+    voiceError.value = "当前是普通连接，已改用系统相机";
+    pickPhotoFile(true);
     return;
   }
   try {
@@ -2281,20 +2462,82 @@ async function shootPhoto() {
   }
 }
 
+// 等待遮罩的唯一出口：正常完成、取消、超时、回到前台找不到文件都走它
+let activeShotInput = null;
+let shotWaitTimer = 0;
+let shotVisBound = false;
+
+function clearShotWait() {
+  shotBusy.value = false;
+  shotBusyText.value = "";
+  if (shotWaitTimer) {
+    window.clearTimeout(shotWaitTimer);
+    shotWaitTimer = 0;
+  }
+  const inp = activeShotInput;
+  activeShotInput = null;
+  if (inp) {
+    try {
+      if (inp.parentNode) inp.parentNode.removeChild(inp);
+    } catch (e) {}
+  }
+}
+
+// 用户点「取消」：相机可能还开着，只能撤掉网页这边的等待层
+function cancelShotWait() {
+  clearShotWait();
+}
+
+// 从系统相机/相册返回时会切回前台；此时输入框里没有文件就说明用户放弃了。
+// WebView 里 focus 不一定触发，visibilitychange 更可靠。
+function bindShotVisibility() {
+  if (shotVisBound) return;
+  shotVisBound = true;
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || !shotBusy.value) return;
+    window.setTimeout(() => {
+      const inp = activeShotInput;
+      if (inp && !(inp.files && inp.files.length)) clearShotWait();
+    }, 700);
+  });
+}
+
 function pickPhotoFile(capture) {
+  // 拉起相机 → 拍完回传 → 压缩 → 出预览，中间有好几秒是空白期，
+  // 不给提示用户会以为没拍成功又反复点。
+  bindShotVisibility();
+  if (capture) {
+    shotBusy.value = true;
+    shotBusyText.value = "已打开相机，拍好后自动处理…";
+    // 用户可能直接把相机划掉、或者相机崩了，onchange 永远不来。
+    // 30 秒兜底，避免"已打开相机"永久挂在屏幕上。
+    if (shotWaitTimer) window.clearTimeout(shotWaitTimer);
+    shotWaitTimer = window.setTimeout(() => {
+      shotWaitTimer = 0;
+      if (shotBusy.value) clearShotWait();
+    }, 30000);
+  }
   const input = document.createElement("input");
+  activeShotInput = input;
   input.type = "file";
   input.accept = "image/*";
   if (capture) input.capture = "environment";
   input.onchange = async () => {
     const f = input.files && input.files[0];
     cleanup();
-    if (!f) return;
+    if (!f) {
+      clearShotWait();
+      return;
+    }
+    shotBusy.value = true;
+    shotBusyText.value = "正在处理照片…";
     if (!/^image\//.test(f.type || "")) {
+      clearShotWait();
       voiceError.value = "这不是图片文件";
       return;
     }
     if (f.size > VOICE_IMAGE_MAX) {
+      clearShotWait();
       voiceError.value = "图片太大，单张不能超过 8 MB";
       return;
     }
@@ -2305,6 +2548,8 @@ function pickPhotoFile(capture) {
       showShot(out.blob, out.ext || safeExt);
     } catch (e) {
       voiceError.value = "这张图片读不出来，换一张试试";
+    } finally {
+      clearShotWait();
     }
   };
   // 必须先把 input 挂进文档再 click()：安卓 Chrome / 多数 WebView 里，
@@ -2326,8 +2571,11 @@ function pickPhotoFile(capture) {
     "focus",
     () => {
       setTimeout(() => {
-        if (document.body.contains(input) && !(input.files && input.files.length))
+        if (document.body.contains(input) && !(input.files && input.files.length)) {
           cleanup();
+          // 用户取消拍照：等待提示也要撤掉
+          clearShotWait();
+        }
       }, 800);
     },
     { once: true },
@@ -2342,7 +2590,7 @@ function fromAlbum() {
 
 function useSystemCamera() {
   voiceSheetOpen.value = false;
-  voiceError.value = "已改用系统相机";
+  voiceError.value = "";
   pickPhotoFile(true);
 }
 
@@ -2536,14 +2784,29 @@ function removeAttach() {
   voiceError.value = "";
 }
 
-/** 等上传结束（最多 ms）：拿到 image_id 返回它，超时返回空串 */
-async function waitAttachUploaded(ms = 4000) {
+/**
+ * 等这张图的上传真正结束。
+ *
+ * 旧实现叫 waitAttachUploaded(4000)：最多等 4 秒，超时就返回空串，
+ * 调用方随即把问题以"不带图"发出去。用户明明选了图，AI 却在"看图"的
+ * 语境下凭空回答——这不只是体验问题，是让模型对着不存在的图编内容。
+ *
+ * 现在等的是"状态不再是上传中"，而不是"等到某个时间点"：
+ * 上传自身有超时（VOICE_UPLOAD_MS），不会无限挂着；
+ * 这里的 ms 只是兜底上限，到点也算它有结论。
+ * 传完了返回 image_id；失败/被取消返回空串，由调用方拦下不发。
+ */
+async function waitAttachSettled(ms = 60000) {
+  const key = attach.value.dedupKey;
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
     if (attach.value.id) return attach.value.id;
-    if (attach.value.status !== Attach.ATTACH.UPLOADING && attach.value.status !== Attach.ATTACH.PICKED)
+    // 期间换了一张图：旧等待作废，交给新图自己的上传流程
+    if (attach.value.dedupKey !== key) return "";
+    const st = attach.value.status;
+    if (st !== Attach.ATTACH.UPLOADING && st !== Attach.ATTACH.PICKED)
       return attach.value.id || "";
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, 150));
   }
   return attach.value.id || "";
 }
@@ -2562,18 +2825,118 @@ async function analyzeAgain() {
   await askStreaming(text, voiceEpoch, { retry: true });
 }
 
+// 招呼、试麦、听不清的零碎字：这类话没有可回答的内容。
+// 直接丢给模型，它只能套用"无法确认"的三段式，用户会以为系统坏了；
+// 而且每一句"喂喂喂"都会在会话列表里留下一条空记录。
+//
+// 但拦截必须"整句就是招呼"才算，不能按字数猜。
+// 老逻辑是"12 字以内 + 以招呼词开头"就拦，结果「你好，叶子黄了怎么办」
+// 去掉标点正好 10 字，被当成招呼回「您好，我在」——用户以为 AI 听不懂人话。
+// 现在的规则：先剥掉招呼词，剥完还有字就说明带实义，一律进模型。
+const GREET_TOKENS = [
+  "你好", "您好", "哈喽", "hello", "hi", "喂",
+  "在吗", "在不在", "听得到吗", "能听到吗", "能听见吗",
+  "听得到", "能听到", "能听见",
+  // 长词必须排在短词前面：stripTokens 按顺序试，先命中"连接正常"
+  // 会剩下一个"吗"，整句就判不出是招呼了
+  "连接正常吗", "连接正常",
+  "测试一下", "测试", "试一下", "试试", "嗯", "哦", "啊",
+];
+const ACK_TOKENS = [
+  "谢谢", "多谢", "感谢", "辛苦了", "麻烦你了",
+  "收到", "明白", "懂了", "好嘞", "好的", "行", "ok",
+];
+// 只要句子里有这些词，就不是招呼，是问题。这条是硬闸门：
+// 宁可把招呼漏给模型（它会礼貌回应），也不能把问题当招呼吃掉。
+const REAL_QUESTION =
+  /(怎么办|怎么治|怎么弄|怎么用|什么|为什么|为啥|为啥子|多少|几个|哪些|哪里|哪个|是不是|能不能|会不会|要不要|有没有|咋|如何|谁|几时|什么时候)/;
+
+function stripTokens(s, list) {
+  let rest = s;
+  let changed = true;
+  while (changed && rest) {
+    changed = false;
+    for (const tok of list) {
+      if (rest.startsWith(tok)) {
+        rest = rest.slice(tok.length);
+        changed = true;
+      }
+    }
+  }
+  return rest;
+}
+
+function chitChatReply(text) {
+  const raw = String(text || "");
+  if (!raw.trim()) return "我在，您说。";
+  // 去标点、去语气词、统一小写，方便按"词"判断而不是按"字"数
+  const t = raw
+    .replace(/[\s，。！？、,.!?~…·；;：:]/g, "")
+    .replace(/[呀呢嘛吧啦哦哈]+$/g, "")
+    .toLowerCase();
+  if (!t) return "我在，您说。";
+  if (REAL_QUESTION.test(t)) return ""; // 带实义，交给模型
+  if (t.length > 10) return ""; // 长句不可能是纯招呼
+  if (/^(.)\1+$/.test(t)) return "我在，您说。"; // 复读：喂喂喂、为为为
+  if (!stripTokens(t, ACK_TOKENS)) return "好，还有问题随时说。";
+  if (stripTokens(t, GREET_TOKENS) === "") {
+    if (/测试|试一下|试试/.test(t)) return "通话正常，我在听，您说。";
+    if (/听得到|听到吗|能听见|能听到/.test(t)) return "听得到，您说。";
+    return "您好，我在。您直接说问题就行。";
+  }
+  return "";
+}
+
 async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
+  // 招呼先在这一层拦掉：不进模型、不建轮次，只回一句并继续听
+  const greet = chitChatReply(text);
+  if (greet && opts.retry !== true) {
+    // 招呼也可能在上一句还没播完时到来：先静音，否则两句叠在一起
+    stopPlaybackNow();
+    voiceText.value = text;
+    voiceAnswerText.value = greet;
+    voiceError.value = "";
+    voicePhase.value = "";
+    voiceInterrupted = false;
+    voiceSpeaking = false;
+    voiceStreamDone = true;
+    lastTurnFailed = false;
+    voiceState.value = "speaking";
+    enqueueSpeech(greet);
+    return;
+  }
+  voiceSpoken = false;
   const rid = voiceRequestId || newVoiceRequestId();
   voiceRequestId = rid; // 记下这一轮的编号：失败重试要复用它才不会多建一轮
   // 本轮带不带图：只有拿到服务端 image_id 才能带。
-  // 还在上传就等一下；等不到就明说这一句先不带图，不假装图已经跟着发了。
+  // 还在传就等它传完（不再 4 秒就丢图）；传失败就停住，让用户重试或明确只发文字。
   let imageId = "";
-  if (attachCanSend.value) {
+  const textOnly = opts.textOnly === true;
+  if (!textOnly && attachCanSend.value) {
     imageId = attach.value.id;
-  } else if (attach.value.status === Attach.ATTACH.UPLOADING) {
-    imageId = await waitAttachUploaded(4000);
-    if (!imageId)
-      voiceError.value = "图片还没传完，这一句先不带图；传好后可以再问一次";
+  } else if (
+    !textOnly &&
+    (attach.value.status === Attach.ATTACH.UPLOADING ||
+      attach.value.status === Attach.ATTACH.PICKED)
+  ) {
+    voiceState.value = "thinking";
+    voicePhase.value = "uploading";
+    imageId = await waitAttachSettled();
+    // 等图期间用户挂断/取消/又问了新的 → 这一轮作废，不悄悄发出去
+    if (epoch !== voiceEpoch) return;
+    if (!imageId) {
+      voicePhase.value = "";
+      voiceState.value = "idle";
+      lastTurnFailed = false;
+      voiceError.value =
+        attach.value.status === Attach.ATTACH.FAILED
+          ? "图片没传上去：点「重试」再传一次，或者删掉这张只发文字"
+          : attach.value.status === Attach.ATTACH.UPLOADING
+            ? "图片还在传，传好后会自动继续；也可以删掉只发文字"
+            : "这张图已失效，请重新拍一张";
+      return; // 关键：不发无图请求
+    }
+    voicePhase.value = "queued";
   }
   // 用户嘴上说"发张图/拍张照"但还没选图：先让他去拍照。
   // 这句话要是当普通问题发出去，模型会顺着"看图"的语境编内容——那就是假装看到了。
@@ -2593,9 +2956,12 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
   const retry = opts.retry === true;
   let finalStatus = "";
   lastQuestionText = text;
+  // 上一句可能还在响（用户在播报中又问了新的）：先彻底静音再开始这一轮
+  stopPlaybackNow();
   voiceState.value = "thinking";
   voicePhase.value = "queued";
   voiceAnswerText.value = "";
+  voiceTtsWarn.value = false;
   voiceQueue = [];
   voiceSpeaking = false;
   voiceStreamDone = false;
@@ -2647,8 +3013,10 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
       const j = await res.json().catch(() => ({}));
       throw new Error(j.error || "服务返回 " + res.status);
     }
-    // 图已随本轮提交 → 分析中。id 保留在状态里，追问时还能继续用同一张
-    if (imageId)
+    // 图已随本轮提交 → 分析中。id 保留在状态里，追问时还能继续用同一张。
+    // 若这张图上一轮已经分析完成（DONE），追问时保持完成态：
+    // 服务端确实会再读一次图给模型看，但界面上没必要再闪一次「正在看这张图」。
+    if (imageId && attach.value.status !== Attach.ATTACH.DONE)
       attach.value = Attach.beginAnalysis(attach.value, {
         requestId: rid,
         conversationId: voiceConversationId,
@@ -2674,7 +3042,16 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
           continue;
         }
         if (obj.type === "meta") {
-          if (obj.conversation_id) voiceConversationId = obj.conversation_id;
+          if (obj.conversation_id) {
+            voiceConversationId = obj.conversation_id;
+            // 语音里开的新会话也要让文字界面认下来，否则挂断后看着像对话丢了
+            if (!conversationId.value) {
+              conversationId.value = voiceConversationId;
+              // 纯语音（不带图）也必须出现在历史会话里：
+              // 会话已由服务端写入，这里补一次列表刷新，别让它只存在于数据库
+              refresh().catch(() => {});
+            }
+          }
           if (obj.turn_id) {
             voiceTurnId = obj.turn_id;
             if (attach.value.status === Attach.ATTACH.ANALYZING)
@@ -2707,11 +3084,27 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
           full += obj.delta;
           pending += obj.delta;
           voiceAnswerText.value = full;
-          let m;
-          while ((m = pending.match(/^([\s\S]*?[。！？!?；;\n])([\s\S]*)$/))) {
-            const sentence = m[1].trim();
-            pending = m[2];
-            if (sentence) enqueueSpeech(sentence);
+          // 切口取「第一个让长度够阈值的句末标点」，而不是第一个标点。
+          // 只取第一个标点会切出很短的句子，塞回队首又永远长不大（每轮都从同一个短句开始），
+          // 结果是整段憋到流结束才合成，首音反而更慢。
+          while (true) {
+            const minLen = voiceSpoken
+              ? VOICE_MIN_SENTENCE
+              : VOICE_FIRST_SENTENCE;
+            if (pending.length < minLen) break;
+            VOICE_SENT_RE.lastIndex = 0;
+            let pos = -1;
+            let mm;
+            while ((mm = VOICE_SENT_RE.exec(pending))) {
+              if (mm.index + 1 >= minLen) {
+                pos = mm.index + 1;
+                break;
+              }
+            }
+            if (pos < 0) break;
+            const cut = pending.slice(0, pos).trim();
+            pending = pending.slice(pos);
+            if (cut) enqueueSpeech(cut);
           }
         }
         if (obj.done) {
@@ -2724,12 +3117,14 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
     if (pending.trim()) enqueueSpeech(pending.trim());
     // 这一轮收尾：只有正常结束才算「这张图分析完成」
     if (imageId) {
-      if (finalStatus === "failed") {
+      // 已经分析过的图，本轮生成失败是「这一问没答出来」，不是「图有问题」
+      const stillAnalyzing = attach.value.status === Attach.ATTACH.ANALYZING;
+      if (finalStatus === "failed" && stillAnalyzing) {
         attach.value = Attach.analysisFail(attach.value, "模型没有返回内容");
         lastTurnFailed = true;
       } else {
         attach.value = Attach.analysisOk(attach.value);
-        lastTurnFailed = false;
+        lastTurnFailed = finalStatus === "failed";
       }
     } else {
       lastTurnFailed = finalStatus === "failed";
@@ -2782,15 +3177,15 @@ function interruptVoice() {
   voiceInterrupted = true;
   voiceEpoch++; // 作废在途的识别与生成
   stopBargeIn(); // 先收回打断监听，再停播，避免监听器把停播当成"又开口"
-  try {
-    if (voiceAudio) {
-      voiceAudio.onended = null;
-      voiceAudio.onpause = null;
-      voiceAudio.pause();
-      voiceAudio.src = "";
-      voiceAudio = null;
-    }
-  } catch (e) {}
+  playbackEpoch += 1; // 旧播放链据此退出
+  stopAllAudio();
+  if (voiceSpeakResolve) {
+    const fn = voiceSpeakResolve;
+    voiceSpeakResolve = null;
+    try {
+      fn();
+    } catch (e) {}
+  }
   try {
     if (window.speechSynthesis) window.speechSynthesis.cancel();
   } catch (e) {}
@@ -2800,6 +3195,7 @@ function interruptVoice() {
     if (n && typeof n.stopListening === "function") n.stopListening();
   } catch (e) {}
   voiceQueue = [];
+  clearTtsPrefetch();
   voiceSpeaking = false;
   voiceStreamDone = true;
   const asr = voiceAsrAbort;
@@ -2829,24 +3225,83 @@ function interruptVoice() {
 }
 
 // 重试回答：换新请求编号重开一轮（失败轮次留在历史里，便于定位）
-function retryAnswer() {
+function retryAnswer(opts = {}) {
   if (!voiceText.value) return;
   voiceError.value = "";
   // 上一轮失败就复用同一 request_id（服务端按同一轮重跑，不新建问题）；
   // 只有确实要换一轮时才申请新编号
   const sameTurn = lastTurnFailed && Boolean(voiceRequestId);
   if (!sameTurn) voiceRequestId = newVoiceRequestId();
-  askStreaming(voiceText.value, voiceEpoch, { retry: sameTurn });
+  askStreaming(voiceText.value, voiceEpoch, { ...opts, retry: sameTurn });
+}
+
+// 图传不上去时，给用户一条明确出路：不带图问，而不是卡在那里
+function retryAnswerTextOnly() {
+  dropAttach();
+  retryAnswer({ textOnly: true });
+}
+
+// 把所有正在播放的音频一次掐掉，并让它们的 Promise 正常收尾，
+// 否则旧链会一直 await 在那里，下次播报就变成两条声音并行。
+function stopAllAudio() {
+  const items = Array.from(liveAudios.entries());
+  liveAudios.clear();
+  for (const [audio, resolve] of items) {
+    try {
+      audio.onended = null;
+      audio.onpause = null;
+      audio.onerror = null;
+      audio.pause();
+      audio.removeAttribute("src");
+    } catch (e) {}
+    try {
+      resolve();
+    } catch (e) {}
+  }
+  voiceAudio = null;
+}
+
+/** 新一轮开口前先彻底静音：清队列、作废预取、掐音频、停原生朗读 */
+function stopPlaybackNow() {
+  playbackEpoch += 1; // 旧播放链据此退出
+  voiceQueue = [];
+  clearTtsPrefetch();
+  stopAllAudio();
+  if (voiceSpeakResolve) {
+    const fn = voiceSpeakResolve;
+    voiceSpeakResolve = null;
+    try {
+      fn();
+    } catch (e) {}
+  }
+  if (voicePreviewAudio) {
+    try {
+      voicePreviewAudio.pause();
+    } catch (e) {}
+    voicePreviewAudio = null;
+  }
+  try {
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+  } catch (e) {}
+  try {
+    const n = voiceNative();
+    if (n && typeof n.stopSpeaking === "function") n.stopSpeaking();
+  } catch (e) {}
+  voiceSpeaking = false;
 }
 
 function enqueueSpeech(text) {
   const t = stripForSpeech(text);
   if (!t) return;
+  voiceSpoken = true;
   voiceQueue.push(t);
   if (!voiceSpeaking) playNext();
+  // 当前句还在播：这句就是下一句，先送合成，播完立刻能接上
+  else prefetchTts(t);
 }
 
 async function playNext() {
+  const epoch = playbackEpoch;
   if (voiceInterrupted) {
     voiceSpeaking = false;
     return;
@@ -2859,8 +3314,8 @@ async function playNext() {
   }
   voiceSpeaking = true;
   voiceState.value = "speaking";
-  // 边播边听：用户开口就打断（不需要去点按钮）
-  startBargeIn();
+  // 当前句已经定了：队列里的下一句先送合成（流式刚到时它还没被预取）
+  prefetchTts(voiceQueue[0]);
   let ok = false;
   if (voiceServer.tts) {
     try {
@@ -2870,91 +3325,198 @@ async function playNext() {
       ok = false;
     }
   }
-  if (!ok) {
+  // 这一句播完之前已经被新一轮顶掉：到此为止，绝不能再往下播
+  if (epoch !== playbackEpoch) return;
+  // 被打断时不要再用本机嗓门补念一句
+  if (!ok && !voiceInterrupted) {
+    let hasNative = false;
+    try {
+      const n = voiceNative();
+      hasNative = Boolean((n && typeof n.speak === "function") || window.speechSynthesis);
+    } catch (e) {}
+    if (!hasNative) voiceTtsWarn.value = true; // 两条路都没声音，必须让用户看见
     try {
       await playFallbackTts(text);
     } catch (e) {}
   }
+  if (epoch !== playbackEpoch) return;
   voiceSpeaking = false;
   playNext();
 }
 
-function playServerTts(text) {
-  return new Promise((resolve, reject) => {
-    // 合成超时就走本机朗读兜底：不能让一段播报把整通电话卡住
-    const ac = new AbortController();
-    const timer = window.setTimeout(() => {
-      try {
-        ac.abort();
-      } catch (e) {}
-    }, VOICE_TTS_MS);
-    fetch("/api/v2/voice/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Workbench": "1" },
-      body: JSON.stringify({ text, voice: voiceName.value || "" }),
-      signal: ac.signal,
-    })
-      .then((r) => {
-        if (!r.ok) throw new Error("TTS " + r.status);
-        return r.blob();
-      })
-      .then((blob) => {
-        window.clearTimeout(timer);
-        const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        voiceAudio = audio;
-        // 首段声音真正播出来的时刻：用户"听到回答"的延迟，
-        // 与首字耗时不是一回事（中间还有合成与解码）
-        audio.onplaying = () => {
-          if (!voiceTiming.firstAudioMs)
-            voiceTiming.firstAudioMs = Math.round(performance.now() - voiceTiming.t0);
-        };
-        audio.onended = () => {
-          URL.revokeObjectURL(url);
-          voiceAudio = null;
-          resolve();
-        };
-        audio.onerror = () => {
-          URL.revokeObjectURL(url);
-          voiceAudio = null;
-          reject(Error("播放失败"));
-        };
-        // 打断时 pause() 不会触发 onended，这里兜底结束当前句
-        audio.onpause = () => {
-          URL.revokeObjectURL(url);
-          voiceAudio = null;
-          resolve();
-        };
-        audio.play().catch(reject);
-      })
-      .catch((e) => {
-        window.clearTimeout(timer);
-        reject(e);
-      });
+// 所有合成请求的唯一出口：预取和即时请求走同一条路，音色/超时口径一致
+function ttsFetch(text, ac) {
+  return fetch("/api/v2/voice/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Workbench": "1" },
+    // 本地合成不分音色，传了也只会让缓存分成几份、白占空间
+    body: JSON.stringify({ text, voice: isLocalTts() ? "" : voiceName.value || "" }),
+    signal: ac.signal,
+  }).then((r) => {
+    if (!r.ok) throw new Error("TTS " + r.status);
+    return r.blob();
   });
+}
+
+// 预取：当前句还在播的时候，把后面的句子先合成好
+function prefetchTts(text) {
+  const t = String(text || "").trim();
+  if (!t || !voiceServer.tts || voiceInterrupted) return;
+  if (ttsPrefetch.has(t) || ttsPrefetch.size >= TTS_PREFETCH_AHEAD) return;
+  const ac = new AbortController();
+  const timer = window.setTimeout(() => {
+    try {
+      ac.abort();
+    } catch (e) {}
+  }, VOICE_TTS_MS);
+  const promise = ttsFetch(t, ac).finally(() => window.clearTimeout(timer));
+  promise.catch(() => {}); // 预取失败不冒泡成未处理拒绝，播放时会重新请求
+  ttsPrefetch.set(t, { promise, ac });
+}
+
+// 停止播报/打断时作废在途预取，别继续占着合成服务
+function clearTtsPrefetch() {
+  for (const item of ttsPrefetch.values()) {
+    try {
+      item.ac.abort();
+    } catch (e) {}
+  }
+  ttsPrefetch.clear();
+  for (const ac of ttsInflight) {
+    try {
+      ac.abort();
+    } catch (e) {}
+  }
+  ttsInflight.clear();
+}
+
+// 取音频：命中预取就直接用，没命中才现请求
+function loadTtsBlob(text) {
+  const hit = ttsPrefetch.get(text);
+  if (hit) {
+    ttsPrefetch.delete(text);
+    return hit.promise.catch(() =>
+      // 预取被打断/超时：换一次即时合成，别让这句话没声音
+      requestTts(text),
+    );
+  }
+  return requestTts(text);
+}
+
+// 即时的单句合成请求：登记在册，打断时一起作废
+function requestTts(text) {
+  const ac = withTtsTimeout(new AbortController());
+  ttsInflight.add(ac);
+  const done = () => ttsInflight.delete(ac);
+  return ttsFetch(text, ac).then(
+    (b) => {
+      done();
+      return b;
+    },
+    (e) => {
+      done();
+      throw e;
+    },
+  );
+}
+
+// 超时就放弃服务端合成，交给本机朗读兜底
+function withTtsTimeout(ac) {
+  const timer = window.setTimeout(() => {
+    try {
+      ac.abort();
+    } catch (e) {}
+  }, VOICE_TTS_MS);
+  ac.signal.addEventListener("abort", () => window.clearTimeout(timer), { once: true });
+  return ac;
+}
+
+function playTtsBlob(blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    // 语速在这里生效：以前只存了 localStorage，播放时从没读过，选 1.3× 也没变化
+    try {
+      audio.playbackRate = voiceRate.value || 1;
+      audio.preservesPitch = true;
+      if ("webkitPreservesPitch" in audio) audio.webkitPreservesPitch = true;
+    } catch (e) {}
+    voiceAudio = audio;
+    liveAudios.set(audio, resolve);
+    const release = () => {
+      liveAudios.delete(audio);
+      try {
+        URL.revokeObjectURL(url);
+      } catch (e) {}
+      if (voiceAudio === audio) voiceAudio = null;
+    };
+    // 首段声音真正播出来的时刻：用户"听到回答"的延迟，
+    // 与首字耗时不是一回事（中间还有合成与解码）
+    audio.onplaying = () => {
+      if (!voiceTiming.firstAudioMs)
+        voiceTiming.firstAudioMs = Math.round(performance.now() - voiceTiming.t0);
+    };
+    audio.onended = () => {
+      release();
+      resolve();
+    };
+    audio.onerror = () => {
+      release();
+      reject(Error("播放失败"));
+    };
+    // 打断时 pause() 不会触发 onended，这里兜底结束当前句
+    audio.onpause = () => {
+      release();
+      resolve();
+    };
+    audio.play().catch((e) => {
+      URL.revokeObjectURL(url);
+      voiceAudio = null;
+      reject(e);
+    });
+  });
+}
+
+async function playServerTts(text) {
+  const blob = await loadTtsBlob(text);
+  await playTtsBlob(blob);
 }
 
 function playFallbackTts(text) {
   return new Promise((resolve) => {
+    let settled = false;
+    let guard = 0;
+    // 只解一次：正常靠 speakEnd / onend，异常靠超时，重复调用无副作用
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      if (guard) window.clearTimeout(guard);
+      if (voiceSpeakResolve === settle) voiceSpeakResolve = null;
+      resolve();
+    };
     const n = voiceNative();
     if (n && typeof n.speak === "function") {
-      voiceSpeakResolve = resolve;
+      voiceSpeakResolve = settle;
+      // 壳没回 speakEnd（引擎缺失、老版本、被系统杀掉）时不能一直等，
+      // 否则 voiceSpeaking 卡在 true，后续句子不再播、界面也不会回到收听。
+      guard = window.setTimeout(settle, 15000);
       try {
         n.speak(text);
       } catch (e) {
-        resolve();
+        settle();
       }
       return;
     }
     if (window.speechSynthesis) {
       const u = new SpeechSynthesisUtterance(text);
       u.lang = "zh-CN";
-      u.onend = resolve;
-      u.onerror = resolve;
+      u.onend = settle;
+      u.onerror = settle;
+      guard = window.setTimeout(settle, 15000);
       window.speechSynthesis.speak(u);
       return;
     }
-    resolve();
+    settle();
   });
 }
 
@@ -3017,6 +3579,16 @@ function handleVoiceEvent(ev) {
     if (text) askStreaming(text);
   } else if (ev.type === "error") {
     const msg = ev.message || "语音识别失败";
+    // 本机朗读只是服务端合成失败后的兜底：引擎缺失不该红字打断对话，
+    // 更不能让 voiceSpeakResolve 一直挂着，否则播放链永远不往下走。
+    if (msg.indexOf("朗读") >= 0) {
+      if (voiceSpeakResolve) {
+        const fn = voiceSpeakResolve;
+        voiceSpeakResolve = null;
+        fn();
+      }
+      return;
+    }
     if (msg.indexOf("忙") >= 0) {
       window.setTimeout(() => {
         if (voiceMode.value) startNativeListening();
@@ -3043,6 +3615,7 @@ function handleVoiceEvent(ev) {
 
 function stopSpeaking() {
   voiceQueue = [];
+  clearTtsPrefetch();
   if (voiceAudio) {
     try {
       voiceAudio.pause();
@@ -3064,6 +3637,10 @@ function stopSpeaking() {
   if (voiceMode.value) resumeListening();
 }
 
+function toggleCaption() {
+  voiceCaptionOn.value = !voiceCaptionOn.value;
+}
+
 function endCall() {
   unbindHoldPointer();
   document.removeEventListener("visibilitychange", onVoiceVisibility);
@@ -3075,6 +3652,7 @@ function endCall() {
   voiceState.value = "idle";
   voiceSetupOpen.value = false;
   voiceQueue = [];
+  clearTtsPrefetch();
   voiceSpeaking = false;
   stopBargeIn(); // 退出通话必须收回打断监听，否则麦克风会一直开着
   cleanupCapture();
@@ -3109,6 +3687,13 @@ function endCall() {
     voiceSpeakResolve = null;
     fn();
   }
+  // 挂断后把这一通电话的轮次拉到界面上：语音轮次是边聊边落库的，
+  // 但挂断前没有再拉过一次，用户回来只看到挂断前的旧内容。
+  // 另外，若这一通电话是在"没有会话"的状态下开的，会话是由服务端建的，
+  // 这里补上选中，避免挂断后停在空白页、看着像对话没保存。
+  if (!conversationId.value && voiceConversationId)
+    conversationId.value = voiceConversationId;
+  refreshCurrent().catch(() => {});
 }
 
 function nativeRequestMic() {
@@ -3298,32 +3883,24 @@ onUnmounted(() => {
           <p class="subtle intro">
             正常提问，随手选择更有帮助的回答。无需填写标注表，也可以直接继续聊。
           </p>
+          <div class="chat-bar">
+            <button
+              type="button"
+              class="outline chat-bar-btn"
+              @click="convDrawer = true"
+            >
+              <History :size="16" /><span>历史会话</span>
+              <em v-if="conversations.length">{{ conversations.length }}</em>
+            </button>
+            <button
+              type="button"
+              class="primary chat-bar-btn"
+              @click="newConversation"
+            >
+              <Plus :size="16" /><span>新会话</span>
+            </button>
+          </div>
           <div class="chat-layout">
-            <section class="panel conversation-list">
-              <button class="primary" @click="newConversation">
-                <Plus :size="16" />新会话</button
-              >
-              <div
-                v-for="c in conversations"
-                :key="c.id"
-                :class="['conversation', { selected: c.id === conversationId }]"
-              >
-                <button class="conv-open" @click="selectConversation(c)">
-                  <strong>{{ c.title }}</strong
-                  ><small>{{ c.domain }}</small>
-                </button>
-                <button
-                  class="conv-delete"
-                  :class="{ confirming: confirmingDelete === c.id }"
-                  :title="confirmingDelete === c.id ? '再次点击确认删除' : '删除会话'"
-                  @click.stop="deleteConversation(c)"
-                  >{{ confirmingDelete === c.id ? "确认删除？" : "删除" }}</button
-                >
-              </div>
-              <p v-if="!conversations.length" class="subtle">
-                你的会话将保存在这里。
-              </p>
-            </section>
             <div class="conversation-body">
               <section v-if="!turns.length" class="panel welcome">
                 <Sprout :size="36" />
@@ -3358,6 +3935,21 @@ onUnmounted(() => {
                       >语音</span
                     >{{ t.question }}
                   </p>
+                  <!-- 随问附图：历史里也要看得见，否则回看时不知道当时给模型看的是什么 -->
+                  <button
+                    v-if="t.image && t.image.attachment_id"
+                    type="button"
+                    class="turn-shot"
+                    title="查看原图"
+                    @click="zoomShot(t.image.attachment_id)"
+                  >
+                    <img
+                      :src="'/api/v2/voice/image/' + t.image.attachment_id"
+                      alt="随问附图"
+                      loading="lazy"
+                    />
+                    <span>随问附图</span>
+                  </button>
                 </div>
                 <div
                   class="wb-answers"
@@ -3554,13 +4146,21 @@ onUnmounted(() => {
                 <div class="form-bottom">
                   <div class="composer-tools">
                     <span class="image-pick">
-                    <label class="inline-check"
-                      ><input
-                        type="file"
-                        accept="image/png,image/jpeg,image/webp,image/gif"
-                        @change="pickImage"
-                      /><ImagePlus :size="16" />附图片（PNG/JPG/WEBP/GIF，≤8MB，随问题发给模型）</label
-                    >
+                      <label class="inline-check" title="调用系统相机拍照，随问题发给模型（≤8MB）">
+                        <input
+                          type="file"
+                          accept="image/*"
+                          capture="environment"
+                          @change="pickImage"
+                        /><Camera :size="16" />拍照
+                      </label>
+                      <label class="inline-check" title="从相册选图（PNG/JPG/WEBP/GIF，≤8MB）">
+                        <input
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp,image/gif"
+                          @change="pickImage"
+                        /><ImagePlus :size="16" />相册
+                      </label>
                     </span>
                   <button
                     type="button"
@@ -3579,18 +4179,13 @@ onUnmounted(() => {
                 ><button
                   type="button"
                   class="voice-entry"
-                    :disabled="busy || turns.some((t) => t.status === 'generating')"
                     @click="startCall"
                   >
                     <Mic :size="16" />语音通话
                   </button
                   ><button
                     class="primary"
-                    :disabled="
-                      busy ||
-                      !question.trim() ||
-                      turns.some((t) => t.status === 'generating')
-                    "
+                    :disabled="!question.trim()"
                   >
                     发送问题
                   </button>
@@ -4368,9 +4963,16 @@ onUnmounted(() => {
                 </template>
               </section>
 
-              <section class="team-detail panel">
+              <section class="team-detail panel" :class="{ 'has-conv': !!teamConv }">
                 <template v-if="teamConv">
                   <header class="team-detail-head">
+                    <button
+                      type="button"
+                      class="team-back"
+                      @click="teamConv = null"
+                    >
+                      <ChevronLeft :size="16" />返回列表
+                    </button>
                     <div>
                       <h2>{{ teamConv.title }}</h2>
                       <p class="subtle">
@@ -5093,11 +5695,15 @@ onUnmounted(() => {
           </div>
           <button
             type="button"
-            class="vc-mode"
-            :title="voiceHandsFree ? '已切换为按住说话' : '已切换为免按键'"
-            @click="toggleHandsFree"
+            class="vc-cap"
+            :class="{ on: voiceCaptionOn }"
+            :aria-pressed="voiceCaptionOn ? 'true' : 'false'"
+            :title="voiceCaptionOn ? '字幕已开启，点击关闭' : '字幕已关闭，点击开启'"
+            @click="toggleCaption"
           >
-            <Mic :size="14" />{{ voiceHandsFree ? '免按键' : '按住说' }}
+            <Captions v-if="voiceCaptionOn" :size="17" />
+            <CaptionsOff v-else :size="17" />
+            <span>{{ voiceCaptionOn ? '字幕开' : '字幕关' }}</span>
           </button>
         </header>
 
@@ -5116,8 +5722,10 @@ onUnmounted(() => {
           <p class="vc-hint">{{ voiceHintText }}</p>
 
           <div class="vc-caption">
-            <p v-if="voiceText" class="vc-said">你说：{{ voiceText }}</p>
-            <p v-if="voiceAnswerText" class="vc-say">{{ voiceAnswerText }}</p>
+            <p v-if="voiceCaptionOn && voiceText" class="vc-said">你说：{{ voiceText }}</p>
+            <p v-if="voiceCaptionOn && voiceAnswerText" class="vc-say">
+              {{ voiceAnswerText }}
+            </p>
 
             <!-- 本轮附图：六态真实反馈，缩略图不等于已上传 -->
             <div v-if="attach.url" class="vc-shot" :class="attachToneClass">
@@ -5147,94 +5755,89 @@ onUnmounted(() => {
               </div>
             </div>
 
+            <p v-if="voiceTtsWarn" class="vc-tts-warn">
+              这段没能合成语音（服务端和本机朗读都没出声），文字已显示在上方
+            </p>
             <p v-if="voiceError" class="vc-error">{{ voiceError }}</p>
-            <button
+            <div
               v-if="voiceError && voiceText && voiceState === 'idle'"
-              type="button"
-              class="vc-retry"
-              @click="retryAnswer"
+              class="vc-retry-row"
             >
-              重试回答
-            </button>
+              <button type="button" class="vc-retry" @click="retryAnswer()">
+                重试回答
+              </button>
+              <button
+                v-if="attach.url && !attachCanSend"
+                type="button"
+                class="vc-retry ghost"
+                @click="retryAnswerTextOnly"
+              >
+                不带图，只发文字
+              </button>
+            </div>
           </div>
         </div>
 
-        <footer class="vc-bottom">
-          <div class="vc-keys">
+        <footer class="vc-dock">
+          <!-- 音色/语速收进一个入口，带当前值摘要，点开才是完整面板 -->
+          <button
+            type="button"
+            class="vc-dock-set"
+            @click="voiceSetOpen = true"
+          >
+            <SlidersHorizontal :size="14" />
+            <span>音色 {{ voiceNameLabel }} · 语速 {{ voiceRateLabel }}</span>
+            <ChevronUp :size="14" />
+          </button>
+
+          <!-- 主操作居中；次级「拍照」在左，破坏性「挂断」在右手拇指位（右侧） -->
+          <div class="vc-dock-main">
             <button
               type="button"
-              class="vc-key big"
-              :class="{ on: voiceHolding || (voiceHandsFree && voiceState === 'listening') }"
-              title="麦克风"
-              aria-label="麦克风"
+              class="vc-round"
+              :disabled="voiceState === 'recognizing'"
+              title="拍照或从相册选图"
+              @click="openCamSheet"
+            >
+              <Camera :size="22" /><span>拍照</span>
+            </button>
+            <button
+              type="button"
+              class="vc-talk"
+              :class="{
+                on: voiceHolding,
+                busy: voiceState === 'thinking' || voiceState === 'speaking',
+              }"
+              :aria-label="holdLabel"
               @pointerdown.prevent="holdVoiceStart"
               @pointerup.prevent="holdVoiceEnd"
               @pointercancel.prevent="holdVoiceCancel"
               @pointermove="holdVoiceMove"
               @contextmenu.prevent
             >
-              <Mic :size="24" />
-              <small>{{ holdLabel }}</small>
+              <Mic :size="34" />
+              <em>{{ holdLabel }}</em>
             </button>
             <button
               type="button"
-              class="vc-key"
-              :disabled="voiceState === 'recognizing'"
-              title="拍照或从相册选图"
-              @click="openCamSheet"
-            >
-              <Camera :size="20" />
-              <small>拍照</small>
-            </button>
-            <button
-              type="button"
-              class="vc-key"
-              :disabled="voiceState !== 'speaking'"
-              title="停止播报"
-              @click="stopSpeaking"
-            >
-              <Square :size="18" />
-              <small>停止</small>
-            </button>
-            <button
-              type="button"
-              class="vc-key"
-              title="回到文字输入"
+              class="vc-round danger"
+              title="挂断"
               @click="endCall"
             >
-              <FileText :size="18" />
-              <small>文字</small>
+              <PhoneOff :size="22" /><span>挂断</span>
             </button>
-            <button type="button" class="vc-key danger" @click="endCall">
-              <PhoneOff :size="18" />
-              <small>挂断</small>
-            </button>
-          </div>
-          <div class="vc-more">
-            <label>
-              声音
-              <select v-model="voiceName">
-                <option value="">默认（晓晓）</option>
-                <option value="zh-CN-XiaoxiaoNeural">晓晓 · 女声</option>
-                <option value="zh-CN-YunxiNeural">云希 · 男声（轻快）</option>
-                <option value="zh-CN-YunjianNeural">云健 · 男声（沉稳）</option>
-                <option value="zh-CN-XiaoyiNeural">晓伊 · 女声（活泼）</option>
-                <option value="zh-CN-YunyangNeural">云扬 · 男声（播报）</option>
-              </select>
-            </label>
-            <label>
-              语速
-              <select v-model.number="voiceRate">
-                <option :value="0.85">慢 0.85×</option>
-                <option :value="1">正常 1.0×</option>
-                <option :value="1.15">快 1.15×</option>
-                <option :value="1.3">更快 1.3×</option>
-              </select>
-            </label>
-            <span class="vc-tip">单次最长 60 秒</span>
           </div>
         </footer>
       </template>
+
+      <!-- 拍照链路等待：相机启动、回传、压缩期间都要有明确反馈 -->
+      <div v-if="shotBusy" class="vc-wait">
+        <i class="vc-wait-ring"></i>
+        <p>{{ shotBusyText || "正在处理照片…" }}</p>
+        <button type="button" class="vc-wait-cancel" @click="cancelShotWait">
+          取消
+        </button>
+      </div>
 
       <!-- 页面内相机：实时取景 + 快门 -->
       <div v-if="voiceCamOpen" class="vc-cam">
@@ -5278,20 +5881,150 @@ onUnmounted(() => {
         @click.self="voiceSheetOpen = false"
       >
         <div class="vc-sheet">
-          <button type="button" @click="openInPageCamera">
-            <Camera :size="18" /><span>打开相机（页面内）</span>
+          <button type="button" @click="useSystemCamera">
+            <Camera :size="18" /><span>拍照</span>
           </button>
           <button type="button" @click="fromAlbum">
             <ImagePlus :size="18" /><span>从相册选择</span>
           </button>
-          <button type="button" @click="useSystemCamera">
-            <Camera :size="18" /><span>系统相机</span>
+          <button v-if="isSecurePage()" type="button" @click="openInPageCamera">
+            <Camera :size="18" /><span>页面内取景（可连续拍）</span>
           </button>
           <p v-if="voiceCamError" class="err">{{ voiceCamError }}</p>
           <button type="button" class="cancel" @click="voiceSheetOpen = false">取消</button>
         </div>
       </div>
+
+      <!-- 播报设置：谁在说话、说多快 -->
+      <div
+        v-if="voiceSetOpen"
+        class="vc-sheet-mask"
+        @click.self="voiceSetOpen = false"
+      >
+        <div class="vc-sheet vc-set">
+          <div class="vc-set-head">
+            <b>播报设置</b>
+            <span>只影响回答的朗读，不影响识别</span>
+          </div>
+
+          <p class="vc-set-label">
+            谁在说话（音色）
+            <em v-if="isLocalTts()">本地合成目前只有这一个女声</em>
+          </p>
+          <div class="vc-set-chips">
+            <button
+              v-for="p in (isLocalTts() ? LOCAL_VOICE_PRESETS : VOICE_PRESETS)"
+              :key="p.value || 'default'"
+              type="button"
+              class="vc-chip"
+              :class="{ on: isLocalTts() || (voiceName || '') === p.value }"
+              @click="pickVoice(p.value)"
+            >
+              <b>{{ p.label }}</b>
+              <small>{{ p.note }}</small>
+            </button>
+          </div>
+
+          <p class="vc-set-label">说多快（语速）</p>
+          <div class="vc-set-chips">
+            <button
+              v-for="r in VOICE_RATES"
+              :key="r.value"
+              type="button"
+              class="vc-chip rate"
+              :class="{ on: voiceRate === r.value }"
+              @click="pickRate(r.value)"
+            >
+              <b>{{ r.label }}</b>
+              <small>{{ fmtRate(r.value) }}</small>
+            </button>
+          </div>
+
+          <div class="vc-set-foot">
+            <button
+              type="button"
+              class="vc-set-try"
+              :disabled="voicePreviewing"
+              @click="previewVoice"
+            >
+              {{ voicePreviewing ? "试听中…" : "试听" }}
+            </button>
+            <button type="button" class="vc-set-done" @click="voiceSetOpen = false">
+              完成
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
+
+    <!-- 原图查看：手机上点缩略图直接铺满，不跳浏览器 -->
+    <div v-if="shotZoom" class="shot-zoom" @click.self="shotZoom = ''">
+      <button type="button" class="shot-zoom-x" @click="shotZoom = ''">
+        <X :size="20" />
+      </button>
+      <img :src="shotZoom" alt="随问附图原图" />
+    </div>
+
+    <!-- 历史会话：从左侧滑出的抽屉。原来是聊天区左边一栏常驻，
+         手机上被压成 160px 高的滚动框，翻起来很别扭 -->
+    <div
+      class="conv-drawer-mask"
+      :class="{ show: convDrawer }"
+      @click="convDrawer = false"
+    ></div>
+    <aside
+      class="conv-drawer"
+      :class="{ open: convDrawer }"
+      :aria-hidden="convDrawer ? 'false' : 'true'"
+      aria-label="历史会话"
+    >
+      <header class="conv-drawer-head">
+        <strong>历史会话</strong>
+        <button
+          type="button"
+          class="conv-drawer-x"
+          aria-label="关闭"
+          @click="convDrawer = false"
+        >
+          <X :size="18" />
+        </button>
+      </header>
+      <input
+        v-model="convQuery"
+        class="conv-drawer-search"
+        type="search"
+        placeholder="搜索会话"
+        aria-label="搜索会话"
+      />
+      <button type="button" class="primary conv-drawer-new" @click="newConversation">
+        <Plus :size="16" />新会话
+      </button>
+      <div class="conv-drawer-list">
+        <template v-for="g in convGroups" :key="g.label">
+          <p class="conv-group">{{ g.label }}</p>
+          <div
+            v-for="c in g.items"
+            :key="c.id"
+            :class="['conversation', { selected: c.id === conversationId }]"
+          >
+            <button class="conv-open" @click="selectConversation(c)">
+              <strong>{{ c.title }}</strong>
+              <small>{{ formatTime(c.created_at) }}</small>
+            </button>
+            <button
+              class="conv-delete"
+              :class="{ confirming: confirmingDelete === c.id }"
+              :title="confirmingDelete === c.id ? '再次点击确认删除' : '删除会话'"
+              @click.stop="deleteConversation(c)"
+              >{{ confirmingDelete === c.id ? "确认" : "删除" }}</button
+            >
+          </div>
+        </template>
+        <p v-if="!convGroups.length" class="subtle conv-empty">
+          {{ convQuery ? "没有匹配的会话" : "还没有会话，问一个问题就会自动保存" }}
+        </p>
+      </div>
+    </aside>
 </template>
 
 <style scoped>
@@ -5501,9 +6234,7 @@ select {
   color: #805c20;
 }
 .chat-layout {
-  display: grid;
-  grid-template-columns: 210px minmax(0, 1fr);
-  gap: 23px;
+  display: block;
 }
 .conversation-list {
   align-self: start;
@@ -5851,9 +6582,6 @@ a.text-button {
   display: none;
 }
 @media (max-width: 1100px) {
-  .chat-layout {
-    grid-template-columns: 170px minmax(0, 1fr);
-  }
   .wb-content {
     padding: 25px;
   }
@@ -5943,13 +6671,6 @@ a.text-button {
   }
   .wb-content {
     padding: 22px 16px;
-  }
-  .chat-layout {
-    grid-template-columns: 1fr;
-  }
-  .conversation-list {
-    position: static;
-    max-height: 160px;
   }
   .conversation-list .conversation {
     padding: 8px;
@@ -6450,6 +7171,49 @@ a.text-button {
 }
 
 /* 图片来源选择 */
+.vc-wait {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 14px;
+  background: #0b1a13cc;
+  color: #eaf3ec;
+  text-align: center;
+}
+.vc-wait-cancel {
+  height: 32px;
+  padding: 0 20px;
+  border-radius: 999px;
+  border: 1px solid #ffffff3d;
+  background: #ffffff12;
+  color: #d7ece2;
+  font-size: 13px;
+}
+.vc-wait-cancel:active {
+  background: #ffffff22;
+}
+.vc-wait p {
+  margin: 0;
+  font-size: 14px;
+  letter-spacing: 0.5px;
+}
+.vc-wait-ring {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 3px solid #ffffff2e;
+  border-top-color: #7ee0a1;
+  animation: vcWaitSpin 0.9s linear infinite;
+}
+@keyframes vcWaitSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .vc-sheet-mask {
   position: fixed;
   inset: 0;
@@ -6745,12 +7509,40 @@ a.text-button {
 .team-bubble.q { background: #f4f7f2; color: #33453b; }
 .team-bubble.a { background: #fff; border: 1px solid #e9efe6; color: #33453b; }
 .team-who { font-size: 11px; color: #8d9c95; margin-bottom: 4px; display: flex; gap: 6px; align-items: center; }
-.team-answer { white-space: pre-wrap; }
+.team-answer { white-space: pre-wrap; }.team-back { display: none; }
+
 @media (max-width: 900px) {
   .team-filters { grid-template-columns: 1fr 1fr; }
   .team-layout { grid-template-columns: 1fr; }
-  .team-list { max-height: 46vh; }
+  .team-list { max-height: 50vh; }
   .team-thread { max-height: none; }
+  /* 手机上选中会话后详情整屏铺开：单列布局下详情在列表下方，很容易看漏 */
+  .team-detail.has-conv {
+    position: fixed;
+    top: 0; right: 0; bottom: 0; left: 0;
+    z-index: 95;
+    border-radius: 0;
+    border: 0;
+    padding: max(12px, env(safe-area-inset-top)) 14px
+      max(14px, env(safe-area-inset-bottom));
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+    background: #fff;
+  }
+  .team-detail.has-conv .team-thread { max-height: none; overflow: visible; }
+  .team-detail-head { flex-wrap: wrap; }
+  .team-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    width: 100%;
+    padding: 0 0 8px;
+    border: 0;
+    background: none;
+    color: #216b50;
+    font-size: 13px;
+    font-weight: 600;
+  }
 }
 
 /* ── 组织与权限 ───────────────────────── */
@@ -6848,9 +7640,14 @@ a.text-button {
 @keyframes vcSpin{to{transform:rotate(360deg)}}
 .vc{position:fixed;top:0;right:0;bottom:0;left:0;z-index:130;display:flex;flex-direction:column;color:#eaf6f0;background:radial-gradient(ellipse at 50% 26%,#123c2f,#0a1f18 55%,#060f0c);padding:max(12px,env(safe-area-inset-top)) 16px max(14px,env(safe-area-inset-bottom))}
 .vc-setup{margin:auto;width:360px;max-width:100%;background:#fff;color:#21443a;border-radius:22px;padding:30px 24px 22px;text-align:center}
-.vc-top{display:flex;align-items:center;gap:10px}
+.vc-top{display:flex;align-items:center;gap:10px;position:relative}
+.vc-cap{display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 13px 0 10px;margin-left:auto;border-radius:999px;border:1px solid #ffffff2b;background:#ffffff10;color:#8fb9a9;font-size:12px;font-weight:500;letter-spacing:.6px;line-height:1;cursor:pointer;transition:background .18s ease,color .18s ease,border-color .18s ease,transform .1s ease}
+.vc-cap svg{flex:none}
+.vc-cap.on{background:#8ff0c42b;border-color:#8ff0c485;color:#e4fff3}
+.vc-cap.on svg{color:#8ff0c4}
+.vc-cap:active{transform:scale(.95)}
 .vc-icon{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;background:#ffffff14;color:#d9efe5;border:0}
-.vc-clock{flex:1;display:flex;flex-direction:column;align-items:center;line-height:1.25}
+.vc-clock{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;line-height:1.25;pointer-events:none;white-space:nowrap}
 .vc-clock b{font-size:15px;font-weight:600;letter-spacing:.3px}
 .vc-clock span{font-size:12px;color:#9fc4b5;font-variant-numeric:tabular-nums}
 .vc-mode{display:inline-flex;align-items:center;gap:5px;height:32px;padding:0 12px;border-radius:999px;background:#ffffff14;color:#cfeee0;border:0;font-size:12px}
@@ -6873,7 +7670,10 @@ a.text-button {
 .vc-said{margin:8px 0 0;font-size:13px;color:#9fc4b5}
 .vc-say{margin:6px 0 0;font-size:16px;line-height:1.6;color:#eefaf3}
 .vc-error{margin:4px 0;font-size:12.5px;color:#ffb3ae}
-.vc-retry{color:#d9efe5;border-color:#ffffff4d;background:transparent}
+.vc-tts-warn{margin:4px 0;font-size:12.5px;color:#ffd7a1}
+.vc-retry-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:2px}
+.vc-retry{color:#d9efe5;border:1px solid #ffffff4d;background:transparent;padding:5px 12px;border-radius:999px;font-size:12.5px;line-height:1.4;cursor:pointer}
+.vc-retry.ghost{color:#b9d6c9;border-style:dashed;border-color:#ffffff33}
 .vc-cam-note{display:flex;align-items:center;gap:5px;margin:2px 0;font-size:12.5px;color:#ffc9a3}
 .vc-drawer{width:min(560px,100%);max-height:32vh;overflow:auto;text-align:left;background:#ffffff0f;border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:10px 12px;margin-top:4px}
 .vc-line{display:flex;gap:8px;padding:5px 0;font-size:13px;line-height:1.55;color:#dbeee5}
@@ -6922,4 +7722,450 @@ a.text-button {
 .vc-sheet button:active{background:#ffffff14}
 .vc-sheet button.cancel{color:#9fc4b5;font-size:14px;margin-top:2px;border-top:1px solid rgba(255,255,255,.08);border-radius:0 0 12px 12px}
 .vc-file{display:none}
+
+/* ── 历史随问附图 ───────────────────────── */
+.turn-shot {
+  display: inline-flex;
+  flex-direction: column;
+  margin-top: 8px;
+  padding: 0;
+  border: 1px solid #dbe7d6;
+  border-radius: 10px;
+  background: #fff;
+  overflow: hidden;
+  cursor: zoom-in;
+}
+.turn-shot img {
+  display: block;
+  width: 132px;
+  height: 132px;
+  object-fit: cover;
+}
+.turn-shot span {
+  padding: 3px 0;
+  font-size: 11px;
+  text-align: center;
+  color: #6d8177;
+  background: #f6faf4;
+}
+.shot-zoom {
+  position: fixed;
+  top: 0; right: 0; bottom: 0; left: 0;
+  z-index: 160;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(8, 18, 14, 0.9);
+}
+.shot-zoom img {
+  max-width: 100%;
+  max-height: 86vh;
+  border-radius: 10px;
+}
+.shot-zoom-x {
+  position: absolute;
+  top: max(14px, env(safe-area-inset-top));
+  right: 14px;
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border: 0;
+  border-radius: 50%;
+  background: #ffffff1f;
+  color: #eaf6f0;
+}
+
+/* ── 语音底栏（参照通话类应用：中间一个大按钮，两侧次要操作）─── */
+.vc-dock {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 4px 2px;
+}
+.vc-dock-aux {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.vc-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: #ffffff12;
+  color: #cfeee0;
+  font-size: 12px;
+}
+.vc-dock-set {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  align-self: center;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid #ffffff1f;
+  background: #ffffff10;
+  color: #bcd9cc;
+  font-size: 12px;
+}
+.vc-dock-set span {
+  max-width: 62vw;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.vc-dock-set:active {
+  background: #ffffff1f;
+}
+.vc-set {
+  gap: 6px;
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+.vc-set-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 12px 8px;
+}
+.vc-set-head b {
+  font-size: 15px;
+  color: #eaf6f0;
+}
+.vc-set-head span {
+  font-size: 12px;
+  color: #8fb9a9;
+}
+.vc-set-label em {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 400;
+  color: #e6c08a;
+  margin-left: 6px;
+}
+.vc-set-label {
+  margin: 6px 12px 2px;
+  font-size: 12px;
+  color: #8fb9a9;
+}
+.vc-set-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 12px 4px;
+}
+.vc-chip {
+  display: flex !important;
+  flex-direction: column;
+  align-items: flex-start !important;
+  justify-content: center;
+  gap: 1px !important;
+  height: auto !important;
+  min-height: 48px;
+  padding: 8px 12px !important;
+  border-radius: 12px !important;
+  border: 1px solid #ffffff1f !important;
+  background: #ffffff0d !important;
+  color: #cfe7db !important;
+  line-height: 1.2;
+}
+.vc-chip b {
+  font-size: 14px;
+  font-weight: 500;
+}
+.vc-chip small {
+  font-size: 11px;
+  color: #86ab9c;
+}
+.vc-chip.rate {
+  min-width: 66px;
+  align-items: center !important;
+}
+.vc-chip.on {
+  background: #8ff0c426 !important;
+  border-color: #8ff0c480 !important;
+  color: #e6fff4 !important;
+}
+.vc-chip.on small {
+  color: #a9d8c4;
+}
+.vc-set-foot {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px 2px;
+}
+.vc-set-foot button {
+  flex: 1;
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+  height: 46px;
+  border-radius: 12px;
+  border: 1px solid #ffffff26;
+  background: #ffffff10;
+  color: #d9efe5;
+  font-size: 15px;
+}
+.vc-set-done {
+  background: #34be8a !important;
+  border-color: #34be8a !important;
+  color: #062a1e !important;
+  font-weight: 500;
+}
+.vc-mini select {
+  border: 0;
+  background: transparent;
+  color: #eaf6f0;
+  font-size: 12px;
+  outline: none;
+  padding-right: 2px;
+}
+.vc-mini select option {
+  color: #123c2f;
+}
+.vc-dock-note {
+  font-size: 11px;
+  color: #7fa595;
+}
+.vc-dock-main {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) 64px;
+  align-items: center;
+  gap: 16px;
+  padding: 0 2px;
+}
+.vc-round {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 64px;
+  height: 64px;
+  border: 0;
+  border-radius: 50%;
+  background: #ffffff14;
+  color: #d9efe5;
+  font-size: 11px;
+}
+.vc-round span {
+  font-size: 11px;
+  line-height: 1;
+}
+.vc-round.danger {
+  background: #e5484d2e;
+  color: #ffc3c4;
+  box-shadow: inset 0 0 0 1px #e5484d59;
+}
+.vc-round.on {
+  background: #8ff0c42e;
+  color: #d6ffe9;
+}
+.vc-talk {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  justify-self: center;
+  width: 112px;
+  height: 112px;
+  border: 0;
+  border-radius: 50%;
+  background: linear-gradient(160deg, #8ff0c4, #43c58f);
+  color: #06231a;
+  box-shadow: 0 14px 34px #34be8a59;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.vc-talk em {
+  font-style: normal;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.vc-talk.on {
+  transform: scale(0.94);
+  box-shadow: 0 8px 18px #34be8a3d;
+}
+.vc-talk.busy {
+  background: linear-gradient(160deg, #ffe9a8, #e5c15c);
+  color: #4a3a10;
+}
+.vc-icon.on {
+  background: #8ff0c433;
+  color: #d6ffe9;
+}
+@media (max-width: 380px) {
+  .vc-talk {
+    width: 96px;
+    height: 96px;
+  }
+  .vc-dock-main {
+    grid-template-columns: 56px minmax(0, 1fr) 56px;
+  }
+  .vc-round {
+    width: 56px;
+    height: 56px;
+  }
+}
+
+/* ── 文字页附图入口：拍照 / 相册 并排 ─────────────────────── */
+.image-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+/* 手机上两个按钮各占一半，不要上下各占一整行 */
+@media (max-width: 760px) {
+  .form-bottom .image-pick { width: 100%; }
+  .form-bottom .image-pick .inline-check {
+    width: auto;
+    flex: 1 1 0;
+    justify-content: center;
+    padding: 10px 12px;
+  }
+}
+
+/* ── 历史会话：工具条 + 左侧抽屉 ─────────────────────────── */
+.chat-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.chat-bar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+.chat-bar-btn em {
+  font-style: normal;
+  font-size: 11px;
+  line-height: 17px;
+  min-width: 17px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #e7efe6;
+  color: #3f6b4d;
+  text-align: center;
+}
+.conv-drawer-mask {
+  position: fixed;
+  inset: 0;
+  background: #0d1a1247;
+  z-index: 300;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+.conv-drawer-mask.show {
+  opacity: 1;
+  pointer-events: auto;
+}
+.conv-drawer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: min(84vw, 330px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 14px calc(16px + env(safe-area-inset-bottom));
+  background: #fff;
+  box-shadow: 2px 0 28px #0d1a1226;
+  z-index: 301;
+  transform: translateX(-102%);
+  transition: transform 0.22s ease, visibility 0s 0.22s;
+  visibility: hidden;
+}
+.conv-drawer.open {
+  transform: none;
+  visibility: visible;
+  transition: transform 0.22s ease, visibility 0s 0s;
+}
+.conv-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.conv-drawer-head strong {
+  font-size: 15px;
+}
+.conv-drawer-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #5d7364;
+  cursor: pointer;
+}
+.conv-drawer-x:active {
+  background: #eef3ec;
+}
+.conv-drawer-search {
+  width: 100%;
+  height: 36px;
+  border-radius: 9px;
+  border: 1px solid #d8e2d6;
+  background: #f7faf6;
+  padding: 0 11px;
+  font: inherit;
+  font-size: 13px;
+}
+.conv-drawer-new {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+}
+.conv-drawer-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: 8px;
+}
+.conv-group {
+  margin: 12px 0 6px;
+  padding-left: 8px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: #8a9b8e;
+}
+.conv-drawer-list .conversation {
+  margin-bottom: 2px;
+}
+.conv-drawer-list .conv-delete {
+  top: 50%;
+  transform: translateY(-50%);
+}
+.conv-empty {
+  padding: 18px 8px;
+  line-height: 1.6;
+}
+/* 触屏没有 hover：删除按钮必须常显，否则永远点不到 */
+@media (hover: none) {
+  .conv-delete {
+    opacity: 1;
+    background: #f7eeeb;
+  }
+}
 </style>

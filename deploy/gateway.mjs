@@ -29,6 +29,22 @@ http.createServer((req,res)=>{
   req.on('aborted',()=>proxy.destroy());res.on('close',()=>proxy.destroy());proxy.setTimeout(180000,()=>proxy.destroy());req.pipe(proxy);return;
  }
  if(!['GET','HEAD'].includes(req.method)){res.writeHead(405).end();return;}
+ // 浏览器若按 http 打开，页面就不是安全上下文：navigator.mediaDevices 直接不存在，
+ // 麦克风报"没权限"、相机报"不是安全连接"，授权多少次都没用。
+ // Cloudflare 边缘默认不强制升级，所以这里兜一层：只认公网域名，局域网 IP 直连不受影响。
+ // 只跳页面，不碰 /api/：301 会把 POST 改成 GET，接口不能这么动。
+ {
+  const host=String(req.headers.host||'').replace(/:\d+$/,'');
+  const visitor=String(req.headers['cf-visitor']||'');
+  const proto=String(req.headers['x-forwarded-proto']||'').toLowerCase();
+  const plain=/"scheme"\s*:\s*"http"/.test(visitor)||proto==='http';
+  // 内网直连（回环/192.168/10.x/172.16-31）保持原样，跳了就没法在现场调数据
+  const isLan=!host||host==='localhost'||/^127\./.test(host)||/^192\.168\./.test(host)||/^10\./.test(host)||/^172\.(1[6-9]|2\d|3[01])\./.test(host);
+  if(plain&&!isLan){
+   res.writeHead(301,{'Location':'https://sundaokun.eu.cc'+req.url,'Cache-Control':'no-store','Connection':'close'});
+   res.end();return;
+  }
+ }
  let file=path.resolve(root,'.'+pathname);
  if(file!==root&&!file.startsWith(root+path.sep)){res.writeHead(403).end();return;}
  try{if(!fs.statSync(file).isFile())file=path.join(root,'index.html');}catch{file=path.join(root,'index.html');}

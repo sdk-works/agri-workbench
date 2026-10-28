@@ -15,6 +15,17 @@ import { buildOriginMatcher } from "./origin-guard.mjs";
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url))),
   env = loadEnv();
 const port = Number(env.PORT || 8787);
+// 构建指纹：前端构建时写 dist/build.json（commit + 构建时间），这里读出来对外暴露。
+// 没有它的时候排障最常问的一句是"线上这版到底是哪个提交建的"——答不上来就只能猜。
+const BOOT_AT = new Date().toISOString();
+const BUILD_FILE = path.join(root, "dist", "build.json");
+function readBuildStamp() {
+  try {
+    return JSON.parse(fs.readFileSync(BUILD_FILE, "utf8"));
+  } catch {
+    return { commit: "unknown", builtAt: "", note: "没有 dist/build.json，用 app/build.sh 重新构建" };
+  }
+}
 function json(res, status, data) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
@@ -99,6 +110,16 @@ const server = http.createServer(async (req, res) => {
       return json(res, 415, { error: "需要 application/json" });
     if (req.method === "GET" && url.pathname === "/api/v1/health")
       return json(res, 200, { ok: true, version: "0.4.0", storage: repo.type });
+    // 版本指纹：前端、服务、提交三者能不能对上，看这一个地址就够了
+    if (req.method === "GET" && url.pathname === "/api/v2/version")
+      return json(res, 200, {
+        ok: true,
+        api: "0.4.0",
+        ...readBuildStamp(),
+        startedAt: BOOT_AT,
+        uptimeSec: Math.round(process.uptime()),
+        node: process.version,
+      });
     if (await voice.handle(req, res, url)) return;
     if (await imageServer.handle(req, res, url)) return;
     if (await workspace.handle(req, res, url)) return;
