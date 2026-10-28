@@ -1464,6 +1464,9 @@ const VOICE_MIN_SENTENCE = 32;
 // 但首句不能等：先把声音放出来，后续才靠长句压停顿
 const VOICE_FIRST_SENTENCE = 8;
 const VOICE_SENT_RE = /[。！？!?；;\n]/g;
+// 首句额外认逗号、顿号、冒号：模型第一句常常二十几个字才出现句号，
+// 只等句号的话 VOICE_FIRST_SENTENCE 调多小都没用，第一声照样要等大半秒。
+const VOICE_FIRST_SENT_RE = /[。！？!?；;，、：:\n]/g;
 let voiceStreamDone = true;
 let voiceCapture = null;
 let voiceAudio = null;
@@ -1492,7 +1495,14 @@ let voiceAsrAbort = null;
 let voiceAsrFails = 0;
 // 分阶段耗时：t0=提交时刻，firstCharMs=首个字到达，firstAudioMs=第一段声音真正播出来。
 // 分开记才能回答"是模型慢、还是播报慢"，不能用总耗时一概而论。
-let voiceTiming = { t0: 0, firstCharMs: 0, firstAudioMs: 0, asrMs: 0 };
+let voiceTiming = {
+  t0: 0,
+  firstCharMs: 0,
+  ttsReqMs: 0, // 首句送合成的时刻
+  ttsGotMs: 0, // 首句音频到手（blob 下载完）的时刻
+  firstAudioMs: 0, // 首句真正出声的时刻
+  asrMs: 0,
+};
 // 本轮实际用到的角色（来自服务端 phase 事件），用于把"走的哪条模型"记进耗时日志
 let voiceLastRole = "";
 const voicePhase = ref(""); // queued | generating | completed | failed | canceled
@@ -2988,7 +2998,16 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
       firstCharTimer = 0;
     }
   };
-  voiceTiming = { t0, firstCharMs: 0, firstAudioMs: 0, asrMs: voiceTiming.asrMs || 0 };
+  voiceTiming = {
+    t0,
+    firstCharMs: 0,
+    ttsReqMs: 0,
+    ttsGotMs: 0,
+    firstAudioMs: 0,
+    asrMs: voiceTiming.asrMs || 0,
+  };
+  // 识别这半秒正好用来把播放器叫醒，等到该出声时不用再等设备
+  warmUpSpeaker();
   try {
     const chosenDomain =
       domain.value && allowedDomainOptions.value.includes(domain.value)
@@ -3088,14 +3107,14 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
           // 只取第一个标点会切出很短的句子，塞回队首又永远长不大（每轮都从同一个短句开始），
           // 结果是整段憋到流结束才合成，首音反而更慢。
           while (true) {
-            const minLen = voiceSpoken
-              ? VOICE_MIN_SENTENCE
-              : VOICE_FIRST_SENTENCE;
+            const firstCut = !voiceSpoken;
+            const minLen = firstCut ? VOICE_FIRST_SENTENCE : VOICE_MIN_SENTENCE;
+            const sentRe = firstCut ? VOICE_FIRST_SENT_RE : VOICE_SENT_RE;
             if (pending.length < minLen) break;
-            VOICE_SENT_RE.lastIndex = 0;
+            sentRe.lastIndex = 0;
             let pos = -1;
             let mm;
-            while ((mm = VOICE_SENT_RE.exec(pending))) {
+            while ((mm = sentRe.exec(pending))) {
               if (mm.index + 1 >= minLen) {
                 pos = mm.index + 1;
                 break;
@@ -3403,8 +3422,55 @@ function loadTtsBlob(text) {
   return requestTts(text);
 }
 
+// ── 音频通路预热 ──
+// WebView 里第一次 new Audio(...).play() 要等系统把音频输出拉起来（蓝牙耳机更慢），
+// 实测常吃掉 0.5~1 秒。说话时先放一段数字静音（全 0 采样，听不见），
+// 把这笔初始化提前到"上传识别"的那半秒里。
+let warmAudioEl = null;
+function silentWavDataUrl(ms) {
+  const rate = 8000;
+  const n = Math.max(1, Math.round((rate * (ms || 120)) / 1000));
+  const bytes = new Uint8Array(44 + n * 2);
+  const dv = new DataView(bytes.buffer);
+  const ascii = (o, t) => {
+    for (let i = 0; i < t.length; i++) bytes[o + i] = t.charCodeAt(i);
+  };
+  ascii(0, "RIFF");
+  dv.setUint32(4, 36 + n * 2, true);
+  ascii(8, "WAVEfmt ");
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true);
+  dv.setUint16(22, 1, true);
+  dv.setUint32(24, rate, true);
+  dv.setUint32(28, rate * 2, true);
+  dv.setUint16(32, 2, true);
+  dv.setUint16(34, 16, true);
+  ascii(36, "data");
+  dv.setUint32(40, n * 2, true);
+  let raw = "";
+  for (let i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+  return "data:audio/wav;base64," + btoa(raw);
+}
+
+function warmUpSpeaker() {
+  try {
+    if (!warmAudioEl) {
+      warmAudioEl = new Audio(silentWavDataUrl(120));
+      warmAudioEl.preload = "auto";
+    }
+    try {
+      warmAudioEl.currentTime = 0;
+    } catch (e) {}
+    const p = warmAudioEl.play();
+    if (p && p.catch) p.catch(() => {});
+  } catch (e) {}
+}
+
 // 即时的单句合成请求：登记在册，打断时一起作废
 function requestTts(text) {
+  // 首句的合成请求发出时刻：和首音对比就能把「合成+下载」与「解码出声」分开
+  if (voiceTiming.t0 && !voiceTiming.ttsReqMs)
+    voiceTiming.ttsReqMs = Math.round(performance.now() - voiceTiming.t0);
   const ac = withTtsTimeout(new AbortController());
   ttsInflight.add(ac);
   const done = () => ttsInflight.delete(ac);
@@ -3479,6 +3545,8 @@ function playTtsBlob(blob) {
 
 async function playServerTts(text) {
   const blob = await loadTtsBlob(text);
+  if (voiceTiming.t0 && !voiceTiming.ttsGotMs)
+    voiceTiming.ttsGotMs = Math.round(performance.now() - voiceTiming.t0);
   await playTtsBlob(blob);
 }
 
@@ -3530,7 +3598,8 @@ function resumeListening() {
     try {
       console.info(
         "[voice] 识别 " + voiceTiming.asrMs + "ms · 首字 " + voiceTiming.firstCharMs +
-          "ms · 首段声音 " + voiceTiming.firstAudioMs + "ms · 完整 " +
+          "ms · 送合成 " + voiceTiming.ttsReqMs + "ms · 音频到手 " + voiceTiming.ttsGotMs +
+          "ms · 出声 " + voiceTiming.firstAudioMs + "ms · 完整 " +
           totalMs + "ms · 角色 " + (voiceLastRole || "?"),
       );
     } catch (e) {}
@@ -3543,6 +3612,8 @@ function resumeListening() {
         body: JSON.stringify({
           asrMs: voiceTiming.asrMs,
           firstCharMs: voiceTiming.firstCharMs,
+          ttsReqMs: voiceTiming.ttsReqMs,
+          ttsGotMs: voiceTiming.ttsGotMs,
           firstAudioMs: voiceTiming.firstAudioMs,
           totalMs: totalMs,
           role: voiceLastRole || "",

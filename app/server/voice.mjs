@@ -264,7 +264,11 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
           n(body.asrMs) +
           "ms · 首字 " +
           n(body.firstCharMs) +
-          "ms · 首音 " +
+          "ms · 送合成 " +
+          n(body.ttsReqMs) +
+          "ms · 音频到手 " +
+          n(body.ttsGotMs) +
+          "ms · 出声 " +
           n(body.firstAudioMs) +
           "ms · 完整 " +
           n(body.totalMs) +
@@ -311,12 +315,18 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
         JSON.stringify({ text, voice: String(body.voice || "") }),
         "utf8",
       );
+      const ttsT0 = Date.now();
       try {
         const r = await toPython(
           "/tts",
           "POST",
           { "Content-Type": "application/json", "Content-Length": payload.length },
           payload,
+        );
+        // 服务端合成耗时：和前端"送合成 → 音频到手"对比，
+        // 差额就是隧道传输 + 客户端解码，别把两件事混成一句"合成慢"
+        console.log(
+          "[tts] " + text.length + "字 " + (Date.now() - ttsT0) + "ms " + r.body.length + "B",
         );
         if (r.status !== 200) {
           res.writeHead(r.status, { "Content-Type": "application/json; charset=utf-8" });
