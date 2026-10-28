@@ -50,7 +50,12 @@ export function createImageServer({ repo, env, json, readBody }) {
         method,
         headers: { "Content-Type": "application/json" },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        signal: AbortSignal.timeout(timeoutMs),
+        // 老运行时没有 AbortSignal.timeout（Node < 17.3 / 浏览器 < Chrome 103）：
+        // 退化成没有超时保护，也不要抛 "is not a function"
+        signal:
+          typeof AbortSignal.timeout === "function"
+            ? AbortSignal.timeout(timeoutMs)
+            : undefined,
       });
     } catch (e) {
       const timedOut = e?.name === "TimeoutError" || e?.name === "AbortError";

@@ -188,9 +188,15 @@ export function createGateway(
       // 排队等待只监听外部取消（用户可取消排队）；执行时限在取得额度后再启动，
       // 避免排队时间扣掉推理预算、或拿到额度时已发过期请求
       release = await limiter.acquire(resKey, resLimit, opts.signal);
-      execSignal = opts.signal
-        ? AbortSignal.any([opts.signal, AbortSignal.timeout(timeoutMs)])
-        : AbortSignal.timeout(timeoutMs);
+      // AbortSignal.any 要 Node 20.3+ / Chrome 116+，timeout 要 Node 17.3+ / Chrome 103+。
+      // 缺了就在老运行时上退化：只保外部取消，不保超时，绝不抛 "is not a function"。
+      const mkTimeout =
+        typeof AbortSignal.timeout === "function"
+          ? () => AbortSignal.timeout(timeoutMs)
+          : () => undefined;
+      if (opts.signal && typeof AbortSignal.any === "function")
+        execSignal = AbortSignal.any([opts.signal, mkTimeout()].filter(Boolean));
+      else execSignal = opts.signal || mkTimeout();
       console.log(`[gateway] role=${role} model=${c.model} target=${c.base_url}`);
       return await run();
     } catch (e) {

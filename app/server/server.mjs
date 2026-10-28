@@ -36,6 +36,9 @@ function json(res, status, data) {
   });
   res.end(body);
 }
+// 客户端诊断限流：同一来源每分钟最多记 20 条，避免日志被刷爆
+const diagHits = new Map();
+
 async function readBody(req, limit = 12_000_000) {
   const chunks = [];
   let size = 0;
@@ -120,6 +123,40 @@ const server = http.createServer(async (req, res) => {
         uptimeSec: Math.round(process.uptime()),
         node: process.version,
       });
+    // 客户端诊断：手机上连控制台都看不到，脚本异常只能送到这里
+    // 匿名可写（登录失败时尤其需要），限流 + 截断，不当成可信数据使用
+    if (req.method === "POST" && url.pathname === "/api/v2/client-diag") {
+      const ip =
+        String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+        req.socket.remoteAddress ||
+        "-";
+      const now = Date.now();
+      const hit = diagHits.get(ip) || { n: 0, t: now };
+      if (now - hit.t > 60_000) {
+        hit.n = 0;
+        hit.t = now;
+      }
+      hit.n += 1;
+      diagHits.set(ip, hit);
+      if (diagHits.size > 500) {
+        for (const [k, v] of diagHits) if (now - v.t > 600_000) diagHits.delete(k);
+      }
+      if (hit.n > 20) return json(res, 200, { ok: true });
+      const body = await readBody(req, 32_000);
+      const cut = (v, n) =>
+        String(v == null ? "" : v)
+          .replace(/\s+/g, " ")
+          .slice(0, n);
+      console.log(
+        "[client-diag] " +
+          cut(body.tag, 24) +
+          " | " +
+          cut(body.message, 400) +
+          " | ua=" +
+          cut(body.ua, 160),
+      );
+      return json(res, 200, { ok: true });
+    }
     if (await voice.handle(req, res, url)) return;
     if (await imageServer.handle(req, res, url)) return;
     if (await workspace.handle(req, res, url)) return;

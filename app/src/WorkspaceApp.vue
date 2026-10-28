@@ -31,6 +31,7 @@ import {
   History,
 } from "lucide-vue-next";
 import { call, download } from "./workspace-api";
+import { uuid, friendlyError, logDiagnostic, compatProbe } from "./compat.js";
 // 附图状态机：六态与「什么才算上传成功」都在这份纯逻辑里，便于单测
 import * as Attach from "./attach-flow.mjs";
 const user = ref(null),
@@ -480,6 +481,22 @@ let timer,
   clock,
   polling = false,
   disposed = false;
+// JavaScript 层面的异常（不是业务错误）必须留证据：手机上连控制台都看不到。
+// 带上能力探测结果，才能判断是不是老 WebView 缺 API。
+const SCRIPT_ERROR_RE =
+  /is not a function|is not defined|is not a constructor|undefined is not an object|null is not an object|Cannot read propert|Cannot set propert|Unexpected token|Script error/i;
+
+function reportIfScriptError(e) {
+  const raw = String((e && e.message) || "");
+  if (!SCRIPT_ERROR_RE.test(raw)) return;
+  try {
+    logDiagnostic("ui-script-error", {
+      message: raw + " | " + JSON.stringify(compatProbe()),
+      stack: (e && e.stack) || "",
+    });
+  } catch (err) {}
+}
+
 async function act(fn) {
   if (busy.value) return;
   busy.value = true;
@@ -488,7 +505,10 @@ async function act(fn) {
   try {
     await fn();
   } catch (e) {
-    error.value = e.message;
+    // 老 WebView 上曾把 "AbortSignal.timeout is not a function" 直接显示在登录框下面，
+    // 用户无从判断。现在统一翻成人话，原文与能力探测结果落诊断日志。
+    error.value = friendlyError(e);
+    reportIfScriptError(e);
     if (e.status === 401) user.value = null;
   } finally {
     busy.value = false;
@@ -547,7 +567,7 @@ async function go(id) {
     try {
       await Promise.all([loadTeamUsers(), loadTeam()]);
     } catch (e) {
-      error.value = e.message;
+      error.value = friendlyError(e);
     }
   }
 }
@@ -783,7 +803,7 @@ async function poll() {
       await refresh();
   } catch (e) {
     if (!disposed) {
-      error.value = e.message;
+      error.value = friendlyError(e);
       if (e.status === 401) user.value = null;
     }
   } finally {
@@ -827,7 +847,7 @@ async function deleteConversation(c) {
     notice.value = "会话已删除";
     await act(refresh);
   } catch (e) {
-    error.value = e.message;
+    error.value = friendlyError(e);
   } finally {
     busy.value = false;
   }
@@ -851,7 +871,7 @@ async function submitImage() {
     await refresh();
     notice.value = "已提交出图任务，可在下方查看进度";
   } catch (e) {
-    error.value = e.message;
+    error.value = friendlyError(e);
   } finally {
     imageSubmitting.value = false;
   }
@@ -926,7 +946,7 @@ async function ask() {
         !sameIds
       )
         draft.value = {
-          request_id: crypto.randomUUID(),
+          request_id: uuid(),
           question: question.value,
           domain: domain.value,
           deep: deep.value,
@@ -1221,7 +1241,7 @@ async function makeTrainingQuestion() {
   await act(async () => {
     const t = await call(`/documents/${doc.value.id}/training-question`, {
       question: docQuestion.value,
-      request_id: crypto.randomUUID(),
+      request_id: uuid(),
     });
     page.value = "chat";
     conversationId.value = t.conversation_id;
@@ -3348,9 +3368,10 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
       lastTurnFailed = false;
       return;
     }
-    voiceError.value = e.message || "生成失败";
+    voiceError.value = friendlyError(e, "生成失败");
+    reportIfScriptError(e);
     if (imageIds.length)
-      markAllAttaches((a) => Attach.analysisFail(a, e.message || "生成失败"));
+      markAllAttaches((a) => Attach.analysisFail(a, friendlyError(e, "生成失败")));
     lastTurnFailed = true;
     voiceState.value = "failed";
     voiceStreamDone = true;
@@ -4076,7 +4097,7 @@ onMounted(async () => {
       await refresh();
     }
   } catch (e) {
-    error.value = e.message;
+    error.value = friendlyError(e);
   } finally {
     ready.value = true;
   }

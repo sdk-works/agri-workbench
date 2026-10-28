@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>京阳智农 · 手机兼容性自检</title>
+<style>
+  body { margin:0; padding:20px 16px 40px; background:#0c1a14; color:#e8f3ed;
+         font:15px/1.7 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  p.sub { margin:0 0 18px; color:#8fb8a4; font-size:13px; }
+  .card { background:#12261d; border:1px solid #1f3d30; border-radius:12px; padding:14px 16px; margin-bottom:14px; }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px solid #1a3327; font-size:14px; }
+  .row:last-child { border-bottom:0; }
+  .k { color:#9fc9b5; }
+  .v { font-family:ui-monospace,Menlo,Consolas,monospace; text-align:right; word-break:break-all; }
+  .bad { color:#ff8f7a; }
+  .good { color:#6ee7a8; }
+  .warn { color:#f5c66b; }
+  pre { white-space:pre-wrap; word-break:break-all; font-size:12px; color:#9fc9b5; margin:0; }
+  button { width:100%; padding:12px; border-radius:10px; border:1px solid #2c5a45;
+           background:#17402f; color:#c9f3dd; font-size:15px; margin-top:6px; }
+</style>
+</head>
+<body>
+<h1>手机兼容性自检</h1>
+<p class="sub">给旧 Android 手机用：看当前 WebView 缺哪些接口，以及能不能真的连上服务。</p>
+
+<div class="card" id="caps"><div class="row"><span class="k">检测中…</span></div></div>
+
+<div class="card">
+  <div class="row"><span class="k">设备</span><span class="v" id="ua">…</span></div>
+</div>
+
+<div class="card" id="net"><div class="row"><span class="k">正在实测请求…</span></div></div>
+
+<div class="card">
+  <pre id="dump">…</pre>
+  <button type="button" id="copy">复制结果发给技术</button>
+</div>
+
+<script>
+(function () {
+  // 这一段手写 ES5：这个页面的作用就是在「跑不了新语法」的机器上也能打开，
+  // 所以不能依赖构建降级，也不能用可选链、??、模板字符串之外的新东西。
+  var ua = navigator.userAgent || "";
+  document.getElementById("ua").textContent = ua;
+
+  function has(name, fn) {
+    try { return typeof fn === "function"; } catch (e) { return false; }
+  }
+
+  var caps = [
+    ["fetch", has("fetch", window.fetch), true],
+    ["AbortController", has("AbortController", window.AbortController), true],
+    ["AbortSignal.timeout", typeof AbortSignal !== "undefined" && has("t", AbortSignal.timeout), true],
+    ["AbortSignal.any", typeof AbortSignal !== "undefined" && has("a", AbortSignal.any), false],
+    ["crypto.randomUUID", !!(window.crypto && has("r", window.crypto.randomUUID)), false],
+    ["Promise.allSettled", !!(window.Promise && has("s", Promise.allSettled)), false],
+    ["ResizeObserver", has("ro", window.ResizeObserver), false],
+    ["Object.fromEntries", !!(window.Object && has("f", Object.fromEntries)), false],
+    ["String.replaceAll", !!(window.String && has("ra", String.prototype.replaceAll)), false],
+    ["Array.at", !!(window.Array && has("at", Array.prototype.at)), false]
+  ];
+
+  var box = document.getElementById("caps");
+  box.innerHTML = "";
+  var lines = [];
+  for (var i = 0; i < caps.length; i++) {
+    var name = caps[i][0], ok = caps[i][1], required = caps[i][2];
+    var row = document.createElement("div");
+    row.className = "row";
+    var k = document.createElement("span");
+    k.className = "k";
+    k.textContent = name;
+    var v = document.createElement("span");
+    v.className = "v " + (ok ? "good" : required ? "bad" : "warn");
+    v.textContent = ok ? "有" : required ? "缺失（必须修）" : "缺失（已有兼容处理）";
+    row.appendChild(k);
+    row.appendChild(v);
+    box.appendChild(row);
+    lines.push(name + "=" + (ok ? "1" : "0"));
+  }
+
+  var probe = {};
+  try {
+    probe = {
+      tag: "compat-page",
+      message: "caps " + lines.join(","),
+      ua: ua,
+      url: location.href
+    };
+    fetch("/api/v2/client-diag", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Workbench": "1" },
+      body: JSON.stringify(probe)
+    }).catch(function () {});
+  } catch (e) {}
+
+  // 实测：用 AbortController + setTimeout 打两个真实接口，看会不会像登录那样崩
+  var net = document.getElementById("net");
+  net.innerHTML = "";
+  var results = [];
+
+  function timedGet(path, ms, done) {
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, ms);
+    var t0 = Date.now();
+    fetch(path, { headers: { "X-Workbench": "1" }, credentials: "same-origin", signal: ac.signal })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          done({ path: path, ok: r.ok, status: r.status, ms: Date.now() - t0, body: String(t).slice(0, 80) });
+        });
+      })
+      .catch(function (e) {
+        done({ path: path, ok: false, status: 0, ms: Date.now() - t0, body: (e && e.message) || "失败" });
+      })
+      .then(function () { clearTimeout(timer); });
+  }
+
+  var queue = ["/api/v2/version", "/api/v2/voice/status"];
+  function next() {
+    if (!queue.length) {
+      var dump = document.getElementById("dump");
+      dump.textContent =
+        "UA: " + ua + "\n" +
+        "能力: " + lines.join(" ") + "\n" +
+        (results.length ? "请求: " + JSON.stringify(results, null, 1) : "");
+      return;
+    }
+    var p = queue.shift();
+    timedGet(p, 15000, function (r) {
+      results.push(r);
+      var row = document.createElement("div");
+      row.className = "row";
+      var k = document.createElement("span");
+      k.className = "k";
+      k.textContent = r.path;
+      var v = document.createElement("span");
+      v.className = "v " + (r.ok || r.status === 401 ? "good" : "bad");
+      v.textContent = (r.status ? r.status + " · " : "") + r.ms + "ms";
+      row.appendChild(k);
+      row.appendChild(v);
+      net.appendChild(row);
+      next();
+    });
+  }
+  next();
+
+  document.getElementById("copy").onclick = function () {
+    var txt = document.getElementById("dump").textContent;
+    var ta = document.createElement("textarea");
+    ta.value = txt;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+    this.textContent = "已复制";
+  };
+})();
+</script>
+</body>
+</html>
