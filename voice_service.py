@@ -449,10 +449,10 @@ _TTS_LOCAL_DIR = os.getenv(
 )
 # 换模型必须换缓存命名空间：缓存 key 只算 (音色+文本)，
 # 不带上模型标识的话，用户会听到上一版模型留下的 wav，以为"改了没生效"。
-_TTS_MODEL_TAG = os.getenv("TTS_MODEL_TAG", "melo-zh-en@24k-mp3")
+_TTS_MODEL_TAG = os.getenv("TTS_MODEL_TAG", "melo-zh-en@44k-mp3")
 # 输出采样率。MeloTTS 原生 44100，改 24000 省掉近一半传输体积；
 # 设 0 则保持模型原生采样率（想对比音质时用）。
-_TTS_SR_OUT = int(os.getenv("TTS_LOCAL_SR", "24000"))
+_TTS_SR_OUT = int(os.getenv("TTS_LOCAL_SR", "44100"))
 # auto  = 本地优先，云端 2 秒内回得来就仍用云端音色（用户选的音色不丢）
 # local = 只用本地；edge = 只用云端
 _TTS_ENGINE = os.getenv("TTS_ENGINE", "auto")
@@ -562,11 +562,13 @@ def _resample(samples, src_sr, dst_sr):
     return y, dst_sr  # 直接给 ndarray，_wav 里省掉一次 tolist 拷贝
 
 
-def _mp3(samples, sr, bitrate=64):
+def _mp3(samples, sr, bitrate=96):
     """PCM -> MP3。
 
-    一句 4 秒的 24kHz 16bit 单声道 wav 有 192KB，手机在田间弱网下
-    光下载就要两三秒，比合成本身还慢；64kbps 的 mp3 只有 32KB。
+    一句 4 秒的 44.1kHz 16bit 单声道 wav 有 353KB，手机在田间弱网下
+    光下载就要两三秒，比合成本身还慢；96kbps 的 mp3 只有 48KB。
+    采样率必须留在 44.1k：之前为省体积降到 24k（砍掉 12kHz 以上），
+    听感就是「闷」，省下的十几 KB 换不来这个代价。
     编码器缺失或抛错时返回空字节，调用方回退到 wav，不能让这句话没声音。
     """
     try:

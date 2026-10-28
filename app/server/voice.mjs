@@ -380,6 +380,8 @@ export function createVoice({ env, json, readBody, gateway, workspace }) {
           // 语音带图：先上传拿 image_id（推荐），也兼容内联 base64 的旧调用
           image: body.image,
           image_id: body.image_id,
+          // 同一轮多张图：按数组顺序送模型
+          image_ids: Array.isArray(body.image_ids) ? body.image_ids : undefined,
           // 失败重试：同一 request_id 重跑同一轮，不新建轮次
           retry: body.retry === true,
         });

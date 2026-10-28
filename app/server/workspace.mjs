@@ -542,6 +542,12 @@ export function createWorkspace({
         // 前端据此确认"本轮实际引用的是哪张附件"，而不是只看页面上还留着图
         attachment_id: (r.image_attachment && r.image_attachment.id) || "",
       };
+    if (Array.isArray(r.images)) {
+      // base64 本体绝不能回给前端：一轮六张能把列表响应撑到几 MB
+      r.image_ids = r.image_attachments.map((a) => a && a.id).filter(Boolean);
+      r.image_count = r.images.length;
+      delete r.images;
+    }
     if (!review && !r.feedback) {
       for (const c of r.candidates) {
         delete c.model;
@@ -904,6 +910,9 @@ export function createWorkspace({
       at: now(),
     };
   }
+  // 一轮最多几张图：多了模型注意力会散，而且一次请求的 base64 体积会压垮网关
+  const TURN_MAX_IMAGES = 6;
+
   // 统一完整性判定：长度截止（ended_reason=length）不算完整答案，不进入评测/偏好/导出/恢复
   function isComplete(c) {
     return c?.status === "completed" && c.ended_reason !== "length";
@@ -914,14 +923,33 @@ export function createWorkspace({
         id = text(b.request_id, "请求编号", 80),
         // 语音轮次不再自带一套历史与模型：统一走 createTurn，只标记来源与播报口径
         voice = b.voice === true;
-      // 图片两种传法：image_id（先上传，可复用/可审计）或 image（base64 内联，兼容旧调用）
+      // 图片三种传法：image_id（单张，兼容旧调用）、image_ids（同一轮多张，按数组顺序
+      // 进模型）、image（base64 内联，兼容旧调用）。多张必须都已落盘，
+      // 否则模型会对着"不存在的图"编内容。
       let image = parseImage(b.image),
         imageAttachment = null;
-      if (b.image_id) {
+      const images = [];
+      const imageAttachments = [];
+      const imageIdList = [];
+      for (const raw of [
+        ...(b.image_id ? [b.image_id] : []),
+        ...(Array.isArray(b.image_ids) ? b.image_ids : []),
+      ]) {
+        const one = String(raw || "").trim();
+        if (one && !imageIdList.includes(one)) imageIdList.push(one);
+      }
+      if (imageIdList.length > TURN_MAX_IMAGES)
+        fail(`一次最多带 ${TURN_MAX_IMAGES} 张图片`);
+      if (imageIdList.length) {
         if (image) fail("图片只能选一种传法");
-        const att = await loadVoiceImage(u, b.image_id, db, b.conversation_id);
-        image = { mime: att.mime, data: att.data };
-        imageAttachment = { id: att.id, mime: att.mime, bytes: att.bytes };
+        for (const iid of imageIdList) {
+          const att = await loadVoiceImage(u, iid, db, b.conversation_id);
+          images.push({ mime: att.mime, data: att.data });
+          imageAttachments.push({ id: att.id, mime: att.mime, bytes: att.bytes });
+        }
+        // 单图字段保持"第一张"，旧逻辑（has_image / image_attachment / 追问判定）照旧可用
+        image = images[0];
+        imageAttachment = imageAttachments[0];
       }
       if (!/^[\w-]{8,80}$/.test(id)) fail("请求编号无效");
       const old = await db.get("turns", id);
@@ -1039,12 +1067,14 @@ export function createWorkspace({
       // 复述改用两条腿压：IMAGE_FORCE_TAIL 的开头约束（治模型）+ 落盘前的
       // stripRepeatedOpening / stripRepeatedOpeningSentence（治结果）。
       // image_followup 就是给后一条用的：历史里已有基于这张图的完整回答，说明这轮是追问。
+      const myImageIds = imageAttachments.map((a) => a.id);
       const imageFollowUp =
-        Boolean(imageAttachment) &&
+        myImageIds.length > 0 &&
         turns.some(
           (p) =>
-            p.image_attachment &&
-            p.image_attachment.id === imageAttachment.id &&
+            [p.image_attachment, ...(p.image_attachments || [])]
+              .filter(Boolean)
+              .some((a) => myImageIds.includes(a.id)) &&
             Array.isArray(p.candidates) &&
             p.candidates.some(isComplete),
         );
@@ -1128,7 +1158,10 @@ export function createWorkspace({
         case_key: digest(JSON.stringify({ domain, context })),
         context,
         image,
-        // 附件标识：本轮实际引用的是哪张上传图（换图/切会话时靠它对齐）
+        // 本轮全部图片（按上传顺序）与它们的附件记录：多图追问、界面预览都靠这两列
+        images,
+        image_attachments: imageAttachments,
+        // 附件标识：本轮实际引用的首张上传图（换图/切会话时靠它对齐）
         image_attachment: imageAttachment,
         // 这是对同一张图的追问吗（首问 false）：只影响落盘前要不要剥开头的复述句
         image_followup: imageFollowUp,
@@ -1137,7 +1170,13 @@ export function createWorkspace({
         references,
         system_prompt:
           BASE_RULES +
-          (image ? IMAGE_RULES : "") +
+          (image
+            ? IMAGE_RULES +
+              (imageAttachments.length > 1
+                ? `\n【多图】本轮共 ${imageAttachments.length} 张图，按上传顺序是第 1～${imageAttachments.length} 张。` +
+                  "用户说「这张/上面那张」时按顺序指代；需要区分时用「第 N 张」，不要把两张的说法混起来。\n"
+                : "")
+            : "") +
           // 语音口径必须排最后：BASE_RULES 的【输出】要求 Markdown 列表，
           // 只有放在它后面才能覆盖掉（规则越靠后越管用，同 IMAGE_RULES 的处理）。
           // 预算再排在口径之后：详述档要能盖掉简洁档的 200 字/三点。
@@ -1179,9 +1218,9 @@ export function createWorkspace({
         config_snapshot: gateway.publicConfig(),
       });
       await db.put("turns", turn);
-      // 附件记录回填与本轮的关联：附件 → 会话 → 轮次，三层都能对上
-      if (imageAttachment) {
-        const rec = await db.get("voice_images", imageAttachment.id);
+      // 附件记录回填与本轮的关联：附件 → 会话 → 轮次，三层都能对上（多图逐张）
+      for (const att of imageAttachments) {
+        const rec = await db.get("voice_images", att.id);
         if (rec)
           await db.put("voice_images", {
             ...rec,
@@ -1334,7 +1373,7 @@ export function createWorkspace({
         candidate.role,
         messages,
         false,
-        t.image ? [t.image] : undefined,
+        t.images && t.images.length ? t.images : t.image ? [t.image] : undefined,
         (delta) => {
           partial += delta;
           const nowT = Date.now();
@@ -1497,8 +1536,14 @@ export function createWorkspace({
             : "failed";
       if (t.status === "canceled") t.ended_reason = "canceled";
       // 附件生命周期收尾：看过图才算 analyzed；失败要保留原因（不假装看过）
-      if (t.image_attachment && t.image_attachment.id) {
-        const rec = await db.get("voice_images", t.image_attachment.id);
+      const doneAttachments =
+        t.image_attachments && t.image_attachments.length
+          ? t.image_attachments
+          : t.image_attachment && t.image_attachment.id
+            ? [t.image_attachment]
+            : [];
+      for (const att of doneAttachments) {
+        const rec = await db.get("voice_images", att.id);
         if (rec) {
           const failed = t.status === "failed";
           const why = failed

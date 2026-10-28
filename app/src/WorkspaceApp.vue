@@ -237,15 +237,15 @@ const holdLabel = computed(() => {
   return "按住说话";
 });
 // 附图条配色：六态映射到旧版三套（ok / bad / busy）
-const attachToneClass = computed(() => {
-  const tone = attachInfo.value.tone;
+function attachToneOf(a) {
+  const tone = Attach.describe(a).tone;
   if (tone === "ok") return "ok";
   if (tone === "err") return "bad";
   if (tone === "busy" || tone === "warn") return "busy";
   return "";
-});
-const attachSubText = computed(() => {
-  switch (attach.value.status) {
+}
+function attachSubTextOf(a) {
+  switch (a && a.status) {
     case "picked":
       return "还没上传，说完问题会自动带上";
     case "uploading":
@@ -262,10 +262,15 @@ const attachSubText = computed(() => {
     default:
       return "";
   }
-});
-function retryAttach() {
-  if (attachRetryUpload.value) retryUploadAttach();
-  else if (attachRetryAnalyze.value) analyzeAgain();
+}
+function attachInfoOf(a) {
+  return Attach.describe(a);
+}
+function retryAttachAt(index) {
+  const a = attaches.value[index];
+  if (!a) return;
+  if (Attach.canRetryUpload(a)) retryUploadAttachAt(index);
+  else if (Attach.canRetryAnalysis(a)) analyzeAgainAt(index);
 }
 // 音色与语速：跟旧版一致，存在本地，下次进来自动恢复
 const voiceName = ref("");
@@ -1528,6 +1533,14 @@ let voiceHoldY = 0;
 let voiceHoldSubmitted = false;
 let voiceHoldAbort = false;
 let voiceWarned = false;
+// 一次录音一个会话号：原生的 audio/result 回传时带回来，
+// 不是本次的一律丢弃——取消后迟到的回调过去会直接替用户提问
+let recSessionId = "";
+let recSubmitted = false; // 本次录音的结果只接受一次
+let recConfirmOnly = false; // 到单次上限：只转文字，不自动提问
+let holdTimer = 0; // 按住计时：原生录音没有 rAF 循环，必须自己数
+// 到上限后"文字已就绪，等你确认发送"
+const voiceConfirmPending = ref(false);
 let voiceNativeCaps = { rec: false, asr: false };
 
 // ── 免按键收听：说完停顿即发送，回答结束自动接着听 ──
@@ -1654,10 +1667,23 @@ async function previewVoice() {
     voicePreviewing.value = false;
   }
 }
-// 附图状态机（picked/uploading/received/analyzing/done/failed），含 id/dedupKey/requestId
-const attach = ref(Attach.emptyAttach());
+// 本轮附图（可以有多个）：按选择/拍摄顺序排列，每张一个独立状态机
+// （picked/uploading/received/analyzing/done/failed，含 id/dedupKey/requestId）。
+// 发送时按这个顺序交 image_ids，模型看到的顺序就是用户看到的顺序。
+const attaches = ref([]);
+const TURN_IMAGE_MAX = 6;
+// dedupKey → 原始文件：上传失败重试不用重新拍
+let attachRawByKey = new Map();
+// 首张：wantsImage 之类的旧判断只需要"有没有图"
+const attach = computed(() => attaches.value[0] || Attach.emptyAttach());
 // 历史附图点开看原图（手机上不跳浏览器）
 const shotZoom = ref("");
+/** 一轮实际引用过的图片编号（新数据带 image_ids，旧数据只有单张 attachment_id） */
+function turnImageIds(t) {
+  if (Array.isArray(t.image_ids) && t.image_ids.length) return t.image_ids;
+  if (t.image && t.image.attachment_id) return [t.image.attachment_id];
+  return [];
+}
 function zoomShot(id) {
   if (id) shotZoom.value = "/api/v2/voice/image/" + id;
 }
@@ -1665,12 +1691,10 @@ function zoomShot(id) {
 const camShot = ref(null); // { url, blob, mime, ext }
 // 服务端确认本轮引用的附件编号（来自 SSE meta/phase），不是页面上的残留
 const turnRefId = ref("");
-const attachInfo = computed(() => Attach.describe(attach.value));
-const attachUploaded = computed(() => Attach.isUploaded(attach.value));
-const attachCanSend = computed(() => Attach.canSend(attach.value));
-const attachBusy = computed(() => Attach.isBusy(attach.value));
-const attachRetryUpload = computed(() => Attach.canRetryUpload(attach.value));
-const attachRetryAnalyze = computed(() => Attach.canRetryAnalysis(attach.value));
+// 全部图片都能进模型才算"可以发送"：只要有一张没传上去，就不能悄悄丢图
+const attachCanSend = computed(
+  () => attaches.value.length > 0 && attaches.value.every((a) => Attach.canSend(a)),
+);
 let voiceCamStream = null;
 
 function showVoiceSetup(steps) {
@@ -1805,7 +1829,7 @@ function startNativeRec() {
   }
 }
 
-async function uploadAudio(blob, ext) {
+async function uploadAudio(blob, ext, opts = {}) {
   const epoch = ++voiceEpoch; // 本轮识别
   const asrT0 = performance.now();
   voiceState.value = "recognizing";
@@ -1841,6 +1865,13 @@ async function uploadAudio(blob, ext) {
     voiceText.value = text;
     voiceTiming.asrMs = Math.round(performance.now() - asrT0);
     voiceAsrFails = 0; // 识别通了就清零，失败熔断只针对真正连续的故障
+    if (opts.confirmOnly) {
+      // 到上限的这段：只把话转成文字留在页面上，发不发由用户决定
+      voiceConfirmPending.value = true;
+      voiceState.value = "idle";
+      voiceError.value = "已到最长录音时间，内容已转成文字，确认无误再发送";
+      return;
+    }
     await askStreaming(text, epoch);
   } catch (e) {
     if (epoch !== voiceEpoch) return;
@@ -1992,7 +2023,8 @@ async function beginRecording() {
           voiceError.value = "还有 10 秒到达单次上限，将自动发送";
         }
         if (held >= VOICE_MAX_MS) {
-          // 上限：自动结束并提交（不依赖静音检测）
+          // 到上限：结束录音，但不替用户发送——转成文字等他确认
+          recConfirmOnly = true;
           holdVoiceEnd("max");
           return;
         }
@@ -2040,6 +2072,39 @@ function unbindHoldPointer() {
   } catch (e) {}
 }
 
+function newRecSessionId() {
+  return "r" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+/**
+ * 按住计时。Web 录音靠 requestAnimationFrame 更新，原生录音没有这个循环，
+ * 所以统一用一个 interval：原生路径也必须有自己的上限提示与到限处理。
+ */
+function startHoldTimer() {
+  stopHoldTimer();
+  holdTimer = window.setInterval(() => {
+    if (!voiceHolding.value) return;
+    const held = performance.now() - voiceHoldStart;
+    voiceHoldMs.value = held;
+    if (!voiceWarned && held >= VOICE_WARN_MS) {
+      voiceWarned = true;
+      voiceError.value = "还有 10 秒到单次上限，到点会转成文字，发不发由你决定";
+    }
+    if (held >= VOICE_MAX_MS) {
+      // 到上限不擅自发送：停录 → 识别 → 文字留在页面，等用户点「确认发送」
+      recConfirmOnly = true;
+      holdVoiceEnd("max");
+    }
+  }, 200);
+}
+
+function stopHoldTimer() {
+  if (holdTimer) {
+    window.clearInterval(holdTimer);
+    holdTimer = 0;
+  }
+}
+
 // 按下
 function holdVoiceStart(ev) {
   if (!voiceMode.value) return;
@@ -2078,11 +2143,19 @@ function holdVoiceStart(ev) {
   voiceHoldMs.value = 0;
   voiceHoldY = ev && typeof ev.clientY === "number" ? ev.clientY : 0;
   voiceError.value = "";
+  voiceConfirmPending.value = false;
+  recSessionId = newRecSessionId();
+  recSubmitted = false;
+  recConfirmOnly = false;
+  startHoldTimer();
 
   const n = voiceNative();
   if (voiceNativeCaps.rec && n && n.recStart) {
     try {
-      n.recStart();
+      // 必须明确告诉壳这是「按住说话」：否则壳按静音 900ms / 15 秒上限
+      // 自己 stopRec(true)，用户手指还没松开，录音已经上传了
+      if (typeof n.recStartHold === "function") n.recStartHold(recSessionId);
+      else n.recStart(); // 旧壳没有按住模式，只能靠下面的标志兜住
       voiceState.value = "listening";
       return;
     } catch (e) {}
@@ -2112,6 +2185,7 @@ function holdVoiceMove(ev) {
 // 松手：发送（或取消/过短）
 function holdVoiceEnd(reason) {
   unbindHoldPointer();
+  stopHoldTimer();
   if (!voiceHolding.value) return;
   const held = performance.now() - voiceHoldStart;
   const cancel = voiceCancelArmed.value && reason !== "max";
@@ -2166,6 +2240,7 @@ function holdVoiceEnd(reason) {
 // 意外中断（切后台/来电/pointercancel）：结束并丢弃，不提交
 function holdVoiceCancel() {
   unbindHoldPointer();
+  stopHoldTimer();
   if (!voiceHolding.value) return;
   const n = voiceNative();
   voiceHolding.value = false;
@@ -2531,36 +2606,49 @@ function pickPhotoFile(capture) {
   activeShotInput = input;
   input.type = "file";
   input.accept = "image/*";
+  // 相册支持一次选多张；拍照仍然一张一张来（系统相机不返回多张）
   if (capture) input.capture = "environment";
+  else input.multiple = true;
   input.onchange = async () => {
-    const f = input.files && input.files[0];
+    const files = Array.from(input.files || []);
     cleanup();
-    if (!f) {
+    if (!files.length) {
       clearShotWait();
       return;
     }
     shotBusy.value = true;
-    shotBusyText.value = "正在处理照片…";
-    if (!/^image\//.test(f.type || "")) {
-      clearShotWait();
-      voiceError.value = "这不是图片文件";
-      return;
+    // 超出本轮上限的截掉并明说，不能悄悄只传前几张
+    const room = Math.max(0, TURN_IMAGE_MAX - attaches.value.length);
+    const take = files.slice(0, room);
+    if (files.length > take.length)
+      voiceError.value = `一次最多带 ${TURN_IMAGE_MAX} 张图，已取前 ${take.length} 张`;
+    let done = 0;
+    for (const f of take) {
+      shotBusyText.value =
+        take.length > 1
+          ? `正在处理第 ${done + 1}/${take.length} 张…`
+          : "正在处理照片…";
+      if (!/^image\//.test(f.type || "")) {
+        voiceError.value = "有文件不是图片，已跳过";
+        continue;
+      }
+      if (f.size > VOICE_IMAGE_MAX) {
+        voiceError.value = "有图片超过 8 MB，已跳过";
+        continue;
+      }
+      const ext = (f.name.split(".").pop() || "jpg").toLowerCase();
+      const safeExt = /^(jpg|jpeg|png|webp)$/.test(ext) ? ext : "jpg";
+      try {
+        const out = await compressImage(f);
+        // 单张仍进预览（可重拍/确认）；多选直接排队上传，逐张可删可重试
+        if (take.length === 1) showShot(out.blob, out.ext || safeExt);
+        else await pickBlob(out.blob, out.ext || safeExt);
+        done += 1;
+      } catch (e) {
+        voiceError.value = "有一张图片读不出来，已跳过";
+      }
     }
-    if (f.size > VOICE_IMAGE_MAX) {
-      clearShotWait();
-      voiceError.value = "图片太大，单张不能超过 8 MB";
-      return;
-    }
-    const ext = (f.name.split(".").pop() || "jpg").toLowerCase();
-    const safeExt = /^(jpg|jpeg|png|webp)$/.test(ext) ? ext : "jpg";
-    try {
-      const out = await compressImage(f);
-      showShot(out.blob, out.ext || safeExt);
-    } catch (e) {
-      voiceError.value = "这张图片读不出来，换一张试试";
-    } finally {
-      clearShotWait();
-    }
+    clearShotWait();
   };
   // 必须先把 input 挂进文档再 click()：安卓 Chrome / 多数 WebView 里，
   // 对一个没有插入 DOM 的 input 调 click() 不会拉起相机或文件选择器，
@@ -2606,7 +2694,6 @@ function useSystemCamera() {
 
 /* ── 预览：拍完/选完先给用户看一眼，确认后才上传 ──────────── */
 
-let attachRaw = null; // { blob, ext } 保留原始文件，上传失败重试不用重新拍
 
 function showShot(blob, ext) {
   disposeShot();
@@ -2696,17 +2783,41 @@ async function pickBlob(blob, ext) {
     voiceError.value = "图片太大，单张不能超过 8 MB";
     return;
   }
-  if (attach.value.url) dropAttach();
-  attachRaw = { blob, ext };
-  attach.value = Attach.pick(attach.value, {
+  if (attaches.value.length >= TURN_IMAGE_MAX) {
+    voiceError.value = `一次最多带 ${TURN_IMAGE_MAX} 张图，先删一张再加`;
+    return;
+  }
+  const next = Attach.pick(Attach.emptyAttach(), {
     url: URL.createObjectURL(blob),
     mime: blob.type || "image/jpeg",
     bytes: blob.size,
     at: Date.now(),
   });
+  attachRawByKey.set(next.dedupKey, { blob, ext });
+  // 追加而不是替换：连拍/连选多张时，前一张不能被后一张顶掉
+  attaches.value = [...attaches.value, next];
   turnRefId.value = "";
   voiceError.value = "";
-  await uploadAttach();
+  await uploadAttach(next.dedupKey);
+}
+
+function attachIndexOf(key) {
+  return attaches.value.findIndex((a) => a.dedupKey === key);
+}
+
+function setAttachAt(index, next) {
+  if (index < 0 || index >= attaches.value.length) return;
+  const list = attaches.value.slice();
+  list[index] = next;
+  attaches.value = list;
+}
+
+/** 对每张已上传的图套同一个状态迁移（分析完成/失败/取消） */
+function markAllAttaches(fn) {
+  for (const a of attaches.value) {
+    if (!a.id) continue;
+    setAttachAt(attachIndexOf(a.dedupKey), fn(a));
+  }
 }
 
 /**
@@ -2714,16 +2825,17 @@ async function pickBlob(blob, ext) {
  * 网络抖动导致重复提交时，服务端复用原图，不会重复落盘。
  * 接口一次请求就完成「落盘 + 记录」，所以这里不显示百分比——不编造进度。
  */
-async function uploadAttach() {
-  const raw = attachRaw;
-  const cur = attach.value;
-  if (!cur.url || !raw) {
+async function uploadAttach(key) {
+  const start = attachIndexOf(key);
+  if (start < 0) return;
+  const raw = attachRawByKey.get(key);
+  if (!raw) {
+    setAttachAt(start, Attach.uploadFail(attaches.value[start], "这张图已失效，请重新拍照"));
     voiceError.value = "这张图已失效，请重新拍照";
     return;
   }
-  attach.value = Attach.startUpload(attach.value);
-  if (attach.value.status !== Attach.ATTACH.UPLOADING) return;
-  const key = attach.value.dedupKey;
+  setAttachAt(start, Attach.startUpload(attaches.value[start]));
+  if (attaches.value[start].status !== Attach.ATTACH.UPLOADING) return;
   const ac = new AbortController();
   const timer = window.setTimeout(() => ac.abort(), VOICE_UPLOAD_MS);
   try {
@@ -2746,16 +2858,21 @@ async function uploadAttach() {
       },
     );
     const j = await r.json().catch(() => ({}));
-    // 上传期间用户已经换了一张图 → 这次结果作废，不能盖到新图上
-    if (attach.value.dedupKey !== key) return;
+    // 上传期间这张图被删掉了 → 这次结果作废（不能盖到别的图上）
+    const at = attachIndexOf(key);
+    if (at < 0) return;
     if (!r.ok) throw new Error(j.error || "上传失败");
-    attach.value = Attach.uploadOk(attach.value, {
-      imageId: j.image_id || j.id || "",
-      duplicate: j.duplicate === true,
-    });
+    setAttachAt(
+      at,
+      Attach.uploadOk(attaches.value[at], {
+        imageId: j.image_id || j.id || "",
+        duplicate: j.duplicate === true,
+      }),
+    );
     voiceError.value = "";
   } catch (e) {
-    if (attach.value.dedupKey !== key) return;
+    const at = attachIndexOf(key);
+    if (at < 0) return;
     const aborted = e && (e.name === "AbortError" || /abort/i.test(e.message || ""));
     const offline = e && e.name === "TypeError";
     const msg = aborted
@@ -2763,7 +2880,7 @@ async function uploadAttach() {
       : offline
         ? "网络中断，图片没传上去"
         : (e && e.message) || "上传失败";
-    attach.value = Attach.uploadFail(attach.value, msg);
+    setAttachAt(at, Attach.uploadFail(attaches.value[at], msg));
     voiceError.value = msg;
     // 失败保留待发送内容：图还在、问题还在，重试不会重复建轮次
   } finally {
@@ -2771,21 +2888,42 @@ async function uploadAttach() {
   }
 }
 
-function retryUploadAttach() {
+function retryUploadAttachAt(index) {
+  const a = attaches.value[index];
+  if (!a) return;
   voiceError.value = "";
-  uploadAttach();
+  uploadAttach(a.dedupKey);
 }
 
-/** 删除这张图：本地和状态一起清掉 */
-function dropAttach() {
-  const a = attach.value;
-  if (a && a.url) {
+/** 删掉第 index 张：本地文件、缩略图、状态一起清掉 */
+function removeAttachAt(index) {
+  const a = attaches.value[index];
+  if (!a) return;
+  if (a.url) {
     try {
       URL.revokeObjectURL(a.url);
     } catch (e) {}
   }
-  attach.value = Attach.clear();
-  attachRaw = null;
+  if (a.dedupKey) attachRawByKey.delete(a.dedupKey);
+  const list = attaches.value.slice();
+  list.splice(index, 1);
+  attaches.value = list;
+  turnRefId.value = "";
+  voiceError.value = "";
+}
+
+/** 清空本轮全部附图（切会话、挂断、改为只发文字） */
+function dropAttach() {
+  for (const a of attaches.value) {
+    if (a && a.url) {
+      try {
+        URL.revokeObjectURL(a.url);
+      } catch (e) {}
+    }
+    if (a && a.dedupKey) attachRawByKey.delete(a.dedupKey);
+  }
+  attaches.value = [];
+  attachRawByKey = new Map();
   turnRefId.value = "";
 }
 
@@ -2807,18 +2945,19 @@ function removeAttach() {
  * 传完了返回 image_id；失败/被取消返回空串，由调用方拦下不发。
  */
 async function waitAttachSettled(ms = 60000) {
-  const key = attach.value.dedupKey;
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
-    if (attach.value.id) return attach.value.id;
-    // 期间换了一张图：旧等待作废，交给新图自己的上传流程
-    if (attach.value.dedupKey !== key) return "";
-    const st = attach.value.status;
-    if (st !== Attach.ATTACH.UPLOADING && st !== Attach.ATTACH.PICKED)
-      return attach.value.id || "";
+    const list = attaches.value;
+    if (!list.length) return [];
+    // 只要还有一张在选/在上传，就继续等——多图里漏一张，模型就少看一张
+    const pending = list.some(
+      (a) =>
+        a.status === Attach.ATTACH.UPLOADING || a.status === Attach.ATTACH.PICKED,
+    );
+    if (!pending) return list.map((a) => a.id).filter(Boolean);
     await new Promise((r) => setTimeout(r, 150));
   }
-  return attach.value.id || "";
+  return attaches.value.map((a) => a.id).filter(Boolean);
 }
 
 /**
@@ -2826,8 +2965,12 @@ async function waitAttachSettled(ms = 60000) {
  * 这样历史里不会出现同一个问题两条记录。
  */
 async function analyzeAgain() {
-  const a = attach.value;
-  if (!Attach.canRetryAnalysis(a)) return;
+  analyzeAgainAt(0);
+}
+
+async function analyzeAgainAt(index) {
+  const a = attaches.value[index];
+  if (!a || !Attach.canRetryAnalysis(a)) return;
   const text = voiceText.value || lastQuestionText;
   if (!text) return;
   voiceError.value = "";
@@ -2920,39 +3063,43 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
   voiceRequestId = rid; // 记下这一轮的编号：失败重试要复用它才不会多建一轮
   // 本轮带不带图：只有拿到服务端 image_id 才能带。
   // 还在传就等它传完（不再 4 秒就丢图）；传失败就停住，让用户重试或明确只发文字。
-  let imageId = "";
+  // 本轮带哪些图：只有拿到服务端 image_id 的才算数，顺序就是用户选图的顺序。
+  // 有一张没传完就等全部传完（不再 4 秒丢图）；有任何一张失败就停住，
+  // 让用户重试或明确只发文字——绝不静默只发前几张。
+  let imageIds = [];
   const textOnly = opts.textOnly === true;
-  if (!textOnly && attachCanSend.value) {
-    imageId = attach.value.id;
-  } else if (
-    !textOnly &&
-    (attach.value.status === Attach.ATTACH.UPLOADING ||
-      attach.value.status === Attach.ATTACH.PICKED)
-  ) {
-    voiceState.value = "thinking";
-    voicePhase.value = "uploading";
-    imageId = await waitAttachSettled();
+  if (!textOnly && attaches.value.length) {
+    const needWait = attaches.value.some(
+      (a) =>
+        a.status === Attach.ATTACH.UPLOADING || a.status === Attach.ATTACH.PICKED,
+    );
+    if (needWait) {
+      voiceState.value = "thinking";
+      voicePhase.value = "uploading";
+    }
+    imageIds = await waitAttachSettled();
     // 等图期间用户挂断/取消/又问了新的 → 这一轮作废，不悄悄发出去
     if (epoch !== voiceEpoch) return;
-    if (!imageId) {
+    const want = attaches.value.length;
+    if (imageIds.length < want) {
       voicePhase.value = "";
       voiceState.value = "idle";
       lastTurnFailed = false;
-      voiceError.value =
-        attach.value.status === Attach.ATTACH.FAILED
-          ? "图片没传上去：点「重试」再传一次，或者删掉这张只发文字"
-          : attach.value.status === Attach.ATTACH.UPLOADING
-            ? "图片还在传，传好后会自动继续；也可以删掉只发文字"
-            : "这张图已失效，请重新拍一张";
-      return; // 关键：不发无图请求
+      const missing = attaches.value.filter((a) => !a.id);
+      voiceError.value = missing.some((a) => a.status === Attach.ATTACH.FAILED)
+        ? `${missing.length} 张图没传上去：点「重试」再传，或者删掉这几张只发文字`
+        : missing.some((a) => a.status === Attach.ATTACH.UPLOADING)
+          ? "图片还在传，传好后会自动继续；也可以删掉只发文字"
+          : "有图片已失效，请重新拍一张";
+      return; // 关键：不发残缺的图
     }
-    voicePhase.value = "queued";
+    if (needWait) voicePhase.value = "queued";
   }
   // 用户嘴上说"发张图/拍张照"但还没选图：先让他去拍照。
   // 这句话要是当普通问题发出去，模型会顺着"看图"的语境编内容——那就是假装看到了。
   // 只在短句里判定，避免"我上次拍的照片怎么防治"这类正常长问题被误拦。
   const wantsImage =
-    !imageId && !attachCanSend.value && text.length <= 20 &&
+    !imageIds.length && !attaches.value.length && text.length <= 20 &&
     /(发|传|拍|看|瞧).{0,4}(图|照片|照)/.test(text);
   if (wantsImage) {
     voiceError.value =
@@ -3021,8 +3168,10 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
         question: text,
         conversation_id: voiceConversationId || undefined,
         domain: chosenDomain,
-        // 附了照片：只带 image_id，图片本身已在 /voice/image 落盘
-        image_id: imageId || undefined,
+        // 附了照片：只带编号（图片本身已在 /voice/image 落盘），
+        // image_ids 按用户选图顺序，模型看到的顺序就是这个顺序
+        image_id: imageIds[0] || undefined,
+        image_ids: imageIds.length ? imageIds : undefined,
         // 失败重试：服务端按同一 request_id 重跑同一轮，不新建问题
         retry: retry || undefined,
       }),
@@ -3035,11 +3184,16 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
     // 图已随本轮提交 → 分析中。id 保留在状态里，追问时还能继续用同一张。
     // 若这张图上一轮已经分析完成（DONE），追问时保持完成态：
     // 服务端确实会再读一次图给模型看，但界面上没必要再闪一次「正在看这张图」。
-    if (imageId && attach.value.status !== Attach.ATTACH.DONE)
-      attach.value = Attach.beginAnalysis(attach.value, {
-        requestId: rid,
-        conversationId: voiceConversationId,
-      });
+    for (const a of attaches.value) {
+      if (!imageIds.includes(a.id) || a.status === Attach.ATTACH.DONE) continue;
+      setAttachAt(
+        attachIndexOf(a.dedupKey),
+        Attach.beginAnalysis(a, {
+          requestId: rid,
+          conversationId: voiceConversationId,
+        }),
+      );
+    }
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -3073,12 +3227,17 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
           }
           if (obj.turn_id) {
             voiceTurnId = obj.turn_id;
-            if (attach.value.status === Attach.ATTACH.ANALYZING)
-              attach.value = Attach.beginAnalysis(attach.value, {
-                requestId: rid,
-                turnId: obj.turn_id,
-                conversationId: voiceConversationId,
-              });
+            for (const a of attaches.value) {
+              if (a.status !== Attach.ATTACH.ANALYZING) continue;
+              setAttachAt(
+                attachIndexOf(a.dedupKey),
+                Attach.beginAnalysis(a, {
+                  requestId: rid,
+                  turnId: obj.turn_id,
+                  conversationId: voiceConversationId,
+                }),
+              );
+            }
           }
           // 服务端确认这一轮绑了哪张附件：界面显示"本轮引用"只用这个来源
           if (obj.image_attachment_id !== undefined)
@@ -3135,14 +3294,16 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
     if (voiceInterrupted || epoch !== voiceEpoch) return;
     if (pending.trim()) enqueueSpeech(pending.trim());
     // 这一轮收尾：只有正常结束才算「这张图分析完成」
-    if (imageId) {
+    if (imageIds.length) {
       // 已经分析过的图，本轮生成失败是「这一问没答出来」，不是「图有问题」
-      const stillAnalyzing = attach.value.status === Attach.ATTACH.ANALYZING;
+      const stillAnalyzing = attaches.value.some(
+        (a) => a.status === Attach.ATTACH.ANALYZING,
+      );
       if (finalStatus === "failed" && stillAnalyzing) {
-        attach.value = Attach.analysisFail(attach.value, "模型没有返回内容");
+        markAllAttaches((a) => Attach.analysisFail(a, "模型没有返回内容"));
         lastTurnFailed = true;
       } else {
-        attach.value = Attach.analysisOk(attach.value);
+        markAllAttaches((a) => Attach.analysisOk(a));
         lastTurnFailed = finalStatus === "failed";
       }
     } else {
@@ -3159,7 +3320,7 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
     if (firstCharTimedOut) {
       const why = `模型 ${Math.round(VOICE_FIRST_TOKEN_MS / 1000)} 秒没有响应，可以重试`;
       voiceError.value = why;
-      if (imageId) attach.value = Attach.analysisFail(attach.value, why);
+      if (imageIds.length) markAllAttaches((a) => Attach.analysisFail(a, why));
       lastTurnFailed = true;
       voiceState.value = "failed";
       voiceStreamDone = true;
@@ -3167,12 +3328,13 @@ async function askStreaming(text, epoch = voiceEpoch, opts = {}) {
     }
     if (voiceInterrupted || ac.signal.aborted) {
       // 用户主动打断/取消：不是失败，图还是好的，退回「服务器已收到」
-      attach.value = Attach.analysisCanceled(attach.value);
+      markAllAttaches((a) => Attach.analysisCanceled(a));
       lastTurnFailed = false;
       return;
     }
     voiceError.value = e.message || "生成失败";
-    if (imageId) attach.value = Attach.analysisFail(attach.value, e.message || "生成失败");
+    if (imageIds.length)
+      markAllAttaches((a) => Attach.analysisFail(a, e.message || "生成失败"));
     lastTurnFailed = true;
     voiceState.value = "failed";
     voiceStreamDone = true;
@@ -3241,6 +3403,23 @@ function interruptVoice() {
   }
   voicePhase.value = "";
   if (voiceState.value !== "listening") voiceState.value = "idle";
+}
+
+// 到上限转成的文字：用户点确认才发
+function confirmVoiceSend() {
+  if (!voiceText.value) return;
+  voiceConfirmPending.value = false;
+  voiceError.value = "";
+  lastTurnFailed = false; // 这是一次全新的提问，不是重试失败轮次
+  voiceRequestId = newVoiceRequestId();
+  askStreaming(voiceText.value, voiceEpoch);
+}
+
+function discardVoiceSend() {
+  voiceConfirmPending.value = false;
+  voiceError.value = "";
+  voiceText.value = "";
+  voiceState.value = "idle";
 }
 
 // 重试回答：换新请求编号重开一轮（失败轮次留在历史里，便于定位）
@@ -3654,16 +3833,42 @@ function handleVoiceEvent(ev) {
     }
   }
   if (!ev || !voiceMode.value) return;
+  // 迟到回调防护：不是本次录音的会话，一律丢掉。
+  // 场景是真实存在的——上滑取消后，早已开始的 MediaRecorder 仍会回传 audio；
+  // 过去这里直接 uploadAudio，等于替用户把取消掉的话发了出去。
+  if (ev.session && recSessionId && ev.session !== recSessionId) return;
   if (ev.type === "audio") {
-    uploadAudio(base64ToBlob(ev.data || "", ev.ext || "m4a"), ev.ext || "m4a");
+    if (recSubmitted) return; // 一次录音只认一份结果
+    if (voiceHoldAbort) return; // 已取消/切后台中断
+    recSubmitted = true;
+    uploadAudio(base64ToBlob(ev.data || "", ev.ext || "m4a"), ev.ext || "m4a", {
+      confirmOnly: recConfirmOnly,
+    });
+    return;
+  }
+  if (ev.type === "limit") {
+    stopHoldTimer();
+    voiceHolding.value = false;
+    voiceHoldAbort = true;
+    voiceState.value = "idle";
+    voiceError.value = ev.message || "录音时间过长，本次未发送";
     return;
   }
   if (ev.type === "partial") {
     voiceText.value = ev.text || "";
   } else if (ev.type === "result") {
+    if (recSubmitted || voiceHoldAbort) return;
+    recSubmitted = true;
     const text = String(ev.text || "").trim();
     voiceText.value = text;
-    if (text) askStreaming(text);
+    if (!text) return;
+    if (recConfirmOnly) {
+      voiceConfirmPending.value = true;
+      voiceState.value = "idle";
+      voiceError.value = "已到最长录音时间，内容已转成文字，确认无误再发送";
+      return;
+    }
+    askStreaming(text);
   } else if (ev.type === "error") {
     const msg = ev.message || "语音识别失败";
     // 本机朗读只是服务端合成失败后的兜底：引擎缺失不该红字打断对话，
@@ -4022,21 +4227,27 @@ onUnmounted(() => {
                       >语音</span
                     >{{ t.question }}
                   </p>
-                  <!-- 随问附图：历史里也要看得见，否则回看时不知道当时给模型看的是什么 -->
-                  <button
-                    v-if="t.image && t.image.attachment_id"
-                    type="button"
-                    class="turn-shot"
-                    title="查看原图"
-                    @click="zoomShot(t.image.attachment_id)"
-                  >
-                    <img
-                      :src="'/api/v2/voice/image/' + t.image.attachment_id"
-                      alt="随问附图"
-                      loading="lazy"
-                    />
-                    <span>随问附图</span>
-                  </button>
+                  <!-- 随问附图：历史里也要看得见，否则回看时不知道当时给模型看的是什么。
+                       多张时按上传顺序编号，追问沿用哪几张一眼能对上。 -->
+                  <div v-if="turnImageIds(t).length" class="turn-shots">
+                    <button
+                      v-for="(iid, ii) in turnImageIds(t)"
+                      :key="iid"
+                      type="button"
+                      class="turn-shot"
+                      title="查看原图"
+                      @click="zoomShot(iid)"
+                    >
+                      <img
+                        :src="'/api/v2/voice/image/' + iid"
+                        alt="随问附图"
+                        loading="lazy"
+                      />
+                      <span>{{
+                        turnImageIds(t).length > 1 ? "第 " + (ii + 1) + " 张" : "随问附图"
+                      }}</span>
+                    </button>
+                  </div>
                 </div>
                 <div
                   class="wb-answers"
@@ -5814,30 +6025,41 @@ onUnmounted(() => {
               {{ voiceAnswerText }}
             </p>
 
-            <!-- 本轮附图：六态真实反馈，缩略图不等于已上传 -->
-            <div v-if="attach.url" class="vc-shot" :class="attachToneClass">
-              <img :src="attach.url" alt="本轮附图" />
-              <div class="vc-shot-side">
-                <b class="vc-shot-label">{{ attachInfo.text }}</b>
-                <span v-if="attachSubText" class="vc-shot-sub">{{ attachSubText }}</span>
-                <p v-if="attach.error" class="vc-shot-err">{{ attach.error }}</p>
-                <div class="vc-shot-acts">
-                  <button
-                    v-if="attach.status === 'failed'"
-                    type="button"
-                    class="vc-shot-act"
-                    @click="retryAttach"
+            <!-- 本轮附图：按选择顺序排列，每张独立状态；缩略图不等于已上传 -->
+            <div v-if="attaches.length" class="vc-shot-row">
+              <div
+                v-for="(a, ai) in attaches"
+                :key="a.dedupKey || ai"
+                class="vc-shot"
+                :class="attachToneOf(a)"
+              >
+                <img :src="a.url" alt="本轮附图" />
+                <div class="vc-shot-side">
+                  <b class="vc-shot-label"
+                    >第 {{ ai + 1 }} 张 · {{ attachInfoOf(a).text }}</b
                   >
-                    重试
-                  </button>
-                  <button
-                    type="button"
-                    class="vc-shot-x"
-                    title="删除这张图"
-                    @click="removeAttach"
-                  >
-                    <X :size="14" />
-                  </button>
+                  <span v-if="attachSubTextOf(a)" class="vc-shot-sub">{{
+                    attachSubTextOf(a)
+                  }}</span>
+                  <p v-if="a.error" class="vc-shot-err">{{ a.error }}</p>
+                  <div class="vc-shot-acts">
+                    <button
+                      v-if="a.status === 'failed'"
+                      type="button"
+                      class="vc-shot-act"
+                      @click="retryAttachAt(ai)"
+                    >
+                      重试
+                    </button>
+                    <button
+                      type="button"
+                      class="vc-shot-x"
+                      title="删除这张图"
+                      @click="removeAttachAt(ai)"
+                    >
+                      <X :size="14" />
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -5847,7 +6069,18 @@ onUnmounted(() => {
             </p>
             <p v-if="voiceError" class="vc-error">{{ voiceError }}</p>
             <div
-              v-if="voiceError && voiceText && voiceState === 'idle'"
+              v-if="voiceConfirmPending && voiceText && voiceState === 'idle'"
+              class="vc-retry-row"
+            >
+              <button type="button" class="vc-retry" @click="confirmVoiceSend">
+                确认发送
+              </button>
+              <button type="button" class="vc-retry ghost" @click="discardVoiceSend">
+                不用了
+              </button>
+            </div>
+            <div
+              v-if="voiceError && voiceText && voiceState === 'idle' && !voiceConfirmPending"
               class="vc-retry-row"
             >
               <button type="button" class="vc-retry" @click="retryAnswer()">
@@ -7778,7 +8011,9 @@ a.text-button {
 .vc-more{display:flex;align-items:center;gap:14px;font-size:12px;color:#9fc4b5;flex-wrap:wrap;justify-content:center}
 .vc-more select{background:#ffffff1a;color:#eaf6f0;border:0;border-radius:8px;padding:5px 8px;font-size:12px}
 .vc-tip{opacity:.7}
-.vc-shot{display:flex;align-items:center;gap:10px;width:min(520px,100%);margin-top:6px;padding:8px 10px;border-radius:14px;background:#ffffff12;border:1px solid rgba(255,255,255,.12);text-align:left}
+.vc-shot-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;max-height:34vh;overflow:auto}
+.vc-shot{display:flex;align-items:center;gap:10px;width:auto;flex:1 1 240px;margin-top:0;padding:8px 10px;border-radius:14px;background:#ffffff12;border:1px solid rgba(255,255,255,.12);text-align:left}
+.turn-shots{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 .vc-shot.ok{border-color:#78dcaf73}
 .vc-shot.bad{border-color:#ff8c8273}
 .vc-shot img{width:56px;height:56px;flex:none;border-radius:10px;object-fit:cover;background:#0b1a15}
