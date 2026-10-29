@@ -270,7 +270,7 @@ wb_block_rules                                 内容拦截规则
 
 ## 十一、已知问题与待办
 
-1. **签名密钥未异地备份** —— `~/agri-keystore/qinghe.jks`（口令 `qinghe123456`）。丢失即永久失去覆盖安装能力。
+1. **签名密钥未异地备份** —— `~/agri-keystore/qinghe.jks`（口令见服务器 `~/.agri-signing`，不入库）。丢失即永久失去覆盖安装能力。
 2. **壳层兜底朗读仍可能静音** —— 本机 TTS 只试 `Locale.SIMPLIFIED_CHINESE` 一级，缺中文数据时无声（现在只是不再弹红字）。
    下一版壳应改多级 locale + pending 队列。
 3. **团队视图看不到他人会话的附图** —— 图片接口按 `owner` 校验，管理员查看他人图片会 404。需要后端加 `scope=team` 授权分支。

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:versionCode="15"
+    android:versionName="1.15">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 在线更新：允许拉起系统安装器 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 语音通话：麦克风 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 页内相机：网页 getUserMedia 需要系统相机权限；没有相机权限时降级到「系统相机」拍照 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:hardwareAccelerated="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|smallestScreenSize"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 更新包以 content:// 交给系统安装器 -->
+        <provider
+            android:name=".ApkFileProvider"
+            android:authorities="com.qinghe.app.apk"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <!-- 拍照输出：系统相机把照片写进 cache/shots，壳再把这个 content:// 交给网页上传 -->
+        <provider
+            android:name=".ShotProvider"
+            android:authorities="com.qinghe.app.shot"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+    </application>
+</manifest>

@@ -1,0 +1,46 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.qinghe.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.qinghe.app"
+        minSdk 21
+        targetSdk 34
+        versionCode 15
+        versionName "1.15"
+    }
+
+    // 口令不入库：构建前 export KS_PASS=... （路径与别名可用 KS_FILE / KS_ALIAS 覆盖）
+    // 实际打包走 android/build.sh，这里保留 Gradle 配置仅为工程完整性
+    signingConfigs {
+        release {
+            storeFile file(System.getenv("KS_FILE") ?: "../keystore/qinghe.jks")
+            storePassword System.getenv("KS_PASS") ?: ""
+            keyAlias System.getenv("KS_ALIAS") ?: "qinghe"
+            keyPassword System.getenv("KS_PASS") ?: ""
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+        debug {
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // 纯 WebView 壳，无第三方依赖
+}

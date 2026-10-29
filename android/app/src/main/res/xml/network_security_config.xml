@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 只对自建的三个入口额外信任私有 CA，其余站点仍只认系统根证书。
+     私有 CA 随包分发，用户不需要到系统设置里手动装证书；
+     没有采用「忽略 SSL 错误」的写法，证书校验依然严格。 -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">42.193.104.148</domain>
+        <domain includeSubdomains="false">192.168.0.141</domain>
+        <domain includeSubdomains="false">qinghe.local</domain>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/jingyang_ca" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

@@ -102,3 +102,37 @@ npm run build
 ```
 
 具体结果见 `VERIFICATION.md`。API 见 `API-CONTRACT.md`。
+
+## 仓库结构
+
+```
+app/          前端 Vue 源码（src）、后端 Node 服务（server）、构建产物（dist）
+deploy/       网关（gateway.mjs 静态直出与反代）、HTTPS 反代、证书（私钥不入库）
+android/      APK 壳工程（WebView + 静默更新），含手写构建脚本 build.sh
+docs/         架构、移动端接入、语音交互等专题文档
+voice_service.py  本地语音服务（ASR/TTS）
+```
+
+## 安卓端（APK）
+
+`android/` 是 WebView 壳，只负责加载 `https://<服务器>/`，业务界面全部由服务端前端产物提供。
+所以**改业务、改界面都不用发 APK**，只有改壳内代码（首页地址、权限、证书信任、更新逻辑）才需要重新打包。
+
+构建不用 Gradle，走 `android/build.sh`（aapt2 → javac → d8 → zipalign → apksigner）：
+
+```bash
+export KS_PASS=<签名口令>          # 口令不入库，密钥在服务器 ~/agri-keystore/qinghe.jks
+bash android/build.sh              # 产物 ~/android-build/out/jingyang-<版本>.apk
+```
+
+依赖：Android SDK build-tools 34.0.0、platforms/android-34、JDK、python3。
+
+发布时把 APK 放到网站目录，并同步更新升级描述 `agri-android.json`（versionCode / apkUrl / md5 / force）：
+客户端启动时拉该文件比对 versionCode，有新版即后台下载并拉起安装界面。
+
+壳内要点：
+- `HOME_URL` 必须是公网地址，写内网地址会在外网白屏
+- `FALLBACK_URL` 也要是公网地址，否则主入口失败后切到备用入口仍然连不上
+- `res/raw/jingyang_ca.crt` 内嵌私有 CA，配合 `network_security_config.xml` 只对指定域名额外信任，
+  不用「忽略所有 SSL 错误」这种写法
+- 签名密钥必须放在构建目录之外，否则每次构建清目录会生成新密钥，覆盖安装失败

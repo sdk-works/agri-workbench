@@ -41,3 +41,11 @@ deploy/tls/**/*.key
 
 # 构建指纹：每次构建都变，属于产物元数据，不进版本库
 app/dist/build.json
+
+# 安卓：构建中间物与签名密钥不入库（密钥只在服务器 ~/agri-keystore）
+android/build/
+android/app/build/
+android/local.properties
+android/backup/
+*.jks
+*.keystore
