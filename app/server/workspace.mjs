@@ -48,6 +48,13 @@ const VOICE_BRIEF_BUDGET = `【本轮播报预算｜简洁档】
 · 一次只问一个问题，问完就停。
 `;
 
+const VOICE_TINY_BUDGET = `【本轮播报预算｜极简档｜覆盖上面关于字数和点数的全部限制】
+用户刚说过回答太长或者太多了，所以这一轮：
+· 整段只说一到两句，不超过 100 字，最多两点。
+· 不要复述图片、不要重新列清单、不要解释刚才为什么长，直接说重点。
+· 说完就停，等用户再问。
+`;
+
 const VOICE_DETAIL_BUDGET = `【本轮播报预算｜详述档｜覆盖上面关于字数和点数的全部限制】
 用户这一轮明确要求讲详细，所以：
 · 可以讲到六点，整段最多 800 字；讲完就停，不要为了凑数继续铺清单。
@@ -62,6 +69,67 @@ const WANT_DETAIL =
   /(详细|展开讲|展开说|说详细|讲详细|完整地讲|完整说|一步一步|一步步|逐步|逐条|一条一条|具体步骤|具体怎么做|具体怎么操作|具体怎么弄|多说点|多说一些|说全|讲全|深入讲|仔细讲|慢慢说)/;
 function wantsDetail(text) {
   return WANT_DETAIL.test(String(text || ""));
+}
+
+// ===== 语音播报预算与"跑飞"在线拦截（2026-10-29）=====
+// 事故经过：语音提问 91 字，模型从"第一"一路数到"第一百四十二条"，4318 字、34 秒还没停，
+// 用户只能喊"你说的太多了"。落盘前的 trimSpokenPoints 只处理**正常返回**的文本，
+// 被取消/超时的那一轮原文会整段留在库里，前端还边流边念，等于没拦住。
+// 所以在流式回调里就判：点数或字数超预算，立刻中止上游，只把已生成部分截到预算点数。
+const SPOKEN_POINT_RE = /第[一二三四五六七八九十百零]+[、，,：:．.]/g;
+function spokenMarks(s) {
+  return [...String(s || "").matchAll(SPOKEN_POINT_RE)].map((m) => m.index);
+}
+// 保留前 keep 点，切在第 keep+1 点的标记起点；切点太靠前说明不是逐条列举，宁可不切
+function cutSpokenAt(s, keep) {
+  const idx = spokenMarks(s);
+  if (idx.length <= keep) return s;
+  const head = String(s)
+    .slice(0, idx[keep])
+    .trim()
+    // 连句末标点一起清掉，否则截在"…形成主回路。"处会出现"。。"（实测踩到）
+    .replace(/[、，,；;。！？!?\s]+$/, "");
+  return head.length >= 12 ? head + "。" : s;
+}
+// 三档：极简（用户刚说过太长）/ 简洁（默认）/ 详述（明确要求讲细）
+const WANT_TINY =
+  /(太多了|太长了|太长|说少点|少说点|简短|简单说|别念了|别说了|好了好了|不用这么长|短一点)/;
+export function spokenBudgetFor(question) {
+  const q = String(question || "");
+  if (WANT_TINY.test(q))
+    return { tier: "tiny", keep: 2, abortLen: 260, len: 130, points: 3 };
+  if (wantsDetail(q))
+    return { tier: "detail", keep: 6, abortLen: 1100, len: 900, points: 7 };
+  return { tier: "brief", keep: 3, abortLen: 380, len: 220, points: 4 };
+}
+// 流式判定：数到第 keep+2 点，或字数超 abortLen，就认为跑飞
+export function spokenRunaway(text, budget) {
+  const s = String(text || "");
+  if (s.length < 60) return null;
+  const marks = spokenMarks(s).length;
+  if (marks > budget.keep + 1)
+    return {
+      kind: "points",
+      points: marks,
+      chars: s.length,
+      text: cutSpokenAt(s, budget.keep),
+    };
+  if (s.length > budget.abortLen)
+    return {
+      kind: "length",
+      points: marks,
+      chars: s.length,
+      text: cutSpokenAt(s, budget.keep),
+    };
+  return null;
+}
+// 失败/取消路径的统一清洗：库里不留"第一百四十二条"这种原文
+export function tidyVoiceFailure(text, question) {
+  const b = spokenBudgetFor(question);
+  return stripQuestionEcho(
+    trimSpokenPoints(String(text || ""), { len: b.len, points: b.points }),
+    question,
+  );
 }
 
 
@@ -1182,7 +1250,11 @@ export function createWorkspace({
           // 预算再排在口径之后：详述档要能盖掉简洁档的 200 字/三点。
           (voice
             ? VOICE_SPOKEN_RULES +
-              (wantsDetail(question) ? VOICE_DETAIL_BUDGET : VOICE_BRIEF_BUDGET)
+              (spokenBudgetFor(question).tier === "tiny"
+                ? VOICE_TINY_BUDGET
+                : wantsDetail(question)
+                  ? VOICE_DETAIL_BUDGET
+                  : VOICE_BRIEF_BUDGET)
             : "") +
           JSON.stringify(references),
         status: "generating",
@@ -1386,6 +1458,10 @@ export function createWorkspace({
       if (!current) return;
       const c = current.candidates.find((x) => x.label === label);
       if (!c || ["completed", "stopped"].includes(c.status)) return;
+      // 语音轮失败/取消时，已生成的部分也要截到预算：否则"第一百四十二条"这种
+      // 跑飞原文会整段留在库里，重新打开会话还会被念一遍（2026-10-29 实测）。
+      if (status === "failed" && current.source === "voice" && c.text)
+        c.text = tidyVoiceFailure(c.text, current.question);
       Object.assign(c, { status, error: message, error_code: code });
       await db.put("turns", current);
     });
@@ -1394,7 +1470,10 @@ export function createWorkspace({
     // 进入运行即标 generating：只要 job 已领取、开始调用模型，就不再显示成排队
     await markCandidate(job, candidate.label, "generating", null, null);
     let partial = "",
-      lastPartialWrite = 0;
+      lastPartialWrite = 0,
+      // 语音轮的在线跑飞拦截：只对语音轮生效（文字轮用户自己会滑走）
+      spoken = t.source === "voice" ? spokenBudgetFor(t.question) : null,
+      runaway = null;
     try {
       // 并发限流由 model-gateway 按实际上游资源统一执行（含裁判/回退/候选生成），
       // 这里不再单独 acquire；等待额度期间若被取消由 gateway 抛 canceled。
@@ -1405,6 +1484,17 @@ export function createWorkspace({
         t.images && t.images.length ? t.images : t.image ? [t.image] : undefined,
         (delta) => {
           partial += delta;
+          // 跑飞拦截：点数或字数超预算就中止上游，abort 后由 catch 分支按"截断完成"落库
+          if (spoken && !runaway) {
+            const hit = spokenRunaway(partial, spoken);
+            if (hit) {
+              runaway = hit;
+              try {
+                jobAborts.get(job.id)?.abort();
+              } catch {}
+              return;
+            }
+          }
           const nowT = Date.now();
           // 语音要边生成边播：落盘节拍压到 200ms，避免首句被 900ms 批量写入拖慢
           if (nowT - lastPartialWrite >= (t.source === "voice" ? 200 : 900)) {
@@ -1485,6 +1575,47 @@ export function createWorkspace({
         await db.put("turns", current);
       });
     } catch (e) {
+      // 跑飞拦截：上游是被我们主动 abort 的，就当"说完并截断"，不算失败
+      if (runaway) {
+        const text = stripQuestionEcho(runaway.text, t.question);
+        await repo.transaction(async (db) => {
+          const current = await db.get("turns", t.id);
+          const cc = current?.candidates?.find((c) => c.label === candidate.label);
+          if (!cc || cc.status === "stopped") return;
+          Object.assign(cc, {
+            status: "completed",
+            text,
+            model:
+              candidate.model_requested ||
+              (typeof gateway.modelFor === "function"
+                ? gateway.modelFor(candidate.role)
+                : null),
+            provider:
+              candidate.role === "cloud" || candidate.role === "fallback"
+                ? "cloud"
+                : "local",
+            usage: null,
+            estimated_cost: null,
+            latency_ms: null,
+            ended_reason: "trimmed",
+            error: null,
+            error_code: null,
+            trimmed: {
+              kind: runaway.kind,
+              points: runaway.points,
+              chars: runaway.chars,
+              tier: spoken.tier,
+            },
+          });
+          await db.put("turns", current);
+        });
+        console.warn(
+          `[voice-runaway] turn=${t.id} label=${candidate.label} tier=${spoken.tier}` +
+            ` kind=${runaway.kind} points=${runaway.points} chars=${runaway.chars}` +
+            ` kept=${text.length}`,
+        );
+        return;
+      }
       const code = e.code || "upstream_error";
       await markCandidate(
         job,

@@ -6409,6 +6409,40 @@ onUnmounted(() => {
               {{ voiceAnswerText }}
             </p>
 
+            <p v-if="voiceTtsWarn" class="vc-tts-warn">
+              这段没能合成语音（服务端和本机朗读都没出声），文字已显示在上方
+            </p>
+            <p v-if="voiceError" class="vc-error">{{ voiceError }}</p>
+            <div
+              v-if="voiceConfirmPending && voiceText && voiceState === 'idle'"
+              class="vc-retry-row"
+            >
+              <button type="button" class="vc-retry" @click="confirmVoiceSend">
+                确认发送
+              </button>
+              <button type="button" class="vc-retry ghost" @click="discardVoiceSend">
+                不用了
+              </button>
+            </div>
+            <div
+              v-if="voiceError && voiceText && voiceState === 'idle' && !voiceConfirmPending"
+              class="vc-retry-row"
+            >
+              <button type="button" class="vc-retry" @click="retryAnswer()">
+                重试回答
+              </button>
+              <button
+                v-if="attach.url && !attachCanSend"
+                type="button"
+                class="vc-retry ghost"
+                @click="retryAnswerTextOnly"
+              >
+                不带图，只发文字
+              </button>
+            </div>
+          </div>
+        </div>
+
             <!-- 本轮附图：按选择顺序排列，每张独立状态；缩略图不等于已上传 -->
             <p v-if="attaches.length > 1 && attachCanSend" class="vc-shot-tip">
               本轮带 {{ attaches.length }} 张图，按你选的顺序交给模型；追问会继续用这几张
@@ -6455,40 +6489,6 @@ onUnmounted(() => {
                 </div>
               </div>
             </div>
-
-            <p v-if="voiceTtsWarn" class="vc-tts-warn">
-              这段没能合成语音（服务端和本机朗读都没出声），文字已显示在上方
-            </p>
-            <p v-if="voiceError" class="vc-error">{{ voiceError }}</p>
-            <div
-              v-if="voiceConfirmPending && voiceText && voiceState === 'idle'"
-              class="vc-retry-row"
-            >
-              <button type="button" class="vc-retry" @click="confirmVoiceSend">
-                确认发送
-              </button>
-              <button type="button" class="vc-retry ghost" @click="discardVoiceSend">
-                不用了
-              </button>
-            </div>
-            <div
-              v-if="voiceError && voiceText && voiceState === 'idle' && !voiceConfirmPending"
-              class="vc-retry-row"
-            >
-              <button type="button" class="vc-retry" @click="retryAnswer()">
-                重试回答
-              </button>
-              <button
-                v-if="attach.url && !attachCanSend"
-                type="button"
-                class="vc-retry ghost"
-                @click="retryAnswerTextOnly"
-              >
-                不带图，只发文字
-              </button>
-            </div>
-          </div>
-        </div>
 
         <footer class="vc-dock">
           <!-- 音色/语速收进一个入口，带当前值摘要，点开才是完整面板 -->
@@ -8498,8 +8498,8 @@ a.text-button {
 .vc-more select{background:#ffffff1a;color:#eaf6f0;border:0;border-radius:8px;padding:5px 8px;font-size:12px}
 .vc-tip{opacity:.7}
 .vc-shot-tip{margin:6px 0 0;font-size:12px;color:#9fd8bd}
-.vc-shot-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;max-height:34vh;overflow:auto}
-.vc-shot{display:flex;align-items:center;gap:10px;width:auto;flex:1 1 240px;margin-top:0;padding:8px 10px;border-radius:14px;background:#ffffff12;border:1px solid rgba(255,255,255,.12);text-align:left}
+.vc-shot-row{display:flex;flex-wrap:nowrap;gap:8px;margin-top:2px;padding:2px 0 4px;overflow-x:auto;overflow-y:hidden;flex:none}
+.vc-shot{display:flex;align-items:center;gap:10px;width:auto;flex:0 0 auto;max-width:78vw;margin-top:0;padding:8px 10px;border-radius:14px;background:#ffffff12;border:1px solid rgba(255,255,255,.12);text-align:left}
 .turn-shots{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 .vc-shot.ok{border-color:#78dcaf73}
 .vc-shot.bad{border-color:#ff8c8273}
