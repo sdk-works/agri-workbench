@@ -1300,7 +1300,23 @@ export function createWorkspace({
     return repo.transaction(async (db) => {
       const t = await ownTurn(db, u, id);
       const job = await db.get("jobs", `generate-${id}`);
-      if (!job) fail("没有正在执行的任务", 404);
+      // 终态幂等：已结束的轮次再点停止，回同一终态而不是 404。
+      // 前端据此显示「服务端已确认停止」，不用靠猜；重复点也不会改内容。
+      if (!job) {
+        if (["completed", "failed", "canceled", "partial"].includes(t.status))
+          return Object.assign(safeTurn(t, u), {
+            cancel_confirmed: true,
+            already_terminal: true,
+          });
+        // 任务行丢了但轮次还挂在 generating：不留一个永远转圈的假生成
+        t.status = t.candidates.some((c) => c.status === "completed")
+          ? "partial"
+          : "canceled";
+        t.cancel_requested_at = t.cancel_requested_at || now();
+        if (t.status === "canceled") t.ended_reason = "canceled";
+        await db.put("turns", t);
+        return Object.assign(safeTurn(t, u), { cancel_confirmed: true });
+      }
       const ctrl = jobAborts.get(job.id);
       if (job.status === "queued") {
         for (const c of t.candidates)
@@ -1323,9 +1339,15 @@ export function createWorkspace({
           error: { message: "用户取消" },
           finished_at: now(),
         });
-        return safeTurn(t, u);
+        return Object.assign(safeTurn(t, u), {
+          cancel_confirmed: true,
+          already_terminal: true,
+        });
       }
       if (job.status === "running") {
+        // 记下取消意图：收尾写库时据此把状态钉成 canceled，
+        // 防止"其实已经流完"的候选把取消覆盖成 completed
+        t.cancel_requested_at = t.cancel_requested_at || now();
         ctrl?.abort();
         for (const c of t.candidates)
           if (c.status === "pending")
@@ -1336,13 +1358,20 @@ export function createWorkspace({
               ended_reason: "canceled",
             });
         await db.put("turns", t);
-        return safeTurn(t, u);
+        // 已请求中止，但收尾还没落库：告诉前端"本地已停、服务端未确认"
+        return Object.assign(safeTurn(t, u), {
+          cancel_pending: true,
+          cancel_confirmed: false,
+        });
       }
       if (["completed", "failed", "canceled"].includes(job.status)) {
         ctrl?.abort();
-        return safeTurn(t, u);
+        return Object.assign(safeTurn(t, u), {
+          cancel_confirmed: true,
+          already_terminal: true,
+        });
       }
-      return safeTurn(t, u);
+      return Object.assign(safeTurn(t, u), { cancel_confirmed: true });
     });
   }
   async function finishJob(job, status, extra = {}) {
@@ -1534,6 +1563,8 @@ export function createWorkspace({
           : good || anyText
             ? "partial"
             : "failed";
+      // 取消是终态：用户点过停止，收尾不能被"其实已经生成完"翻回 completed
+      if (t.cancel_requested_at && !adoptedChoice) t.status = "canceled";
       if (t.status === "canceled") t.ended_reason = "canceled";
       // 附件生命周期收尾：看过图才算 analyzed；失败要保留原因（不假装看过）
       const doneAttachments =
@@ -2667,6 +2698,27 @@ export function createWorkspace({
           }));
         return send({ items });
       }
+      // 后台任务追踪：不看当前会话，列出这个人所有还在生成的轮次。
+      // 切走会话后仍有据可查、可点停止，不必回到原会话才能找到。
+      if (url.searchParams.get("active") === "1") {
+        const live = (
+          await repo.list("turns", { tenant: u.tenant, owner: u.id })
+        )
+          .filter((t) => t.status === "generating")
+          .sort((a, b) =>
+            String(b.created_at || "").localeCompare(String(a.created_at || "")),
+          )
+          .map((t) => ({
+            id: t.id,
+            conversation_id: t.conversation_id || "",
+            question: String(t.question || "").slice(0, 40),
+            domain: t.domain || "",
+            status: t.status,
+            created_at: t.created_at || "",
+            cancel_requested_at: t.cancel_requested_at || "",
+          }));
+        return send({ items: live });
+      }
       const items = (
         await repo.list("turns", { tenant: u.tenant, owner: u.id })
       ).filter((t) => !convId || t.conversation_id === convId);
@@ -2674,6 +2726,16 @@ export function createWorkspace({
     }
     if (routePath === "/turns" && method === "POST")
       return send(await createTurn(u, await body()), 202);
+    // 只读对账：轮次 id 就是 request_id。查这一条建没建出来，
+    // 不新建、不改状态、不触发模型——「状态待确认」靠它收敛。
+    // 查不到也回 200 + found:false，让前端区分"确定没建"与"链路出错"。
+    let tm = routePath.match(/^\/turns\/([\w-]+)$/);
+    if (tm && method === "GET") {
+      const t = await repo.get("turns", tm[1]);
+      if (!t || t.tenant !== u.tenant || t.owner !== u.id)
+        return send({ found: false });
+      return send({ found: true, turn: safeTurn(t, u) });
+    }
     let m = routePath.match(/^\/turns\/([\w-]+)\/feedback$/);
     if (m && method === "POST")
       return send(await feedback(u, m[1], await body()));

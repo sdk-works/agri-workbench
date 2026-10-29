@@ -47,7 +47,7 @@ http.createServer((req,res)=>{
  }
  let file=path.resolve(root,'.'+pathname);
  if(file!==root&&!file.startsWith(root+path.sep)){res.writeHead(403).end();return;}
- try{if(!fs.statSync(file).isFile())file=path.join(root,'index.html');}catch{file=path.join(root,'index.html');}
+ const isAsset=pathname.startsWith('/assets/')||path.extname(pathname)!=='';const notFound=()=>{res.writeHead(404,{'Content-Type':'text/plain; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end('not found');};try{if(!fs.statSync(file).isFile()){if(isAsset)return notFound();file=path.join(root,'index.html');}}catch{if(isAsset)return notFound();file=path.join(root,'index.html');}
  fs.stat(file,(err,stat)=>{if(err){res.writeHead(404).end();return;}
  const ext=path.extname(file).toLowerCase();
  const headers={'Content-Type':mime[ext]||'application/octet-stream','Content-Length':stat.size,'X-Content-Type-Options':'nosniff','Cache-Control':file.endsWith('.html')?'no-cache':'public, max-age=3600'};

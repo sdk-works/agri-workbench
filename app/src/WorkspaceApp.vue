@@ -34,6 +34,15 @@ import { call, download } from "./workspace-api";
 import { uuid, friendlyError, logDiagnostic, compatProbe } from "./compat.js";
 // 附图状态机：六态与「什么才算上传成功」都在这份纯逻辑里，便于单测
 import * as Attach from "./attach-flow.mjs";
+// 请求状态机：提交/轮询/取消的判定都在这里，组件只负责调用（配套 request-state.test.mjs）
+import {
+  SEND,
+  TIMEOUTS,
+  createSendTracker,
+  createPollScheduler,
+  cancelEnabled,
+  isDefiniteFailure,
+} from "./request-state.mjs";
 const user = ref(null),
   ready = ref(false),
   setup = ref(false),
@@ -41,6 +50,21 @@ const user = ref(null),
   busy = ref(false),
   error = ref(""),
   notice = ref("");
+// 启动探测独立：白屏超过 TIMEOUTS.boot 就明说「连不上」并给重试，不再干等 60 秒
+const bootState = ref("loading"),
+  bootError = ref("");
+// 提交 / 取消 / 会话代号：生成中可以刷新、可以取消，各走各的通道
+const sendPhase = ref(SEND.IDLE),
+  sendDraft = ref(null),
+  cancelingTurnId = ref(""),
+  convEpoch = ref(0);
+// 后台任务清单（不分会话）：切走会话后仍能看到、能回来、能停
+const activeTurns = ref([]);
+const backgroundTurns = computed(() =>
+  activeTurns.value.filter(
+    (t) => !conversationId.value || t.conversation_id !== conversationId.value,
+  ),
+);
 const login = ref({ username: "", name: "", password: "" }),
   domains = ["种植管理", "农业物联网", "农业销售", "设计"];
 const conversations = ref([]),
@@ -477,10 +501,30 @@ const filteredReviews = computed(() =>
       !["approved", "excluded"].includes(r.status),
   ),
 );
-let timer,
-  clock,
-  polling = false,
+let clock,
   disposed = false;
+
+// 提交跟踪：token 用于识别「迟到的响应」，切会话后旧 token 一律作废
+const sender = createSendTracker({
+  onChange: (s) => {
+    sendPhase.value = s.phase;
+    sendDraft.value = s.draft;
+  },
+});
+
+// 轮询：上一发回来才安排下一拍，弱网按 3→6→12→24→30 秒退避
+const poller = createPollScheduler({
+  run: () => poll(),
+  onError: (e, fails) => {
+    if (disposed) return;
+    if (e && e.status === 401) {
+      user.value = null;
+      return;
+    }
+    // 偶发一次抖动不刷红条，连续两拍失败才提示，避免弱网时满屏报错
+    if (fails >= 2) error.value = friendlyError(e);
+  },
+});
 // JavaScript 层面的异常（不是业务错误）必须留证据：手机上连控制台都看不到。
 // 带上能力探测结果，才能判断是不是老 WebView 缺 API。
 const SCRIPT_ERROR_RE =
@@ -526,8 +570,13 @@ async function authenticate() {
     await refresh();
   });
 }
+// 部门列表是否已经回来：页面一能输入就点发送时，部门常常还在路上，
+// 那时 allowedDomainOptions 还是空的，直接拦会甩一句"还没有分配部门"——
+// 其实只是没加载完。这个标记让 ask() 先等一次，而不是误报。
+const deptsLoaded = ref(false);
 async function loadDepartments() {
   departments.value = (await call("/departments")).items;
+  deptsLoaded.value = true;
   // 管理员在部门停用/变动时回退到第一个；其他人由所属部门推导，不默认归属
   if (
     admin.value &&
@@ -796,21 +845,53 @@ async function refresh() {
   }
 }
 async function poll() {
-  if (polling || busy.value || !user.value) return;
-  polling = true;
+  // 生成中也照样刷新：以前这里的 if (busy) return，正好在最需要看进度的时候把界面冻住
+  if (!user.value || bootState.value !== "ready") return;
+  // 后台标签页不轮询，切回来时由 visibilitychange 立刻补一拍
+  if (typeof document !== "undefined" && document.hidden) return;
+  if (!["chat", "images", "reviews", "documents"].includes(page.value)) return;
   try {
-    if (["chat", "images", "reviews", "documents"].includes(page.value))
-      await refresh();
-  } catch (e) {
-    if (!disposed) {
-      error.value = friendlyError(e);
-      if (e.status === 401) user.value = null;
-    }
+    await refresh();
   } finally {
-    polling = false;
+    // 后台任务跟当前会话无关，单独一查；失败不打扰用户
+    await loadActiveTurns();
   }
 }
+// 后台任务清单：列出这个人所有还在生成的轮次（不分会话）。
+// 切走会话以后，上一会话那条还在跑的轮次仍然能被看到、能回来、能停，
+// 不用靠记忆翻历史去猜它到底停了没有。
+let activeAt = 0;
+async function loadActiveTurns() {
+  if (!user.value || page.value !== "chat") return;
+  const now = Date.now();
+  if (now - activeAt < 1500) return; // 轮询与手动刷新可能撞在一起
+  activeAt = now;
+  try {
+    const out = await call("/turns?active=1", undefined, undefined, {
+      timeoutMs: TIMEOUTS.poll,
+    });
+    activeTurns.value = Array.isArray(out && out.items) ? out.items : [];
+  } catch (e) {
+    // 这一查只影响提示条，不能因为它弹错误把主流程打断；
+    // 断网时保留上一次结果，下一次轮询再收敛
+    if (e && e.status === 401) user.value = null;
+  }
+}
+async function openBackgroundTurn(bt) {
+  if (bt.conversation_id && bt.conversation_id !== conversationId.value) {
+    await selectConversation({ id: bt.conversation_id, domain: bt.domain || domain.value });
+  }
+  await refresh();
+  await loadActiveTurns();
+}
+// 会话代号 +1：在途提交的迟到响应一律作废，不能填进新会话，也不能解锁新请求
+function bumpConvEpoch() {
+  convEpoch.value += 1;
+  sender.reset(convEpoch.value);
+  cancelingTurnId.value = "";
+}
 function newConversation() {
+  bumpConvEpoch();
   conversationId.value = "";
   turns.value = [];
   question.value = "";
@@ -819,11 +900,19 @@ function newConversation() {
   convDrawer.value = false;
 }
 async function selectConversation(c) {
+  bumpConvEpoch();
   conversationId.value = c.id;
   domain.value = c.domain;
   dropAttach();
   convDrawer.value = false;
-  await act(refresh);
+  // 切会话不能走 act()：act 在忙时直接 return，会出现「点了历史会话但列表是空的」
+  try {
+    await refresh();
+  } catch (e) {
+    error.value = friendlyError(e);
+    if (e.status === 401) user.value = null;
+  }
+  await loadActiveTurns();
 }
 async function deleteConversation(c) {
   // 二次确认：第一次点击进入确认态（按钮变"确认删除？"），4 秒内再点执行
@@ -902,9 +991,18 @@ function imageTitle(t) {
 }
 let askInflight = false;
 async function ask() {
-  if (busy.value) {
-    notice.value = "上一条还在回答，等它结束后再发";
+  // 上一轮还没收到回执：再点发送 = 用同一个 request_id 去对账，不会变成第二条
+  if (sendPhase.value === SEND.UNCONFIRMED && sendDraft.value) {
+    await reconcileSend();
     return;
+  }
+  if (sendPhase.value === SEND.SENDING) {
+    notice.value = "上一条还在等服务器回执，稍等一下；要放弃就点回答上方的「停止」";
+    return;
+  }
+  if (!allowedDomainOptions.value.length && !deptsLoaded.value) {
+    // 网络慢时部门列表还没到：等一次再判，别把"没加载完"说成"没分配部门"
+    await loadDepartments().catch(() => {});
   }
   if (!allowedDomainOptions.value.length) {
     notice.value = "还没有分配部门，请联系管理员分配后再提问。";
@@ -934,38 +1032,137 @@ async function ask() {
         return; // 关键：不发残缺的图
       }
     }
-    await act(async () => {
-      const ids = imageIds;
-      const sameIds =
-        (draft.value?.image_ids || []).join(",") === ids.join(",");
-      if (
-        !draft.value ||
-        draft.value.question !== question.value ||
-        draft.value.conversation_id !== conversationId.value ||
-        Boolean(draft.value.deep) !== Boolean(deep.value) ||
-        !sameIds
-      )
-        draft.value = {
-          request_id: uuid(),
-          question: question.value,
-          domain: domain.value,
-          deep: deep.value,
-          conversation_id: conversationId.value || undefined,
-          // 只带服务端编号：图已由 /voice/image 落盘，顺序就是用户选图的顺序
-          image_id: ids[0] || undefined,
-          image_ids: ids.length ? ids : undefined,
-        };
-      const t = await call("/turns", draft.value);
-      conversationId.value = t.conversation_id;
-      question.value = "";
-      draft.value = null;
-      dropAttach(); // 图已随本轮提交，收进历史记录
-      await refresh();
-    });
+    const ids = imageIds;
+    const sameIds =
+      (draft.value?.image_ids || []).join(",") === ids.join(",");
+    if (
+      !draft.value ||
+      draft.value.question !== question.value ||
+      draft.value.conversation_id !== conversationId.value ||
+      Boolean(draft.value.deep) !== Boolean(deep.value) ||
+      !sameIds
+    )
+      draft.value = {
+        request_id: uuid(),
+        question: question.value,
+        domain: domain.value,
+        deep: deep.value,
+        conversation_id: conversationId.value || undefined,
+        // 只带服务端编号：图已由 /voice/image 落盘，顺序就是用户选图的顺序
+        image_id: ids[0] || undefined,
+        image_ids: ids.length ? ids : undefined,
+      };
+    // 提交只改「提交态」，不碰全局 busy：生成中依然能刷新、能取消、能切会话
+    const token = sender.begin(draft.value, convEpoch.value);
+    await sendDraftNow(draft.value, token);
   } finally {
     askInflight = false;
   }
 }
+
+// 提交一轮。超时/断网不当「失败」——服务端可能已经建好轮次了，
+// 只有 4xx 这种明确拒绝才敢放开锁；其余一律进「状态待确认」，保留同一个 request_id。
+async function sendDraftNow(draftObj, token) {
+  error.value = "";
+  notice.value = "";
+  try {
+    const t = await call("/turns", draftObj, undefined, {
+      timeoutMs: TIMEOUTS.send,
+    });
+    // 迟到的响应：会话已经切走，这一轮落在旧会话里，不能填进新会话
+    if (sender.confirm(token, convEpoch.value) === "stale") {
+      notice.value = "上一条已在原来的会话里完成，去「历史会话」可以找到";
+      return;
+    }
+    conversationId.value = t.conversation_id;
+    question.value = "";
+    draft.value = null;
+    dropAttach(); // 图已随本轮提交，收进历史记录
+    await refresh();
+    await loadActiveTurns();
+  } catch (e) {
+    if (isDefiniteFailure(e)) {
+      // 4xx：确定没有建轮次，可以安全放开并让用户改内容重发
+      sender.fail(token, convEpoch.value);
+      error.value = friendlyError(e);
+      reportIfScriptError(e);
+      if (e.status === 401) user.value = null;
+      return;
+    }
+    if (
+      sender.markUnconfirmed(token, convEpoch.value, friendlyError(e)) ===
+      "stale"
+    )
+      return;
+    notice.value = "没收到服务器回执，正在核对这一条是否已经提交…";
+    await reconcileSend();
+  }
+}
+
+// 对账：先只读查证，再决定要不要补发。
+// 1) GET /turns/{request_id} 不建轮次、不改状态、不调模型 —— 查到就说明服务器收下了；
+// 2) 只有明确 found:false（服务器确定没有这条）才用同一个 request_id 补发一次；
+// 3) 查询本身失败（断网、超时）不动状态，留着继续核，绝不靠重发去赌。
+async function reconcileSend() {
+  const st = sender.state;
+  if (st.phase !== SEND.UNCONFIRMED || !st.draft) return;
+  const token = st.token;
+  const epoch = convEpoch.value;
+  const rid = st.draft.request_id;
+  // 迟到的结论不能盖过更新的动作：对账要跨好几次网络往返（弱网下几秒），
+  // 这期间用户可能已经开始下一条、或者切了会话。那时这句"已确认"会压在
+  // 新请求的错误提示上面，读起来像两条互相打脸的消息。
+  const stillCurrent = () =>
+    sender.state.token === token && convEpoch.value === epoch;
+  let look;
+  try {
+    look = await call(`/turns/${encodeURIComponent(rid)}`, undefined, undefined, {
+      timeoutMs: TIMEOUTS.reconcile,
+    });
+  } catch (e) {
+    if (isDefiniteFailure(e) && e.status === 401) user.value = null;
+    sender.markUnconfirmed(token, convEpoch.value, friendlyError(e));
+    notice.value = "还连不上服务器，核不了；网络恢复后再点「核对这一条」，不会重复生成";
+    return;
+  }
+  if (look && look.found) {
+    if (sender.confirm(token, convEpoch.value) === "stale") return;
+    conversationId.value = look.turn.conversation_id || conversationId.value;
+    question.value = "";
+    draft.value = null;
+    dropAttach();
+    await refresh();
+    await loadActiveTurns();
+    if (!stillCurrent()) return;
+    notice.value = "已确认：这一条服务器早就收下了，没有重复生成";
+    return;
+  }
+  // 服务器确定没有这条，才补发；request_id 不变，即使它其实刚建好也只会命中幂等分支
+  try {
+    const t = await call("/turns", st.draft, undefined, {
+      timeoutMs: TIMEOUTS.reconcile,
+    });
+    if (sender.confirm(token, convEpoch.value) === "stale") return;
+    conversationId.value = t.conversation_id;
+    question.value = "";
+    draft.value = null;
+    dropAttach();
+    await refresh();
+    await loadActiveTurns();
+    if (!stillCurrent()) return;
+    notice.value = t.duplicate ? "已确认：这一条之前就提交成功了" : "已补发成功";
+  } catch (e) {
+    if (isDefiniteFailure(e)) {
+      sender.fail(token, convEpoch.value);
+      error.value = friendlyError(e);
+      return;
+    }
+    sender.markUnconfirmed(token, convEpoch.value, friendlyError(e));
+    notice.value =
+      "网络还没恢复，这一条仍在核对；恢复后点「核对这一条」会继续核同一条，不会重复生成";
+  }
+}
+
 function onComposerKeydown(e) {
   if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
   e.preventDefault();
@@ -1012,11 +1209,44 @@ async function adopt(t, choice) {
   });
 }
 async function cancelTurn(t) {
-  await act(async () => {
-    await call(`/turns/${t.id}/cancel`, {});
-    notice.value = "已停止。";
+  // 取消必须绕开 busy。以前这里是 act()，而 act 开头就是 if (busy) return，
+  // 于是「请求卡住 → busy=true → 停止按钮 :disabled=busy」——最想停的时候偏偏按不了。
+  if (
+    !cancelEnabled({
+      status: t.status,
+      cancelingId: cancelingTurnId.value,
+      turnId: t.id,
+    })
+  )
+    return;
+  cancelingTurnId.value = t.id;
+  error.value = "";
+  notice.value = "已停止本地等待，正在让服务器确认…";
+  try {
+    const out = await call(`/turns/${t.id}/cancel`, {}, undefined, {
+      timeoutMs: TIMEOUTS.cancel,
+    });
+    // 服务端分三种回答，界面必须说清楚，不能一律显示"已停止"：
+    //   cancel_confirmed：已经停下（排队中取消 / 早已结束）
+    //   cancel_pending：中止已发出，收尾还没落库
+    if (out && out.cancel_confirmed) {
+      notice.value = out.already_terminal
+        ? "这一条已经结束，服务端状态未变"
+        : "服务端已确认停止";
+    } else if (out && out.cancel_pending) {
+      notice.value = "停止指令已发出，服务器还在收尾；这条不会再算完成";
+    } else {
+      notice.value = "已请求停止，正在等服务端确认";
+    }
     await refresh();
-  });
+    await loadActiveTurns();
+  } catch (e) {
+    // 本地停下 ≠ 服务端停下：这句必须说清楚，否则用户以为已经省了算力
+    error.value = "服务端没确认取消，这一轮可能还在生成：" + friendlyError(e);
+    await loadActiveTurns();
+  } finally {
+    cancelingTurnId.value = "";
+  }
 }
 async function openReview(r) {
   await act(async () => {
@@ -2183,10 +2413,10 @@ function holdVoiceStart(ev) {
       // 自己 stopRec(true)，用户手指还没松开，录音已经上传了
       if (typeof n.recStartHold === "function") n.recStartHold(recSessionId);
       else n.recStart(); // 旧壳没有按住模式，只能靠下面的标志兜住
-      voiceState.value = "listening";
-      return;
+        voiceState.value = "listening";
+        return;
     } catch (e) {}
-  }
+      }
   if (voiceNativeCaps.asr && n && n.startListening) {
     try {
       n.startListening();
@@ -3884,10 +4114,10 @@ function handleVoiceEvent(ev) {
     return;
   }
   if (ev.type === "limit") {
-    stopHoldTimer();
-    voiceHolding.value = false;
-    voiceHoldAbort = true;
-    voiceState.value = "idle";
+      stopHoldTimer();
+      voiceHolding.value = false;
+      voiceHoldAbort = true;
+      voiceState.value = "idle";
     voiceError.value = ev.message || "录音时间过长，本次未发送";
     return;
   }
@@ -4084,30 +4314,49 @@ const closeDeptMenu = () => {
   if (deptMenu.value) deptMenu.value = "";
 };
 
-onMounted(async () => {
-  // 接收安卓壳的语音事件
-  window.__qingheVoice = handleVoiceEvent;
-  document.addEventListener("click", closeDeptMenu);
+// 启动探测：短超时 + 明确失败态。以前这里没有独立超时，链路挂住就白屏 60 秒。
+async function boot() {
+  bootState.value = "loading";
+  bootError.value = "";
+  error.value = "";
   try {
-    const status = await call("/auth/status");
+    const status = await call("/auth/status", undefined, undefined, {
+      timeoutMs: TIMEOUTS.boot,
+    });
     setup.value = status.setup_required;
     user.value = status.user;
     if (user.value) {
       await loadDepartments();
       await refresh();
     }
-  } catch (e) {
-    error.value = friendlyError(e);
-  } finally {
     ready.value = true;
+    bootState.value = "ready";
+  } catch (e) {
+    bootError.value = friendlyError(e);
+    bootState.value = "failed";
+    ready.value = false;
+    reportIfScriptError(e);
   }
-  timer = setInterval(poll, 3000);
+}
+// 切回前台立刻补一拍，别等退避计时器
+function onVisibility() {
+  if (!document.hidden) poller.tick();
+}
+onMounted(async () => {
+  // 接收安卓壳的语音事件
+  window.__qingheVoice = handleVoiceEvent;
+  document.addEventListener("click", closeDeptMenu);
+  document.addEventListener("visibilitychange", onVisibility);
+  await boot();
+  await loadActiveTurns();
+  poller.start();
   clock = setInterval(() => (nowTick.value = Date.now()), 1000);
 });
 onUnmounted(() => {
   disposed = true;
-  clearInterval(timer);
+  poller.stop();
   clearInterval(clock);
+  document.removeEventListener("visibilitychange", onVisibility);
   if (window.__qingheVoice === handleVoiceEvent) delete window.__qingheVoice;
   document.removeEventListener("click", closeDeptMenu);
   endCall();
@@ -4122,8 +4371,25 @@ onUnmounted(() => {
       </div>
       <p class="subtle">日常使用积累经验，让专家把关农业知识。</p>
       <h1>
-        {{ !ready ? "连接工作台…" : setup ? "创建管理员账号" : "欢迎回来" }}
+        {{
+          bootState === "loading"
+            ? "连接工作台…"
+            : bootState === "failed"
+              ? "连不上工作台"
+              : setup
+                ? "创建管理员账号"
+                : "欢迎回来"
+        }}
       </h1>
+      <div
+        v-if="bootState === 'failed'"
+        style="display: flex; flex-direction: column; gap: 10px; margin-top: 14px"
+      >
+        <p class="subtle" style="margin: 0">
+          {{ bootError || "网络暂时不通，检查一下网络再试" }}
+        </p>
+        <button class="primary" type="button" @click="boot">重试连接</button>
+      </div>
       <form v-if="ready" @submit.prevent="authenticate">
         <label
           >账号<input
@@ -4229,6 +4495,36 @@ onUnmounted(() => {
               <Plus :size="16" /><span>新会话</span>
             </button>
           </div>
+          <!-- 后台任务：切走会话以后，上一会话还在跑的那条不该消失。
+               没有这一条时只能靠记忆翻历史去猜它停没停。 -->
+          <div v-if="backgroundTurns.length" class="bg-tasks" role="status">
+            <span class="bg-tasks-label"
+              >还有 {{ backgroundTurns.length }} 条在别的会话里生成</span
+            >
+            <ul>
+              <li v-for="bt in backgroundTurns" :key="bt.id">
+                <button
+                  type="button"
+                  class="bg-open"
+                  @click="openBackgroundTurn(bt)"
+                >
+                  {{ bt.question || "（语音提问）" }}
+                </button>
+                <span v-if="bt.cancel_requested_at" class="bg-pending"
+                  >停止中…</span
+                >
+                <button
+                  v-else
+                  type="button"
+                  class="text-button stop"
+                  :disabled="cancelingTurnId === bt.id"
+                  @click="cancelTurn(bt)"
+                >
+                  {{ cancelingTurnId === bt.id ? "停止中…" : "停止" }}
+                </button>
+              </li>
+            </ul>
+          </div>
           <div class="chat-layout">
             <div class="conversation-body">
               <section v-if="!turns.length" class="panel welcome">
@@ -4238,7 +4534,14 @@ onUnmounted(() => {
                   描述作物、生育期、现场环境和你的目标，能帮助模型给出更合适的建议。
                 </p>
               </section>
-              <article v-for="t in turns" :key="t.id" class="turn">
+              <!-- data-turn-id：后台任务/停止按钮要能按轮次精确定位，
+                   免得"点最后一条的停止"误停前面那条还在生成的 -->
+              <article
+                v-for="t in turns"
+                :key="t.id"
+                class="turn"
+                :data-turn-id="t.id"
+              >
                 <div class="question-bubble">
                   <small
                     >第 {{ t.sequence }} 轮 · {{
@@ -4254,10 +4557,10 @@ onUnmounted(() => {
                       !t.candidates.some((c) => c.status === 'stopped')
                     "
                     class="text-button stop"
-                    :disabled="busy"
+                    :disabled="cancelingTurnId === t.id"
                     @click="cancelTurn(t)"
                   >
-                    停止
+                    {{ cancelingTurnId === t.id ? "停止中…" : "停止" }}
                   </button>
                   <p>
                     <span v-if="t.source === 'voice'" class="badge amber"
@@ -4510,6 +4813,17 @@ onUnmounted(() => {
                   </div>
                 </div>
                 <p v-if="voiceError" class="composer-shot-alert">{{ voiceError }}</p>
+                <p v-if="sendPhase === 'unconfirmed'" class="composer-shot-alert">
+                  上一条没收到服务器回执。
+                  <button
+                    type="button"
+                    class="text-button"
+                    @click="reconcileSend"
+                  >
+                    核对这一条
+                  </button>
+                  用的是同一个请求编号，不会重复生成
+                </p>
                 <div class="form-bottom">
                   <div class="composer-tools">
                     <span class="image-pick">
@@ -4553,9 +4867,9 @@ onUnmounted(() => {
                   </button
                   ><button
                     class="primary"
-                    :disabled="!question.trim()"
+                    :disabled="!question.trim() && sendPhase !== 'unconfirmed'"
                   >
-                    发送问题
+                    {{ sendPhase === "unconfirmed" ? "核对上一条" : "发送问题" }}
                   </button>
                 </div>
               </form>
@@ -8555,6 +8869,74 @@ a.text-button {
   background: #e7efe6;
   color: #3f6b4d;
   text-align: center;
+}
+/* 后台任务提示条：只在有别的会话还在生成时出现，窄屏也能点 */
+.bg-tasks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 9px 12px;
+  border: 1px solid #d8e4d6;
+  border-left: 3px solid #3f6b4d;
+  border-radius: 10px;
+  background: #f5faf4;
+}
+.bg-tasks-label {
+  font-size: 13px;
+  color: #3f6b4d;
+  white-space: nowrap;
+}
+.bg-tasks ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+.bg-tasks li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+}
+.bg-open {
+  max-width: 46vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid #d8e4d6;
+  background: #fff;
+  border-radius: 999px;
+  padding: 3px 11px;
+  font-size: 13px;
+  color: #2f5138;
+  cursor: pointer;
+}
+.bg-pending {
+  font-size: 12px;
+  color: #8a6d3b;
+}
+/* 测试版标识：颜色偏琥珀，避免和"成功/正常"徽标混淆 */
+.test-flag {
+  max-width: 46vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.test-banner {
+  margin: 6px 0 12px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: #fdf3e0;
+  border: 1px solid #f0d9ad;
+  color: #8a5a12;
+  font-size: 12px;
+  line-height: 1.5;
 }
 .conv-drawer-mask {
   position: fixed;
