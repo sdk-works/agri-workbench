@@ -11,6 +11,7 @@ import { createImageServer } from "./image-server.mjs";
 import { createVoice } from "./voice.mjs";
 import { loadEnv } from "./env.mjs";
 import { buildOriginMatcher } from "./origin-guard.mjs";
+import { cloudFetch } from "./cloud-fetch.mjs";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url))),
   env = loadEnv();
@@ -63,6 +64,8 @@ const gateway = createGateway(
   env,
   env.MODEL_CONFIG_PATH || path.join(root, "data/model-config.json"),
   {
+    // 云端请求经本机代理且握手可能 11–16s，内置 fetch 的 10s 连接超时会误杀
+    fetcher: cloudFetch,
     limits: {
       localConcurrency: Number(env.LOCAL_CONCURRENCY || 2),
       cloudConcurrency: Number(env.CLOUD_CONCURRENCY || 2),

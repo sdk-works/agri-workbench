@@ -200,6 +200,12 @@ export function createGateway(
       console.log(`[gateway] role=${role} model=${c.model} target=${c.base_url}`);
       return await run();
     } catch (e) {
+      // 诊断：保留底层真实错误，否则一律被归类成"模型连接失败"，无法定位
+      console.error(
+        `[gateway-err] role=${role} name=${e?.name} msg=${String(e?.message).slice(0, 200)}` +
+          ` code=${e?.code || ""} cause_code=${e?.cause?.code || ""}` +
+          ` cause_msg=${String(e?.cause?.message || "").slice(0, 200)}`,
+      );
       if (opts.signal?.aborted)
         throw Object.assign(Error("模型调用已取消"), { code: "canceled" });
       if (e.code === "canceled") throw e;
